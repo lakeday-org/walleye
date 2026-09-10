@@ -34,7 +34,7 @@ class ReviewConfig:
     total_tokens: int | None = None
     per_call_tokens: int | None = None
     max_output_tokens: int = 128000
-    timeout_seconds: int = 600
+    timeout_seconds: int = 1800
 
     def __post_init__(self):
         for field in fields(self):

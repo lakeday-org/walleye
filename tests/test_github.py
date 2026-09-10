@@ -164,6 +164,19 @@ def test_edits_are_exact_and_cannot_silently_hit_multiple_sites():
         apply_edits(b"aa", [{"old": "a", "new": "b"}])
 
 
+def test_extracted_helpers_do_not_make_later_edits_ambiguous():
+    original = b"def scan():\n    return build_report()\n"
+    edits = [
+        {"old": "def scan():", "new": "def finish():\n    return build_report()\n\ndef scan():"},
+        {"old": "    return build_report()", "new": "    return finish()"},
+    ]
+    assert apply_edits(original, edits) == (
+        b"def finish():\n    return build_report()\n\ndef scan():\n    return finish()\n"
+    )
+    with pytest.raises(ValueError, match="overlap"):
+        apply_edits(b"abc", [{"old": "ab", "new": "x"}, {"old": "bc", "new": "y"}])
+
+
 ORIGINAL = "def clamp(x):\n    if x > 10:\n        return 10\n    return x\n"
 FIXED = "def clamp(x):\n    return max(0, min(10, x))\n"
 TESTS = """from clamp import clamp
@@ -379,6 +392,38 @@ def test_native_readability_rejection_never_pushes_or_creates_a_pr(native_repo, 
     assert result["status"] == "stopped" and "repeated" in result["error"]
     assert not any(method == "POST" for method, _, _ in requests)
     assert (workspace.repo / "clamp.py").read_text() == ORIGINAL
+
+
+def test_invalid_patch_returns_feedback_without_rewriting_frozen_tests(native_repo, tmp_path):
+    client, workspace, requests = native_repo
+    stages, invoke = model()
+    patches = 0
+
+    def writer(prompt, config, limit, **kwargs):
+        nonlocal patches
+        result = invoke(prompt, config, limit, **kwargs)
+        if "edits" in kwargs["schema"]["properties"]:
+            patches += 1
+            if patches == 1:
+                result["response"]["edits"] = [{"old": "missing source", "new": FIXED}]
+            else:
+                assert "Edit 1 matches 0 times" in prompt
+                assert (workspace.directory / "worktree/clamp.py").read_text() == ORIGINAL
+        return result
+
+    result, _ = improve_issue(
+        client,
+        workspace,
+        1,
+        config=ReviewConfig(backend="codex"),
+        output=tmp_path / "improve",
+        invoke=writer,
+        progress=lambda x: None,
+    )
+    assert result["status"] == "pull-request", result.get("error")
+    assert stages == ["tests", "patch", "patch", "review"]
+    assert [a["passed"] for a in result["attempts"]] == [False, True]
+    assert len([r for r in requests if r[0] == "POST"]) == 1
 
 
 def test_issue_publication_is_recoverable_and_deduplicates_existing_records(native_repo, tmp_path):

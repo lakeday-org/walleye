@@ -22,10 +22,20 @@ def apply_edits(original, edits):
     text = original.decode()
     if not edits:
         raise ValueError("Patch contains no edits")
-    for edit in edits:
-        if not edit["old"] or text.count(edit["old"]) != 1:
-            raise ValueError("Each edit must match exactly once in the assigned source file")
-        text = text.replace(edit["old"], edit["new"], 1)
+    spans = []
+    for number, edit in enumerate(edits, 1):
+        matches = text.count(edit["old"]) if edit["old"] else 0
+        if matches != 1:
+            raise ValueError(
+                f"Edit {number} matches {matches} times; each edit must match exactly once"
+            )
+        start = text.index(edit["old"])
+        spans.append((start, start + len(edit["old"]), edit["new"]))
+    spans.sort()
+    if any(left[1] > right[0] for left, right in zip(spans, spans[1:], strict=False)):
+        raise ValueError("Edits overlap in the original source")
+    for start, end, replacement in reversed(spans):
+        text = text[:start] + replacement + text[end:]
     if text.encode() == original:
         raise ValueError("Patch does not change the source")
     return text.encode()
@@ -100,8 +110,10 @@ def candidate(agent, root, runner, packet, index, finding, plan, before, output,
     target = packet["target"]
     original = index.sources[target["path"]]
     detail = (
-        "Produce a focused patch for this issue. Return exact old/new text edits applied "
-        "sequentially to ONLY " + target["path"] + ". Preserve public signatures and contracts. "
+        "Produce a focused patch for this issue. Return non-overlapping exact old/new text edits "
+        "against the unmodified SOURCE FILE below, ONLY "
+        + target["path"]
+        + ". Preserve public signatures and contracts. "
         "You may add cohesive helpers in this file. Frozen tests and other files cannot change. "
         "Improve maintainability while addressing the objective. Do not compress code or bolt on "
         "nested special cases. The coordinator measures scores; do not calculate Halstead scores. "
@@ -118,7 +130,11 @@ def candidate(agent, root, runner, packet, index, finding, plan, before, output,
     patch = agent.phase("native-patch", packet, finding, index, output, detail, [])
     if patch["status"] != "ready":
         raise ValueError(patch["summary"])
-    safe_path(root, target["path"]).write_bytes(apply_edits(original, patch["edits"]))
+    try:
+        updated = apply_edits(original, patch["edits"])
+    except ValueError as error:
+        return patch, None, {"passed": False, "failures": [str(error)]}
+    safe_path(root, target["path"]).write_bytes(updated)
     runner.format_file(target["path"], output.name + "-format")
     after = runner.frozen(plan["test_path"], output.name + "-frozen")
     checks = runner.commands("checks", output.name + "-checks")
@@ -192,11 +208,14 @@ def iterate(
     output,
     issue,
     progress,
+    *,
+    feedback=None,
+    start=1,
 ):
     relative = packet["target"]["path"]
     original = index.sources[relative]
-    seen, feedback = set(), None
-    for number in range(1, MAX_ATTEMPTS + 1):
+    seen = set()
+    for number in range(start, MAX_ATTEMPTS + 1):
         safe_path(root, relative).write_bytes(original)
         directory = output / "attempts" / f"{number:03}"
         directory.mkdir(parents=True)
