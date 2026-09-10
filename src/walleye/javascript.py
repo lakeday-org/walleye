@@ -87,7 +87,7 @@ def _runtime():
         + Path(__file__).with_name("vendor").joinpath("babel-parser.cjs").read_text()
     )
     context.eval("""
-        function declankParse(source, language) {
+        function walleyeParse(source, language) {
           try {
             const plugins = ["decorators-legacy", "importAttributes"];
             if (language !== "javascript") plugins.push("typescript");
@@ -106,7 +106,7 @@ def _runtime():
           }
         }
     """)
-    return context, context.get("declankParse")
+    return context, context.get("walleyeParse")
 
 
 class Node:

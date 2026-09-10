@@ -671,7 +671,7 @@ def scan(
     report = {
         "schema_version": 1,
         "tool": {
-            "name": "declank",
+            "name": "walleye",
             "version": __version__,
             "profile": profiles[0] if len(profiles) == 1 else "mixed",
             "profiles": profiles,

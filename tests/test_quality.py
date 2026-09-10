@@ -2,9 +2,9 @@ import json
 
 import pytest
 
-from declank.cli import main, record_sort_key
-from declank.discovery import ScanOptions
-from declank.scanner import analyze, risk_sort_key, scan
+from walleye.cli import main, record_sort_key
+from walleye.discovery import ScanOptions
+from walleye.scanner import analyze, risk_sort_key, scan
 
 
 def function(source: str, language: str = "python", name: str | None = None) -> dict:

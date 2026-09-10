@@ -4,10 +4,10 @@ from decimal import Decimal
 
 import pytest
 
-from declank.cli import dollar_budget
-from declank.review import ReviewConfig, prepare_review
-from declank.review_agent import run_review
-from declank.review_cost import (
+from walleye.cli import dollar_budget
+from walleye.review import ReviewConfig, prepare_review
+from walleye.review_agent import run_review
+from walleye.review_cost import (
     LUNA_PRICING,
     backend_for,
     invoke_api,
@@ -212,7 +212,7 @@ def test_coordinator_releases_reservation_charges_actual_cost_and_stops_at_dolla
         response["usage"]["input_tokens_details"] = {"cache_write_tokens": 10000}
         return response
 
-    monkeypatch.setattr("declank.review_cost._api_post", post)
+    monkeypatch.setattr("walleye.review_cost._api_post", post)
     result = run_review(manifest, packets, index, output, config)
     assert result["usage"]["calls"] == 1
     assert result["cost"]["spent_usd"] == 0.01
@@ -232,7 +232,7 @@ def test_coordinator_stops_with_unknown_spend_after_timeout(tmp_path, monkeypatc
             return {"input_tokens": 10000}
         raise TimeoutError("Timeout after dispatch")
 
-    monkeypatch.setattr("declank.review_cost._api_post", post)
+    monkeypatch.setattr("walleye.review_cost._api_post", post)
     result = run_review(manifest, packets, index, output, config)
     assert result["stop_reason"] == "usage_unknown"
     assert result["cost"]["unknown"] and result["cost"]["reserved_usd"] > 0
@@ -250,7 +250,7 @@ def test_unexpected_api_usage_stops_before_another_request(tmp_path, monkeypatch
             return {"input_tokens": 10000}
         return api_response(output_tokens=150000)
 
-    monkeypatch.setattr("declank.review_cost._api_post", post)
+    monkeypatch.setattr("walleye.review_cost._api_post", post)
     result = run_review(manifest, packets, index, output, config)
     assert result["status"] == "incomplete" and result["stop_reason"] == "agent_error"
     assert result["cost"]["spent_usd"] > 0
@@ -287,7 +287,7 @@ def test_progressive_context_requests_continue_and_retain_prior_source(tmp_path,
             response["output"][0]["content"][0]["text"] = json.dumps(result)
         return response
 
-    monkeypatch.setattr("declank.review_cost._api_post", post)
+    monkeypatch.setattr("walleye.review_cost._api_post", post)
     result = run_review(manifest, [packet], index, output, config)
     assert len(calls) == 3
     assert "4: def second(x):" in calls[1] and "4: def second(x):" in calls[2]

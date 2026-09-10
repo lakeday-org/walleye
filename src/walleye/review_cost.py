@@ -155,7 +155,7 @@ def invoke_api(
         "text": {
             "format": {
                 "type": "json_schema",
-                "name": "declank_review",
+                "name": "walleye_review",
                 "schema": schema or response_schema(),
                 "strict": True,
             }

@@ -7,9 +7,9 @@ from pathlib import Path
 import networkx as nx
 import pytest
 
-from declank.callgraph import structural_metrics
-from declank.discovery import ScanOptions
-from declank.scanner import scan
+from walleye.callgraph import structural_metrics
+from walleye.discovery import ScanOptions
+from walleye.scanner import scan
 
 
 def report(tmp_path, sources):
@@ -159,8 +159,8 @@ def test_fresh_process_default_cli_has_line_and_callgraph_breakdown(tmp_path, la
         "def helper(x):\n if x: return x\n return 0\ndef caller(): return helper(1)\n"
     )
     (source / "schema.sql").write_text("PRAGMA foreign_keys=ON; BEGIN IMMEDIATE; COMMIT;")
-    script = Path(sys.executable).with_name("declank.exe" if os.name == "nt" else "declank")
-    command = [sys.executable, "-m", "declank"] if launcher == "module" else [str(script)]
+    script = Path(sys.executable).with_name("walleye.exe" if os.name == "nt" else "walleye")
+    command = [sys.executable, "-m", "walleye"] if launcher == "module" else [str(script)]
     env = {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
     run = subprocess.run(
         [*command, "scan", str(source)],

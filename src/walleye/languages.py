@@ -99,6 +99,6 @@ def parse_mapping(value: str) -> tuple[str, str]:
     extension, separator, language = value.partition("=")
     if not separator or not extension.startswith(".") or language not in LANGUAGES:
         raise ValueError(
-            f"Invalid mapping {value!r}; expected .ext=language (see declank languages)"
+            f"Invalid mapping {value!r}; expected .ext=language (see walleye languages)"
         )
     return extension, language

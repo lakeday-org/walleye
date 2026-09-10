@@ -1,4 +1,4 @@
-"""The declank command line; report data goes to stdout, diagnostics to stderr."""
+"""The walleye command line; report data goes to stdout, diagnostics to stderr."""
 
 import argparse
 import csv
@@ -180,16 +180,17 @@ def sql_dialect(value: str) -> str:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="declank",
+        prog="walleye",
         description="Scan code and rank function-level maintenance and control-flow hotspots.",
     )
-    parser.add_argument("--version", action="version", version=f"declank {__version__}")
+    parser.add_argument("--version", action="version", version=f"walleye {__version__}")
     commands = parser.add_subparsers(dest="command", required=True)
     languages = commands.add_parser("languages", help="List auto-detected languages and grammars")
     languages.add_argument("--all", action="store_true", help="Include all 173 bundled grammars")
     languages.add_argument("--format", choices=("table", "json"), default="table")
     scanner = commands.add_parser("scan", help="Scan any local codebase or source file")
-    scanner.add_argument("path", nargs="?", default=".", type=Path)
+    scanner.add_argument("path", nargs="?", default=".", help="Local path or GitHub OWNER/REPO")
+    scanner.add_argument("--ref", help="GitHub branch to scan (default: repository default branch)")
     scanner.add_argument("--format", choices=("table", "json", "csv"), default="table")
     scanner.add_argument("-o", "--output", type=Path, help="Write report atomically to a file")
     scanner.add_argument(
@@ -274,7 +275,10 @@ def build_parser() -> argparse.ArgumentParser:
     reviewer = commands.add_parser(
         "review", help="Review distinct hotspots with agents and a dollar budget"
     )
-    reviewer.add_argument("path", nargs="?", default=".", type=Path)
+    reviewer.add_argument("path", nargs="?", default=".", help="Local path or GitHub OWNER/REPO")
+    reviewer.add_argument(
+        "--ref", help="GitHub branch to review (default: repository default branch)"
+    )
     reviewer.add_argument(
         "--issues", type=positive, default=10, help="Maximum findings (default: 10)"
     )
@@ -288,12 +292,18 @@ def build_parser() -> argparse.ArgumentParser:
     reviewer.add_argument(
         "--prepare", action="store_true", help="Write packets without model calls"
     )
-    reviewer.add_argument("--config", type=Path, help="Override ~/.config/declank/config.json")
+    reviewer.add_argument("--config", type=Path, help="Override ~/.config/walleye/config.json")
     reviewer.add_argument("-o", "--output", type=Path, help="New directory for packets and results")
     improver = commands.add_parser(
         "improve", help="Reproduce findings, propose fixes, verify tests, and compare scores"
     )
-    improver.add_argument("path", type=Path, help="Repository or saved review.json")
+    improver.add_argument("path", help="Local repository, review.json, or GitHub issue URL")
+    improver.add_argument(
+        "--ref", help="GitHub base branch (default: branch recorded in the issue)"
+    )
+    improver.add_argument(
+        "--issue", type=positive, help="Finding issue number when passing OWNER/REPO"
+    )
     improver.add_argument(
         "--issues", type=positive, default=1, help="Maximum findings (default: 1)"
     )
@@ -312,7 +322,7 @@ def render_table(report: dict, stream, *, terminal: bool = False):
     console = Console(file=stream, force_terminal=terminal, highlight=False)
     summary = report["summary"]
     scores = report.get("scores", {})
-    console.print(Text(f"declank {report['tool']['version']} · {report['root']}", style="bold"))
+    console.print(Text(f"walleye {report['tool']['version']} · {report['root']}", style="bold"))
     console.print(
         Text(
             f"{summary['scanned_files']:,} files · {len(summary['languages'])} languages · "
@@ -678,6 +688,11 @@ def main(argv: list[str] | None = None) -> int:
             print(f"\n{len(rows)} languages; 173 grammars bundled, no runtime downloads.")
         return 0
     try:
+        from .github_cli import prepare_remote, run_improve
+
+        remote = prepare_remote(args)
+        if remote and args.command == "improve":
+            return run_improve(args, *remote)
         if args.command in {"improve", "apply"}:
             from .review import load_config
             from .workflow import apply_proposal, improve
@@ -754,7 +769,7 @@ def main(argv: list[str] | None = None) -> int:
                     )
                     if proposal["status"] == "verified-candidate":
                         console.print(
-                            Text(f"Apply: declank apply {output / 'proposals' / proposal['id']}")
+                            Text(f"Apply: walleye apply {output / 'proposals' / proposal['id']}")
                         )
                 if proposal.get("error"):
                     console.print(Text(proposal["error"]))
@@ -806,6 +821,10 @@ def main(argv: list[str] | None = None) -> int:
             )
             if not args.prepare and packets:
                 manifest = run_review(manifest, packets, index, output, config, progress=progress)
+            if remote:
+                from .github_cli import publish_review
+
+                publish_review(remote, manifest, packets, output, prepared=args.prepare)
             table = Table()
             table.add_column("Task")
             table.add_column("Target", overflow="fold")
@@ -896,6 +915,12 @@ def main(argv: list[str] | None = None) -> int:
             sql_dialect=args.sql_dialect,
         )
         report = scan(args.path, options)
+        if remote:
+            report["github"] = {
+                "repository": remote[0].repository.full_name,
+                "commit": remote[1].sha,
+                "branch": remote[1].base_branch,
+            }
         if args.focus:
             focus_path, separator, focus_line = args.focus.rpartition(":")
             if not separator or not focus_line.isdigit() or int(focus_line) < 1:
@@ -961,7 +986,7 @@ def main(argv: list[str] | None = None) -> int:
     except (OSError, ValueError) as error:
         if isinstance(error, BrokenPipeError):
             return 0
-        Console(stderr=True).print(Text(f"declank: {error}"))
+        Console(stderr=True).print(Text(f"walleye: {error}"))
         return 2
 
 

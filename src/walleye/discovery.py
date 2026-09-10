@@ -12,7 +12,7 @@ from pathspec import GitIgnoreSpec
 from .languages import detect
 
 ALWAYS_SKIP = frozenset(
-    {".git", ".hg", ".svn", ".declank", "node_modules", ".venv", "venv", "__pycache__"}
+    {".git", ".hg", ".svn", ".walleye", ".declank", "node_modules", ".venv", "venv", "__pycache__"}
 )
 VENDOR_DIRS = frozenset({"vendor", "vendors", "third_party", "third-party", "external"})
 BUILD_DIRS = frozenset(

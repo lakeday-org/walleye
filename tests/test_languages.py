@@ -1,7 +1,7 @@
 import pytest
 
-from declank.languages import EXTENSIONS, LANGUAGES
-from declank.scanner import analyze, parser_for
+from walleye.languages import EXTENSIONS, LANGUAGES
+from walleye.scanner import analyze, parser_for
 
 # Real, minimal programs exercise the parser and metric walker together.
 PROGRAMS = {

@@ -1,0 +1,10 @@
+{
+  "setup": [["uv", "sync", "--frozen"]],
+  "checks": [
+    ["uv", "run", "pytest", "-q"],
+    ["uv", "run", "ruff", "check", "src", "tests"],
+    ["uv", "run", "ruff", "format", "--check", "src", "tests"]
+  ],
+  "test_command": ["uv", "run", "pytest", "-q", "{test_file}", "--junitxml={report}"],
+  "format": ["uv", "run", "ruff", "format", "{file}"]
+}

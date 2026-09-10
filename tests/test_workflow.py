@@ -3,9 +3,9 @@ from dataclasses import replace
 
 import pytest
 
-from declank.review import ReviewConfig, prepare_review, write_json
-from declank.workflow import apply_proposal, improve, safe_path
-from declank.workflow_validation import (
+from walleye.review import ReviewConfig, prepare_review, write_json
+from walleye.workflow import apply_proposal, improve, safe_path
+from walleye.workflow_validation import (
     replace_function,
     run_cases,
     source_bundle,
@@ -220,9 +220,9 @@ def test_complexity_cannot_be_hidden_in_a_nested_helper(saved, tmp_path):
 
 
 def test_region_includes_helpers_but_not_same_line_siblings(tmp_path):
-    from declank.discovery import ScanOptions
-    from declank.scanner import scan
-    from declank.workflow_scores import _region
+    from walleye.discovery import ScanOptions
+    from walleye.scanner import scan
+    from walleye.workflow_scores import _region
 
     (tmp_path / "inline.js").write_text(
         "function outer(x) { function inner(y) {return y;} return inner(x); } "
@@ -294,7 +294,7 @@ def test_apply_reverifies_preserves_mode_and_updates_actual_scores(saved, tmp_pa
     proposal, card = apply_proposal(output / "proposals/001")
     assert proposal["status"] == card["state"] == "applied"
     assert file.read_text() == FIXED and file.stat().st_mode & 0o777 == 0o640
-    assert len(list((root / ".declank/regressions").glob("*.json"))) == 1
+    assert len(list((root / ".walleye/regressions").glob("*.json"))) == 1
     actual = json.loads((output / "proposals/001/applied-scan.json").read_text())
     assert (
         actual["scores"]["overall_score"] == card["maintainability"]["repository"]["score"]["after"]
@@ -427,7 +427,7 @@ def test_stale_saved_finding_does_not_start_an_agent(saved, tmp_path):
 
 
 def test_fresh_review_and_fix_share_the_same_usage_ledger(saved, tmp_path):
-    from declank.review_agent import response_schema
+    from walleye.review_agent import response_schema
 
     root, review = saved
     finding = json.loads(review.read_text())["findings"][0]
@@ -538,8 +538,45 @@ def test_workflow_api_uses_stage_schemas_and_reserves_dollars(saved, tmp_path, m
             ],
         }
 
-    monkeypatch.setattr("declank.review_cost._api_post", post)
+    monkeypatch.setattr("walleye.review_cost._api_post", post)
     manifest, _ = improve(review, output=output, config=ReviewConfig(backend="api"))
     assert len(calls) == manifest["usage"]["calls"] == 3
     assert manifest["cost"]["spent_usd"] == 0.0021
     assert manifest["verified_resolutions"] == 1
+
+
+@pytest.mark.parametrize("repeat", [False, True])
+def test_invalid_context_request_has_one_budgeted_correction(saved, tmp_path, repeat):
+    _, review = saved
+    output = tmp_path / "improve"
+    _, writer = fake_agent(output)
+    calls = []
+
+    def invoke(prompt, config, limit, *, schema, instructions):
+        calls.append(prompt)
+        if len(calls) == 1 or repeat:
+            return measured(
+                {
+                    "status": "needs_context",
+                    "summary": "Need setup",
+                    "tests": [],
+                    "context_requests": [
+                        {
+                            "resource_id": "file:not-in-catalog",
+                            "line": 1,
+                            "end_line": 2,
+                            "reason": "Need context",
+                        }
+                    ],
+                }
+            )
+        if len(calls) == 2:
+            assert "validation_error" in prompt and "exact resource IDs" in prompt
+        return writer(prompt, config, limit, schema=schema, instructions=instructions)
+
+    manifest, _ = improve(
+        review, output=output, invoke=invoke, config=ReviewConfig(backend="codex")
+    )
+    assert len(calls) == (2 if repeat else 4)
+    assert manifest["verified_resolutions"] == (0 if repeat else 1)
+    assert manifest["usage"]["calls"] == len(calls)

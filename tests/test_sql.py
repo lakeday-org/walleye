@@ -5,9 +5,9 @@ import pytest
 from sqlfluff.core import FluffConfig
 from sqlfluff.core.parser import Lexer, Parser
 
-from declank.cli import main
-from declank.scanner import analyze
-from declank.sql import SQL_PROFILE
+from walleye.cli import main
+from walleye.scanner import analyze
+from walleye.sql import SQL_PROFILE
 
 
 def parsed(source, dialect="auto"):

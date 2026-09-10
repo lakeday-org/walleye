@@ -4,8 +4,8 @@ import json
 
 import pytest
 
-from declank import __version__
-from declank.cli import main
+from walleye import __version__
+from walleye.cli import main
 
 
 def test_json_is_sorted_complete_and_machine_readable(tmp_path, capsys):
@@ -121,7 +121,7 @@ def test_default_output_keeps_maintainability_and_all_halstead_metrics_visible(
     (tmp_path / filename).write_text(source)
     assert main(["scan", str(tmp_path)]) == 0
     output = " ".join(capsys.readouterr().out.split())
-    assert f"declank {__version__}" in output
+    assert f"walleye {__version__}" in output
     assert "Maintainability (MI):" in output
     for label in (
         "distinct operators=",

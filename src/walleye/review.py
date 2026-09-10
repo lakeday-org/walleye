@@ -34,7 +34,7 @@ class ReviewConfig:
     total_tokens: int | None = None
     per_call_tokens: int | None = None
     max_output_tokens: int = 128000
-    timeout_seconds: int = 600
+    timeout_seconds: int = 1800
 
     def __post_init__(self):
         for field in fields(self):
@@ -63,7 +63,7 @@ def load_config(path: Path | None = None) -> ReviewConfig:
     explicit = path is not None
     path = (
         path
-        or Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "declank/config.json"
+        or Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "walleye/config.json"
     )
     if not path.exists() and not explicit:
         return ReviewConfig()
@@ -246,7 +246,7 @@ def prepare_review(
                 for c in candidates
                 if c["row"]["path"] == target["path"]
                 and c["row"]["line"] == target["line"]
-                and c["row"]["name"] == target["name"]
+                and c["row"].get("qualified_name", c["row"]["name"]) == target["name"]
             ]
             if len(matches) != 1:
                 raise ValueError(f"Saved target no longer matches the scan: {target['path']}")
@@ -279,7 +279,7 @@ def prepare_review(
     output = (
         output
         or Path.cwd()
-        / ".declank/reviews"
+        / ".walleye/reviews"
         / f"{Path(report['root']).name}-{timestamp}-{uuid4().hex[:6]}"
     ).absolute()
     output.mkdir(parents=True, exist_ok=False)
