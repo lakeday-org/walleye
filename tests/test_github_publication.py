@@ -116,7 +116,7 @@ def test_issue_links_call_context_and_handles_fences_in_source(finding, metadata
     assert len(data["graph"]["edges"]) == 6
     assert body.count("- [render]") == 1
     assert f"[pathParts]({repo.url}/blob/{'a' * 40}/src/path.ts#L3-L20)" in body
-    assert "````\nconst fence = '```';\n````" in body
+    assert "````typescript\nconst fence = '```';\n````" in body
 
 
 @pytest.mark.parametrize("objective,name", [("bug", "bugs"), ("refactor", "architecture")])

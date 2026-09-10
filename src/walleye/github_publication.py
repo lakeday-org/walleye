@@ -4,7 +4,10 @@ import base64
 import hashlib
 import json
 import re
+from pathlib import Path
 from urllib.parse import quote
+
+from .languages import EXTENSIONS
 
 WRITING = """Write issue and pull request text as a concise engineer speaking to another engineer.
 Assume the reader has never seen the review packet or this conversation. Explain the component's
@@ -15,6 +18,7 @@ or a score increase. Bug issue titles describe the failure; PR titles describe t
 Refactor titles name the responsibility being separated and why.
 Explain maintenance benefits as specific changes that become easier
 to make or verify, not 'improves maintainability'. Scores alone do not justify a change.
+Do not pad a refactor with statements denying unrelated crashes, data loss, or timing bugs.
 Use Markdown paragraphs, short lists, and descriptive headings. Include enough substance to
 review the proposal without opening another issue. No hype, canned AI phrases, flattery, emojis,
 theatrical headings, marketing,
@@ -33,7 +37,7 @@ instead of changing unrelated behavior. In Compatibility, name the contracts and
 cases preserved. In Tests added, name the tests and the behavior each exercises; distinguish
 regression from characterization coverage. For bugs, explain how tests trigger the failure and
 check recovery or isolation where relevant, not just a happy path. Use the frozen test file
-supplied.
+supplied. Use one bullet per test or behavior group instead of a list of test names without reasons.
 Keep detail proportional to the change, but do not reduce the description to 'improves this method'
 or a score claim. Do not put test status or execution claims in description; the coordinator adds
 verified results after running checks. summary is an internal author note and is not published.
@@ -128,13 +132,14 @@ def issue_summary(finding):
 def source_evidence(repository, metadata):
     excerpts = []
     for number, item in enumerate(metadata["finding"]["evidence"], 1):
+        language = EXTENSIONS.get(Path(item["path"]).suffix.lower(), "")
         fence = "`" * max(
             3, max((len(m[0]) + 1 for m in re.finditer(r"`+", item["quote"])), default=0)
         )
         excerpts.append(
             f"**{number}.** "
             + source_link(repository, metadata["commit"], item)
-            + f"\n\n{fence}\n{item['quote']}\n{fence}"
+            + f"\n\n{fence}{language}\n{item['quote']}\n{fence}"
         )
     title = "Code with bug" if metadata["finding"]["objective"] == "bug" else "Source evidence"
     return f"## {title}\n\n" + "\n\n".join(excerpts)

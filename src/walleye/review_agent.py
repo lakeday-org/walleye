@@ -26,13 +26,17 @@ For a refactor, give one cohesive proposed change, preserved behavior, and the e
 Write context to explain the component's role and the relevant caller or data flow. root_cause
 names the defect or maintenance burden. In explanation, trace the causal chain step by step:
 entry point, state/control transition, failure or coupling, and consequence. Each step cites
-one or more 1-based indices into evidence. Supply evidence for every material hop, not just the
-target's suspicious line. Use impact to bound the affected users, operations, instances or data;
-distinguish per-object from process-wide effects, deterministic triggers from timing-dependent
-ones, and established consequences from conditional ones. Do not escalate a local problem into
-global data loss without evidence. State the concrete trigger, including ordering/preconditions.
+one or more 1-based indices into evidence. Each cited excerpt must contain the condition or state
+transition being explained, not just an unrelated opening line. Supply evidence for every material
+hop. For bugs, use impact to bound the affected users, operations, instances or data. Distinguish
+local from process-wide effects and deterministic from timing-dependent triggers when relevant.
+Do not escalate a local problem into global data loss without evidence. State the concrete trigger,
+including ordering/preconditions. Do not repeat irrelevant risk categories or absence-of-evidence
+disclaimers. Write the explanation as direct causal steps, without 'Entry point:' or 'State
+transition:' labels. Describe the original code; put the proposed change in proposed_change.
 For refactors, explain which responsibilities are coupled and which future change or test becomes
-easier; do not invent a behavioral defect. In expected_benefit, explain the practical result of
+easier; impact should name the maintenance task that is difficult today, not list unrelated bug
+risks. Do not invent a behavioral defect. In expected_benefit, explain the practical result of
 the proposed change. Make validation an actionable test plan with inputs and expected outcomes.
 Recommend a fix that addresses the cause while preserving intentional contracts, locks and gates.
 Do not name an introducing commit or author: the packet supplies current source, not verified
