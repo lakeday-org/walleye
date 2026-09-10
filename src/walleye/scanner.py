@@ -548,83 +548,100 @@ def _coverage(discovery, scanned: Counter, files: list[dict], functions: list[di
     }
 
 
-def scan(
-    target: Path,
-    options: ScanOptions | None = None,
+def _process_discovered_file(
+    path: Path,
+    relative: str,
+    language: str,
+    options: ScanOptions,
     *,
     source_snapshot: dict[str, bytes] | None = None,
 ) -> dict:
-    options = options or ScanOptions()
-    target = target.expanduser().absolute()
-    if target.is_symlink():
-        raise ValueError("Scan a real file or directory, not a symbolic link")
-    if not target.exists():
-        raise ValueError(f"Path does not exist: {target}")
-    if not (target.is_file() or target.is_dir()):
-        raise ValueError(f"Not a regular file or directory: {target}")
-    target = target.resolve()
-    started = time.monotonic()
-    discovery = discover(target, options)
-    files, functions, issues = [], [], list(discovery.issues)
-    graph_facts = []
-    skipped = discovery.skipped.copy()
-    scanned = Counter()
-    fingerprint = hashlib.sha256()
-    source_hashes = {}
-    for path, relative, language in discovery.files:
-        try:
-            # Bound the actual read, including files that grow after discovery.
-            with path.open("rb") as stream:
-                source = stream.read(options.max_bytes + 1)
-            if len(source) > options.max_bytes:
-                skipped["oversized"] += 1
-                issues.append({"path": relative, "kind": "size", "message": "Exceeds --max-bytes"})
-                continue
-            if not options.include_generated and GENERATED_HEADER.search(source[:2048]):
-                skipped["generated-header"] += 1
-                continue
-            if not options.include_generated and language in {"javascript", "typescript", "tsx"}:
-                lengths = [len(line) for line in source.splitlines() if line.strip()]
-                if lengths and max(lengths) > 5000 and sum(lengths) / len(lengths) > 200:
-                    skipped["minified-heuristic"] += 1
-                    continue
-            if b"\0" in source:
-                offset = source.index(b"\0")
-                skipped["read-or-parser-error"] += 1
-                issues.append(
-                    {
-                        "path": relative,
-                        "kind": "read-or-parser",
-                        "line": source[:offset].count(b"\n") + 1,
-                        "column": offset - source.rfind(b"\n", 0, offset),
-                        "message": "Binary content (NUL byte); file left unscored",
-                    }
-                )
-                continue
-            fingerprint.update(relative.encode("utf-8", errors="surrogateescape") + b"\0")
-            fingerprint.update(hashlib.sha256(source).digest())
-            found_files, found_functions, errors = analyze_units(
-                source,
-                language,
-                relative,
-                include_tests=options.include_tests,
-                sql_dialect=options.sql_dialect,
-                graph_facts=graph_facts,
-            )
-            if errors:
-                skipped["parse-error"] += 1
-                issues.extend(errors)
-            else:
-                scanned[language] += 1
-                files.extend(found_files)
-                functions.extend(found_functions)
-                source_hashes[relative] = hashlib.sha256(source).hexdigest()
-                if source_snapshot is not None:
-                    source_snapshot[relative] = source
-        except (OSError, UnicodeError, ValueError, RuntimeError, LookupError) as error:
-            skipped["read-or-parser-error"] += 1
-            issues.append({"path": relative, "kind": "read-or-parser", "message": str(error)})
+    """Process one discovered file and return scan-state deltas."""
 
+    result = {
+        "files": [],
+        "functions": [],
+        "issues": [],
+        "skipped": Counter(),
+        "scanned": Counter(),
+        "fingerprint": b"",
+        "source_hashes": {},
+        "graph_facts": [],
+    }
+    try:
+        # Bound the actual read, including files that grow after discovery.
+        with path.open("rb") as stream:
+            source = stream.read(options.max_bytes + 1)
+        if len(source) > options.max_bytes:
+            result["skipped"]["oversized"] += 1
+            result["issues"].append(
+                {"path": relative, "kind": "size", "message": "Exceeds --max-bytes"}
+            )
+            return result
+        if not options.include_generated and GENERATED_HEADER.search(source[:2048]):
+            result["skipped"]["generated-header"] += 1
+            return result
+        if not options.include_generated and language in {"javascript", "typescript", "tsx"}:
+            lengths = [len(line) for line in source.splitlines() if line.strip()]
+            if lengths and max(lengths) > 5000 and sum(lengths) / len(lengths) > 200:
+                result["skipped"]["minified-heuristic"] += 1
+                return result
+        if b"\0" in source:
+            offset = source.index(b"\0")
+            result["skipped"]["read-or-parser-error"] += 1
+            result["issues"].append(
+                {
+                    "path": relative,
+                    "kind": "read-or-parser",
+                    "line": source[:offset].count(b"\n") + 1,
+                    "column": offset - source.rfind(b"\n", 0, offset),
+                    "message": "Binary content (NUL byte); file left unscored",
+                }
+            )
+            return result
+        result["fingerprint"] = (
+            relative.encode("utf-8", errors="surrogateescape")
+            + b"\0"
+            + hashlib.sha256(source).digest()
+        )
+        found_files, found_functions, errors = analyze_units(
+            source,
+            language,
+            relative,
+            include_tests=options.include_tests,
+            sql_dialect=options.sql_dialect,
+            graph_facts=result["graph_facts"],
+        )
+        if errors:
+            result["skipped"]["parse-error"] += 1
+            result["issues"].extend(errors)
+        else:
+            result["scanned"][language] += 1
+            result["files"].extend(found_files)
+            result["functions"].extend(found_functions)
+            result["source_hashes"][relative] = hashlib.sha256(source).hexdigest()
+            if source_snapshot is not None:
+                source_snapshot[relative] = source
+    except (OSError, UnicodeError, ValueError, RuntimeError, LookupError) as error:
+        result["skipped"]["read-or-parser-error"] += 1
+        result["issues"].append({"path": relative, "kind": "read-or-parser", "message": str(error)})
+    return result
+
+
+def _build_scan_report(
+    target: Path,
+    options: ScanOptions,
+    discovery,
+    files: list[dict],
+    functions: list[dict],
+    issues: list[dict],
+    graph_facts: list,
+    skipped: Counter,
+    scanned: Counter,
+    fingerprint,
+    source_hashes: dict,
+    started: float,
+) -> dict:
     graph = build_graph(graph_facts, files, functions)
     by_file_functions = Counter(row["path"] for row in functions)
     by_file_top_level = Counter(row["path"] for row in functions if row.get("function_depth") == 0)
@@ -751,3 +768,59 @@ def scan(
 
     report["health"] = health_snapshot(report)
     return report
+
+
+def scan(
+    target: Path,
+    options: ScanOptions | None = None,
+    *,
+    source_snapshot: dict[str, bytes] | None = None,
+) -> dict:
+    options = options or ScanOptions()
+    target = target.expanduser().absolute()
+    if target.is_symlink():
+        raise ValueError("Scan a real file or directory, not a symbolic link")
+    if not target.exists():
+        raise ValueError(f"Path does not exist: {target}")
+    if not (target.is_file() or target.is_dir()):
+        raise ValueError(f"Not a regular file or directory: {target}")
+    target = target.resolve()
+    started = time.monotonic()
+    discovery = discover(target, options)
+    files, functions, issues = [], [], list(discovery.issues)
+    graph_facts = []
+    skipped = discovery.skipped.copy()
+    scanned = Counter()
+    fingerprint = hashlib.sha256()
+    source_hashes = {}
+    for path, relative, language in discovery.files:
+        file_result = _process_discovered_file(
+            path,
+            relative,
+            language,
+            options,
+            source_snapshot=source_snapshot,
+        )
+        fingerprint.update(file_result["fingerprint"])
+        graph_facts.extend(file_result["graph_facts"])
+        files.extend(file_result["files"])
+        functions.extend(file_result["functions"])
+        issues.extend(file_result["issues"])
+        skipped.update(file_result["skipped"])
+        scanned.update(file_result["scanned"])
+        source_hashes.update(file_result["source_hashes"])
+
+    return _build_scan_report(
+        target,
+        options,
+        discovery,
+        files,
+        functions,
+        issues,
+        graph_facts,
+        skipped,
+        scanned,
+        fingerprint,
+        source_hashes,
+        started,
+    )
