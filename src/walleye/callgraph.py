@@ -54,35 +54,38 @@ def _use_names(node, prefix=""):
         yield path, path.rsplit("::", 1)[-1]
 
 
-def _imports(root, source: bytes, language: str) -> list[dict]:
+def _python_imports(source: bytes) -> list[dict]:
     imports = []
-    if language == "python":
-        try:
-            module = ast.parse(source)
-        except SyntaxError:
-            return []  # Python newer than this interpreter can still use Tree-sitter.
-        for node in module.body:
-            if isinstance(node, ast.Import):
-                for alias in node.names:
-                    imports.append(
-                        dict(
-                            module=alias.name,
-                            name=None,
-                            alias=alias.asname or alias.name,
-                            line=node.lineno,
-                        )
+    try:
+        module = ast.parse(source)
+    except SyntaxError:
+        return []  # Python newer than this interpreter can still use Tree-sitter.
+    for node in module.body:
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                imports.append(
+                    dict(
+                        module=alias.name,
+                        name=None,
+                        alias=alias.asname or alias.name,
+                        line=node.lineno,
                     )
-            elif isinstance(node, ast.ImportFrom):
-                for alias in node.names:
-                    imports.append(
-                        dict(
-                            module="." * node.level + (node.module or ""),
-                            name=alias.name,
-                            alias=alias.asname or alias.name,
-                            line=node.lineno,
-                        )
+                )
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                imports.append(
+                    dict(
+                        module="." * node.level + (node.module or ""),
+                        name=alias.name,
+                        alias=alias.asname or alias.name,
+                        line=node.lineno,
                     )
-        return imports
+                )
+    return imports
+
+
+def _tree_sitter_imports(root) -> list[dict]:
+    imports = []
     for node in root.named_children:
         if node.type in {"import_statement", "export_statement"}:
             source_node = node.child_by_field_name("source")
@@ -131,6 +134,12 @@ def _imports(root, source: bytes, language: str) -> list[dict]:
                 )
             )
     return imports
+
+
+def _imports(root, source: bytes, language: str) -> list[dict]:
+    if language == "python":
+        return _python_imports(source)
+    return _tree_sitter_imports(root)
 
 
 def collect_facts(root, source, path, language, nodes, records, excluded) -> Facts:
