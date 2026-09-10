@@ -7,20 +7,57 @@ import re
 from urllib.parse import quote
 
 WRITING = """Write issue and pull request text as a concise engineer speaking to another engineer.
-Lead with the concrete problem and resulting behavior. Use plain words, precise filenames,
-and evidence. No hype, canned AI phrases, flattery, emojis, theatrical headings, marketing,
+Assume the reader has never seen the review packet or this conversation. Explain the component's
+role, the relevant caller or data flow, the concrete problem, and its consequence before the fix.
+Use exact symbols and examples from the supplied source; never invent product context or callers.
+Titles must name the affected behavior or responsibility, not 'improve method', 'clean up code',
+or a score increase. Bug issue titles describe the failure; PR titles describe the concrete fix.
+Refactor titles name the responsibility being separated and why.
+Explain maintenance benefits as specific changes that become easier
+to make or verify, not 'improves maintainability'. Scores alone do not justify a change.
+Use Markdown paragraphs, short lists, and descriptive headings. Include enough substance to
+review the proposal without opening another issue. No hype, canned AI phrases, flattery, emojis,
+theatrical headings, marketing,
 or claims of verification you did not receive. Avoid 'leverage', 'delve', 'robust', 'seamless',
 'enhance', 'comprehensive', and 'it's worth noting'. Explain why the change matters and what
 was actually tested. Do not mention these writing instructions in the result.
 """
+PR_WRITING = """The title and description will be used in a public pull request.
+The title must name the component and the specific behavioral fix or responsibility separated.
+Write description as Markdown with ## Problem, ## Changes, ## Compatibility, and ## Tests added.
+In Problem, explain the component's role in the program, the relevant caller or data flow when
+supported by source, and what fails or makes future changes difficult. Give a concrete input/output
+example for bugs. In Changes, name the symbols changed, explain the approach and why it addresses
+that causal chain, including any meaningful tradeoff. Explain why the fix is scoped this way
+instead of changing unrelated behavior. In Compatibility, name the contracts and edge
+cases preserved. In Tests added, name the tests and the behavior each exercises; distinguish
+regression from characterization coverage. For bugs, explain how tests trigger the failure and
+check recovery or isolation where relevant, not just a happy path. Use the frozen test file
+supplied.
+Keep detail proportional to the change, but do not reduce the description to 'improves this method'
+or a score claim. Do not put test status or execution claims in description; the coordinator adds
+verified results after running checks. summary is an internal author note and is not published.
+"""
 MARKER = "walleye-finding-v1"
+LABELS = {
+    "bug": {
+        "name": "bugs",
+        "color": "d73a4a",
+        "description": "Behavioral defects with source evidence",
+    },
+    "refactor": {
+        "name": "architecture",
+        "color": "5319e7",
+        "description": "Code structure and maintainability improvements",
+    },
+}
 
 
-def finding_metadata(repository, sha, branch, target, finding):
+def finding_metadata(repository, sha, branch, target, finding, *, graph=None):
     identity = {k: finding[k] for k in ("objective", "root_cause")}
     identity.update(repository=repository.full_name, path=target["path"], name=target["name"])
     key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
-    return {
+    metadata = {
         "version": 1,
         "key": key,
         "repository": repository.full_name,
@@ -29,34 +66,131 @@ def finding_metadata(repository, sha, branch, target, finding):
         "target": target,
         "finding": finding,
     }
+    if graph:
+        # Keep a few source-backed relationships, not the entire repository graph.
+        edges = graph.get("edges", [])[:6]
+        endpoints = {e[k] for e in edges for k in ("source", "target")}
+        metadata["graph"] = {
+            "edges": edges,
+            "nodes": [n for n in graph.get("nodes", []) if n["id"] in endpoints],
+        }
+    return metadata
+
+
+def source_link(repository, commit, item, label=None):
+    location = f"{item['path']}:{item['line']}-{item['end_line']}"
+    url = (
+        f"{repository.url}/blob/{commit}/{quote(item['path'], safe='/')}"
+        f"#L{item['line']}-L{item['end_line']}"
+    )
+    return f"[{label or location}]({url})"
+
+
+def call_context(repository, metadata):
+    graph = metadata.get("graph", {})
+    nodes = {n["id"]: n for n in graph.get("nodes", []) if "path" in n}
+    lines = []
+    for edge in graph.get("edges", []):
+        if edge["source"] not in nodes or edge["target"] not in nodes:
+            continue
+        links = [
+            source_link(
+                repository, metadata["commit"], nodes[edge[k]], nodes[edge[k]]["qualified_name"]
+            )
+            for k in ("source", "target")
+        ]
+        line = "- " + " → ".join(links)
+        if line not in lines:
+            lines.append(line)
+    if not lines:
+        return ""
+    return "## Call context\n\nResolved static references:\n\n" + "\n".join(lines)
+
+
+def issue_summary(finding):
+    paragraphs = ["## Summary"]
+    if finding.get("context"):
+        paragraphs.append("**Context:** " + finding["context"])
+    label = "Bug" if finding["objective"] == "bug" else "Architecture"
+    paragraphs.append(f"**{label}:** " + finding["root_cause"])
+    if finding["objective"] == "bug":
+        paragraphs.extend(
+            [
+                "**Actual:** " + finding["actual_behavior"],
+                "**Expected:** " + finding["expected_behavior"],
+            ]
+        )
+    if impact := finding.get("impact") or finding.get("expected_benefit"):
+        paragraphs.append("**Impact:** " + impact)
+    return "\n\n".join(paragraphs)
+
+
+def source_evidence(repository, metadata):
+    excerpts = []
+    for number, item in enumerate(metadata["finding"]["evidence"], 1):
+        fence = "`" * max(
+            3, max((len(m[0]) + 1 for m in re.finditer(r"`+", item["quote"])), default=0)
+        )
+        excerpts.append(
+            f"**{number}.** "
+            + source_link(repository, metadata["commit"], item)
+            + f"\n\n{fence}\n{item['quote']}\n{fence}"
+        )
+    title = "Code with bug" if metadata["finding"]["objective"] == "bug" else "Source evidence"
+    return f"## {title}\n\n" + "\n\n".join(excerpts)
+
+
+def explanation_body(repository, metadata):
+    lines = []
+    for number, step in enumerate(metadata["finding"].get("explanation", []), 1):
+        citations = [
+            source_link(
+                repository,
+                metadata["commit"],
+                metadata["finding"]["evidence"][i - 1],
+                f"source {i}",
+            )
+            for i in step["evidence"]
+        ]
+        lines.append(f"{number}. {step['text']} " + ", ".join(citations))
+    return "## Explanation\n\n" + "\n".join(lines) if lines else ""
 
 
 def issue_body(repository, metadata):
-    finding = metadata["finding"]
-    paragraphs = [finding["root_cause"]]
-    fields = (
-        ("trigger", "Trigger"),
-        ("expected_behavior", "Expected"),
-        ("actual_behavior", "Actual"),
-        ("proposed_change", "Change"),
-        ("preserved_behavior", "Preserves"),
-        ("validation", "Validation"),
-    )
-    paragraphs.extend(f"**{label}:** {finding[key]}" for key, label in fields if finding[key])
-    for item in finding["evidence"]:
-        url = (
-            repository.url
-            + "/blob/"
-            + metadata["commit"]
-            + "/"
-            + quote(item["path"], safe="/")
-            + f"#L{item['line']}-L{item['end_line']}"
-        )
-        paragraphs.append(f"[{item['path']}:{item['line']}]({url})\n\n```\n{item['quote']}\n```")
+    finding, target = metadata["finding"], metadata["target"]
+    paragraphs = [
+        issue_summary(finding),
+        f"**Location:** `{target['name']}` in "
+        + source_link(repository, metadata["commit"], target),
+    ]
+    if finding["objective"] == "bug":
+        paragraphs.append("**Trigger:** " + finding["trigger"])
+    paragraphs.append(source_evidence(repository, metadata))
+    if explanation := explanation_body(repository, metadata):
+        paragraphs.append(explanation)
+    if context := call_context(repository, metadata):
+        paragraphs.append(context)
+    if finding.get("proposed_change"):
+        title = "Recommended fix" if finding["objective"] == "bug" else "Proposed change"
+        paragraphs.append(f"## {title}\n\n" + finding["proposed_change"])
+    if finding.get("expected_benefit"):
+        paragraphs.append("**Expected benefit:** " + finding["expected_benefit"])
+    if finding.get("preserved_behavior"):
+        paragraphs.append("**Behavior to preserve:** " + finding["preserved_behavior"])
+    paragraphs.append("## Validation plan\n\n" + finding["validation"])
     paragraphs.append(
-        f"{finding['objective'].capitalize()} · {finding['severity']} severity · "
-        f"{finding['confidence']} confidence. Source evidence checked; "
-        "tests have not been run for this finding."
+        "Source evidence checked. This finding has not yet been reproduced by running tests."
+        if finding["objective"] == "bug"
+        else "Source evidence checked. The proposed refactor and its tests have not been run."
+    )
+    assessment = (
+        f"Potential bug · {finding['severity']} severity"
+        if finding["objective"] == "bug"
+        else "Architecture improvement"
+    )
+    paragraphs.append(
+        f"{assessment} · {finding['confidence']} confidence. "
+        f"Reviewed at [{metadata['commit'][:7]}]({repository.url}/commit/{metadata['commit']})."
     )
     payload = base64.b64encode(json.dumps(metadata, separators=(",", ":")).encode()).decode()
     paragraphs.append(f"<!-- {MARKER}:{payload} -->")
@@ -64,6 +198,30 @@ def issue_body(repository, metadata):
     if len(body) > 60000:
         raise ValueError("Finding is too large for a GitHub issue")
     return body
+
+
+def ensure_label(github, objective):
+    label = LABELS[objective]
+
+    def existing():
+        return next(
+            (
+                item["name"]
+                for item in github.pages("/labels")
+                if item["name"].casefold() == label["name"]
+            ),
+            None,
+        )
+
+    if name := existing():
+        return name
+    try:
+        return github.api("POST", "/labels", label)["name"]
+    except ValueError:
+        # Another job may have created it. Re-read, without retrying the mutation.
+        if name := existing():
+            return name
+        raise
 
 
 def read_metadata(body, repository):
@@ -95,24 +253,41 @@ def publish_findings(github, manifest, packets, workspace, *, output=None):
             continue
     by_id = {p["task_id"]: p for p in packets}
     published = []
+    labels = {}
     for finding in manifest["findings"]:
         packet = by_id[finding["task_id"]]
         metadata = finding_metadata(
-            github.repository, workspace.sha, workspace.base_branch, packet["target"], finding
+            github.repository,
+            workspace.sha,
+            workspace.base_branch,
+            packet["target"],
+            finding,
+            graph=packet.get("graph"),
         )
+        objective = finding["objective"]
+        if objective not in labels:
+            labels[objective] = ensure_label(github, objective)
+        label = labels[objective]
         issue = existing.get(metadata["key"])
         if issue is None:
+            payload = {
+                "title": finding["title"],
+                "body": issue_body(github.repository, metadata),
+                "labels": [label],
+            }
             if output:
                 write_json(
                     output / f"issue-{finding['task_id']}-request.json",
-                    {"title": finding["title"], "body": issue_body(github.repository, metadata)},
+                    payload,
                 )
             issue = github.api(
                 "POST",
                 "/issues",
-                {"title": finding["title"], "body": issue_body(github.repository, metadata)},
+                payload,
             )
             existing[metadata["key"]] = issue
+        elif label not in [item["name"] for item in issue.get("labels", [])]:
+            github.api("POST", f"/issues/{issue['number']}/labels", {"labels": [label]})
         published.append(
             {
                 "task_id": finding["task_id"],
@@ -127,21 +302,68 @@ def publish_findings(github, manifest, packets, workspace, *, output=None):
     return published
 
 
-def pull_body(issue, description, card, tests):
+def pull_body(issue, description, card, tests, *, test_path):
     quality = card["maintainability"]["repository"]["score"]
     target = card["maintainability"]["target_quality"]
     module = card["maintainability"]["region"]["quality"]
-    return (
-        description.strip() + f"\n\nCloses #{issue}.\n<!-- walleye-issue:{issue} -->\n\n"
-        f"Validation: frozen native tests and all {len(tests)} configured project checks passed. "
-        "The independent correctness and maintainability review passed.\n\n"
-        "| Structural quality | Before | After |\n| --- | ---: | ---: |\n"
-        f"| Changed function | {target['before']:.4f} | {target['after']:.4f} |\n"
-        f"| Changed module, including helpers | {module['before']:.4f} | {module['after']:.4f} |\n"
-        f"| Repository | {quality['before']:.4f} | {quality['after']:.4f} |\n\n"
-        "Checks run:\n"
-        + "\n".join("- `" + " ".join(t["command"]) + "`" for t in tests)
-        + "\n\nScores compare the same parsed source files. These are candidate scores; "
-        "the base branch changes only after merge. "
-        "Unresolved calls and unreviewed behavior remain unknown."
+    paragraphs = [description.strip(), f"Closes #{issue}.\n<!-- walleye-issue:{issue} -->"]
+    validation = [
+        "## Validation",
+        f"Tests in `{test_path}` were run against both the original and patched code.",
+    ]
+    cases = card["correctness"].get("test_cases", [])
+    if cases:
+        rows = ["| Test | Before | After |", "| --- | --- | --- |"]
+        rows.extend(
+            f"| `{c['name'].replace('|', '&#124;')}` | {c['before']} | {c['after']} |"
+            for c in cases
+        )
+        validation.append("\n".join(rows))
+    else:
+        counts = card["correctness"]["tests_passing"]
+        validation.append(f"New tests passing: {counts['before']} before, {counts['after']} after.")
+    validation.append(
+        "Project checks:\n\n"
+        + "\n".join(
+            "- "
+            + ("Passed" if t["exit_code"] == 0 else f"Failed (exit {t['exit_code']})")
+            + ": `"
+            + " ".join(t["command"])
+            + "`"
+            for t in tests
+        )
     )
+    validation.append("The patch and tests also passed an independent agent review.")
+    paragraphs.append("\n\n".join(validation))
+    scores = [
+        "## Measured impact",
+        "Quality scores run from 0–100; higher is better.",
+        "| Scope | Before | After | Change |\n| --- | ---: | ---: | ---: |",
+    ]
+    for label, values in (
+        ("Repository", quality),
+        ("Changed module, including helpers", module),
+        ("Changed function", target),
+    ):
+        scores[-1] += (
+            f"\n| {label} | {values['before']:.4f} | {values['after']:.4f} | "
+            f"{values['after'] - values['before']:+.4f} |"
+        )
+    region = card["maintainability"]["region"]
+    scores.append(
+        "Changed module: "
+        + "; ".join(
+            f"{label} {region[key]['before']} → {region[key]['after']}"
+            for key, label in (("decisions", "decisions"), ("max_nesting", "maximum nesting"))
+            if key in region
+        )
+        + "."
+    )
+    scores.append(
+        f"Scores cover the same {card['scope']['source_files']} parsed source files "
+        "and all helpers in the changed module. They measure code structure, not bug probability."
+    )
+    if comparison := card["scope"].get("comparison_url"):
+        scores.append(f"[Exact commits used for this comparison]({comparison})")
+    paragraphs.append("\n\n".join(scores))
+    return "\n\n".join(paragraphs)

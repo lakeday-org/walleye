@@ -39,7 +39,10 @@ def saved(tmp_path):
     finding = {
         "objective": "bug",
         "title": "Negative inputs are not clamped",
+        "context": "clamp bounds numeric inputs.",
         "root_cause": "Lower bound missing",
+        "impact": "Negative inputs escape the lower bound.",
+        "explanation": [{"text": "Only the upper bound is checked.", "evidence": [1]}],
         "severity": "medium",
         "confidence": "high",
         "trigger": "clamp(-1)",

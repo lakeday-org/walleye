@@ -23,6 +23,22 @@ A finding must cite a short exact source quote and lines present in the supplied
 including evidence inside the target. Explain the causal argument and a concrete validation test.
 Do not claim a test was run. For a bug, give a reachable trigger, expected and actual behavior.
 For a refactor, give one cohesive proposed change, preserved behavior, and the expected benefit.
+Write context to explain the component's role and the relevant caller or data flow. root_cause
+names the defect or maintenance burden. In explanation, trace the causal chain step by step:
+entry point, state/control transition, failure or coupling, and consequence. Each step cites
+one or more 1-based indices into evidence. Supply evidence for every material hop, not just the
+target's suspicious line. Use impact to bound the affected users, operations, instances or data;
+distinguish per-object from process-wide effects, deterministic triggers from timing-dependent
+ones, and established consequences from conditional ones. Do not escalate a local problem into
+global data loss without evidence. State the concrete trigger, including ordering/preconditions.
+For refactors, explain which responsibilities are coupled and which future change or test becomes
+easier; do not invent a behavioral defect. In expected_benefit, explain the practical result of
+the proposed change. Make validation an actionable test plan with inputs and expected outcomes.
+Recommend a fix that addresses the cause while preserving intentional contracts, locks and gates.
+Do not name an introducing commit or author: the packet supplies current source, not verified
+history. A reviewed commit or a blame line alone does not establish when a bug was introduced.
+Bug titles describe a failure, not an instruction to fix it. Refactor titles identify the
+responsibilities being separated, not a generic request to improve a function.
 Use empty strings for finding fields that do not apply to the objective. Never invent contracts.
 If a necessary contract, type, caller, or enclosing condition is absent, return needs_context
 with specific resource IDs and inclusive lines from the provided catalog. Request the entire
@@ -49,7 +65,19 @@ def response_schema():
         {
             "objective": {"type": "string", "enum": ["bug", "refactor"]},
             "title": string,
+            "context": string,
             "root_cause": string,
+            "impact": string,
+            "explanation": {
+                "type": "array",
+                "maxItems": 8,
+                "items": _object(
+                    {
+                        "text": string,
+                        "evidence": {"type": "array", "maxItems": 8, "items": integer},
+                    }
+                ),
+            },
             "severity": {"type": "string", "enum": ["low", "medium", "high", "critical"]},
             "confidence": {"type": "string", "enum": ["low", "medium", "high"]},
             **{
@@ -66,7 +94,7 @@ def response_schema():
             },
             "evidence": {
                 "type": "array",
-                "maxItems": 4,
+                "maxItems": 8,
                 "items": _object(
                     {"path": string, "line": integer, "end_line": integer, "quote": string}
                 ),
@@ -310,7 +338,14 @@ def quote_matches(quote, lines, start, end):
     return bool(quoted) and quoted in actual
 
 
-def validate_response(response, packet, index, expansion=()):
+def stored_finding(finding):
+    """Revalidate older saved findings without inventing missing narrative or evidence."""
+    defaults = {"context": "", "impact": "", "explanation": []}
+    fields = response_schema()["properties"]["finding"]["anyOf"][0]["properties"]
+    return {key: finding[key] if key in finding else defaults[key] for key in fields}
+
+
+def validate_response(response, packet, index, expansion=(), *, require_detail=True):
     _check_shape(response, response_schema())
     if not response["summary"].strip():
         raise ValueError("Every result needs a summary")
@@ -336,6 +371,19 @@ def validate_response(response, packet, index, expansion=()):
         raise ValueError("Finding lacks causal explanation or validation")
     if not finding["evidence"]:
         raise ValueError("Finding has no source evidence")
+    if require_detail and (
+        not finding["context"].strip()
+        or not finding["impact"].strip()
+        or not finding["explanation"]
+    ):
+        raise ValueError("Finding needs context, bounded impact, and a causal explanation")
+    for step in finding["explanation"]:
+        if (
+            not step["text"].strip()
+            or not step["evidence"]
+            or any(number > len(finding["evidence"]) for number in step["evidence"])
+        ):
+            raise ValueError("Every explanation step must reference supplied source evidence")
     target_evidence = False
     for evidence in finding["evidence"]:
         path, start, end = evidence["path"], evidence["line"], evidence["end_line"]

@@ -1,5 +1,10 @@
 # walleye
 
+[![Build](https://github.com/lakeday-org/walleye/actions/workflows/tests.yml/badge.svg?branch=main)](https://github.com/lakeday-org/walleye/actions/workflows/tests.yml)
+[![MIT](https://img.shields.io/badge/license-MIT-38b2ac)](LICENSE)
+[![Python](https://img.shields.io/badge/python-3.10%2B-3776ab)](https://www.python.org/downloads/)
+[![Languages](https://img.shields.io/badge/languages-64-0e7490)](#commands)
+
 Code quality scans and tested fixes for local and GitHub repositories. Supports 64 languages.
 
 - Rank functions by maintainability, complexity, and call graph impact.
@@ -13,6 +18,22 @@ Python 3.10+ and [uv](https://docs.astral.sh/uv/).
 ```sh
 uv tool install git+https://github.com/lakeday-org/walleye.git
 ```
+
+## AI access
+
+For reviews and fixes, set an [OpenAI API key](https://developers.openai.com/api/docs/quickstart):
+
+```sh
+export OPENAI_API_KEY="your-api-key"
+```
+
+Or, with no API key set, sign in using an installed [Codex CLI](https://developers.openai.com/codex/auth):
+
+```sh
+codex login
+```
+
+Scans do not need AI access.
 
 ## Commands
 
@@ -30,7 +51,6 @@ walleye improve https://github.com/owner/repo/issues/42
 | `improve` | A worktree, tests, a fix, a rescan, and a PR. Requires passing tests and improved maintainability. No automatic merge. |
 
 `--issues 5` limits findings. `--budget 5` sets the run's dollar budget.
-Reviews use `OPENAI_API_KEY` when set, otherwise your existing Codex login.
 Codex spending is an API cost estimate, not a hard cap or subscription charge.
 
 ## GitHub App

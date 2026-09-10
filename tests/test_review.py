@@ -60,7 +60,10 @@ def result_for(packet):
         "finding": {
             "objective": "bug",
             "title": "Unhandled zero input",
+            "context": "calculate divides a value to produce a result.",
             "root_cause": "Zero is admitted",
+            "impact": "Calls with zero fail instead of returning a result.",
+            "explanation": [{"text": "Zero reaches the calculation.", "evidence": [1]}],
             "severity": "medium",
             "confidence": "high",
             "trigger": "Call with zero",
@@ -89,6 +92,18 @@ def no_finding():
         "finding": None,
         "context_requests": [],
     }
+
+
+@pytest.mark.parametrize("missing", ["context", "impact", "explanation", "citation"])
+def test_findings_require_context_impact_and_cited_causal_steps(prepared, missing):
+    _, packets, index, _ = prepared
+    response = result_for(packets[0])
+    if missing == "citation":
+        response["finding"]["explanation"][0]["evidence"] = [2]
+    else:
+        response["finding"][missing] = [] if missing == "explanation" else ""
+    with pytest.raises(ValueError):
+        validate_response(response, packets[0], index)
 
 
 def measured(response, input_tokens=1000, output_tokens=200):

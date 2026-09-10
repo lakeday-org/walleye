@@ -371,6 +371,10 @@ def test_native_worktree_pipeline_runs_real_tests_and_publishes_only_verified_pa
     assert pull["body"].startswith("Clamp both bounds with standard operations.")
     assert "Tests were not run by the patch author" not in pull["body"]
     assert "Changed module, including helpers" in pull["body"]
+    assert "| `test_negative` | Assertion failed | Passed |" in pull["body"]
+    assert "## Validation" in pull["body"] and "## Measured impact" in pull["body"]
+    assert "tests/test_regression.py" in pull["body"]
+    assert f"/compare/{workspace.sha}...{result['head_commit']}" in pull["body"]
     assert git(Path(result["worktree"]), "log", "-1", "--format=%an <%ae>") == (
         "Fixture Owner <123+fixture@users.noreply.github.com>"
     )
@@ -392,6 +396,36 @@ def test_native_readability_rejection_never_pushes_or_creates_a_pr(native_repo, 
     assert result["status"] == "stopped" and "repeated" in result["error"]
     assert not any(method == "POST" for method, _, _ in requests)
     assert (workspace.repo / "clamp.py").read_text() == ORIGINAL
+
+
+def test_changed_test_collection_cannot_be_published_as_before_after_evidence(
+    native_repo, tmp_path, monkeypatch
+):
+    from walleye.project_tests import ProjectTests
+
+    original = ProjectTests.frozen
+
+    def changed_cases(self, path, label):
+        result = original(self, path, label)
+        if label == "001-frozen":
+            result["cases"][0]["name"] = "different_test"
+        return result
+
+    monkeypatch.setattr(ProjectTests, "frozen", changed_cases)
+    client, workspace, requests = native_repo
+    _, invoke = model()
+    result, _ = improve_issue(
+        client,
+        workspace,
+        1,
+        config=ReviewConfig(backend="codex"),
+        output=tmp_path / "improve",
+        invoke=invoke,
+        progress=lambda _: None,
+    )
+    assert result["status"] == "stopped"
+    assert "Frozen test cases changed" in result["error"]
+    assert not any(method == "POST" for method, _, _ in requests)
 
 
 def test_invalid_patch_returns_feedback_without_rewriting_frozen_tests(native_repo, tmp_path):
@@ -430,22 +464,33 @@ def test_issue_publication_is_recoverable_and_deduplicates_existing_records(nati
     client, workspace, _ = native_repo
     data = read_metadata(client.api("GET", "/issues/1")["body"], client.repository)
     created = []
+    labels = []
     original_api = client.api
 
     def api(method, suffix="", payload=None):
+        if method == "POST" and suffix == "/labels":
+            labels.append(payload)
+            return payload
         if method == "POST" and suffix == "/issues":
-            issue = {**payload, "number": 7, "html_url": client.repository.url + "/issues/7"}
+            issue = {
+                **payload,
+                "labels": [{"name": label} for label in payload["labels"]],
+                "number": 7,
+                "html_url": client.repository.url + "/issues/7",
+            }
             created.append(issue)
             return issue
         return original_api(method, suffix, payload)
 
     client.api = api
-    client.pages = lambda suffix: iter(created)
+    client.pages = lambda suffix: iter(labels if suffix == "/labels" else created)
     manifest = {"findings": [data["finding"]], "github": {"issues": []}}
     packets = [{"task_id": "001", "target": data["target"]}]
     first = publish_findings(client, manifest, packets, workspace, output=tmp_path)
     second = publish_findings(client, manifest, packets, workspace, output=tmp_path)
     assert first == second and len(created) == 1
+    assert [label["name"] for label in labels] == ["bugs"]
+    assert created[0]["labels"] == [{"name": "bugs"}]
     assert (tmp_path / "issue-001-request.json").exists()
     assert json.loads((tmp_path / "review.json").read_text())["github"]["issues"][0]["number"] == 7
     with pytest.raises(ValueError, match="repository"):
