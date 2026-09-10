@@ -246,7 +246,7 @@ def prepare_review(
                 for c in candidates
                 if c["row"]["path"] == target["path"]
                 and c["row"]["line"] == target["line"]
-                and c["row"]["name"] == target["name"]
+                and c["row"].get("qualified_name", c["row"]["name"]) == target["name"]
             ]
             if len(matches) != 1:
                 raise ValueError(f"Saved target no longer matches the scan: {target['path']}")

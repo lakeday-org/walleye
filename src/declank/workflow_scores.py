@@ -75,7 +75,17 @@ def _region(report, target):
     }
 
 
-def scorecard(baseline, candidate, target, finding, verification, *, applied=False, accepted=False):
+def scorecard(
+    baseline,
+    candidate,
+    target,
+    finding,
+    verification,
+    *,
+    applied=False,
+    accepted=False,
+    allow_line_shift=False,
+):
     if set(baseline["source_hashes"]) != set(candidate["source_hashes"]):
         raise ValueError("Comparison source scope changed; scores are not comparable")
     keys = (
@@ -95,8 +105,8 @@ def scorecard(baseline, candidate, target, finding, verification, *, applied=Fal
             r
             for r in report["records"]
             if r["path"] == target["path"]
-            and r["line"] == target["line"]
-            and r["name"] == target["name"]
+            and (allow_line_shift or r["line"] == target["line"])
+            and r.get("qualified_name", r["name"]) == target["name"]
         ]
         if len(rows) != 1:
             raise ValueError("Cannot match target identity across the patch")

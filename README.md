@@ -89,6 +89,20 @@ cyclomatic complexity, nesting, volume, path, and line. A metric unavailable
 for an unsupported adapter sorts after measured values and remains `null` in
 JSON.
 
+## GitHub App jobs
+
+```sh
+declank scan lakeday-org/declank
+declank review lakeday-org/declank --issues 2 --objective refactor
+declank improve https://github.com/lakeday-org/declank/issues/42
+```
+
+Supply `GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY_PATH`, and optionally
+`GITHUB_APP_INSTALLATION_ID`. The current directory is the supplied sandbox;
+clones and worktrees are saved under `.declank/jobs/`. Review publishes issues;
+improve publishes a tested PR after the correctness and maintainability gates pass.
+It does not merge. [Setup and full workflow](docs/github-app-sandbox.md).
+
 ## Focused agent reviews
 
 To reproduce findings, generate a test-first candidate patch, and compare measured
@@ -112,8 +126,11 @@ share the same frozen tests and dollar budget; rejected attempts remain visible.
 Candidate source stays separate until `apply` rechecks it and updates the repository.
 Executable verification currently covers isolated synchronous JS/TS/TSX functions;
 unsupported cases remain unverified. See the [workflow and its gates](docs/improvement-workflow.md).
-The intended hosted execution boundary is documented in the
-[GitHub App sandbox design](docs/github-app-sandbox.md); the App service is not implemented yet.
+GitHub inputs now clone into the supplied sandbox: `scan OWNER/REPO` scans,
+`review OWNER/REPO` files finding issues, and `improve ISSUE_URL` creates a worktree,
+runs native project tests, and opens an accepted pull request. Configure GitHub App
+credentials through environment variables. See the [GitHub workflow](docs/github-app-sandbox.md)
+for credentials, test commands, artifacts, and execution boundaries.
 
 `review` selects distinct functions, packages exact line-numbered source and a
 local call graph, and invokes **gpt-5.6-luna with max reasoning**.
