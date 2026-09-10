@@ -251,7 +251,17 @@ def native_repo(tmp_path, monkeypatch):
         "preserved_behavior": "Values from zero through ten and the upper bound",
         "expected_benefit": "Correct both bounds with fewer branches",
         "validation": "Check negative, middle and high values",
-        "evidence": [{"path": "clamp.py", "line": 1, "end_line": 4, "quote": ORIGINAL.strip()}],
+        "evidence": [
+            {
+                "path": "clamp.py",
+                "line": 1,
+                "end_line": 4,
+                "quote": ORIGINAL.strip(),
+                "annotations": [
+                    {"quote_line": 4, "text": "Returns negative inputs without clamping"}
+                ],
+            }
+        ],
         "source_sha256": target["sha256"],
         "task_id": "001",
     }
@@ -491,6 +501,9 @@ def test_issue_publication_is_recoverable_and_deduplicates_existing_records(nati
     assert first == second and len(created) == 1
     assert [label["name"] for label in labels] == ["bugs"]
     assert created[0]["labels"] == [{"name": "bugs"}]
+    assert "return x  # <-- BUG 🔴 Returns negative inputs without clamping" in created[0]["body"]
+    record = read_metadata(created[0]["body"], client.repository)
+    assert record["finding"]["evidence"][0]["quote"] == ORIGINAL.strip()
     assert (tmp_path / "issue-001-request.json").exists()
     assert json.loads((tmp_path / "review.json").read_text())["github"]["issues"][0]["number"] == 7
     with pytest.raises(ValueError, match="repository"):

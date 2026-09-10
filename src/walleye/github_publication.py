@@ -7,7 +7,7 @@ import re
 from pathlib import Path
 from urllib.parse import quote
 
-from .languages import BY_EXTENSION
+from .languages import detect
 
 WRITING = """Write issue and pull request text as a concise engineer speaking to another engineer.
 Assume the reader has never seen the review packet or this conversation. Explain the component's
@@ -20,7 +20,8 @@ Explain maintenance benefits as specific changes that become easier
 to make or verify, not 'improves maintainability'. Scores alone do not justify a change.
 Do not pad a refactor with statements denying unrelated crashes, data loss, or timing bugs.
 Use Markdown paragraphs, short lists, and descriptive headings. Include enough substance to
-review the proposal without opening another issue. No hype, canned AI phrases, flattery, emojis,
+review the proposal without opening another issue. No hype, canned AI phrases, flattery,
+or decorative emojis outside source callouts,
 theatrical headings, marketing,
 or claims of verification you did not receive. Avoid 'leverage', 'delve', 'robust', 'seamless',
 'enhance', 'comprehensive', and 'it's worth noting'. Explain why the change matters and what
@@ -54,6 +55,21 @@ LABELS = {
         "color": "5319e7",
         "description": "Code structure and maintainability improvements",
     },
+}
+COMMENT_STYLES = {
+    **dict.fromkeys(
+        "python bash fish ruby perl r julia elixir powershell yaml toml nim nix starlark".split(),
+        ("#", ""),
+    ),
+    **dict.fromkeys("sql lua luau haskell purescript ada vhdl".split(), ("--", "")),
+    **dict.fromkeys("clojure commonlisp scheme racket emacs_lisp assembly".split(), (";", "")),
+    **dict.fromkeys("html xml vue svelte".split(), ("<!--", " -->")),
+    **dict.fromkeys("css scss".split(), ("/*", " */")),
+    **dict.fromkeys("ocaml ocaml_interface fsharp".split(), ("(*", " *)")),
+    **dict.fromkeys("erlang matlab".split(), ("%", "")),
+    "fortran": ("!", ""),
+    "vim": ('"', ""),
+    "tcl": ("; #", ""),
 }
 
 
@@ -129,20 +145,35 @@ def issue_summary(finding):
     return "\n\n".join(paragraphs)
 
 
+def annotated_quote(item, language, objective):
+    """Add display-only notes; the stored source quote remains exact."""
+    annotations = {a["quote_line"]: a["text"] for a in item.get("annotations", [])}
+    marker = "BUG 🔴" if objective == "bug" else "ARCHITECTURE 🟡"
+    opening, closing = COMMENT_STYLES.get(language, ("//", ""))
+    lines = item["quote"].splitlines()
+    for number, note in annotations.items():
+        lines[number - 1] += f"  {opening} <-- {marker} {note}{closing}"
+    return "\n".join(lines)
+
+
 def source_evidence(repository, metadata):
     excerpts = []
     for number, item in enumerate(metadata["finding"]["evidence"], 1):
-        language = BY_EXTENSION.get(Path(item["path"]).suffix, "")
-        fence = "`" * max(
-            3, max((len(m[0]) + 1 for m in re.finditer(r"`+", item["quote"])), default=0)
-        )
+        language = detect(Path(item["path"])) or ""
+        code = annotated_quote(item, language, metadata["finding"]["objective"])
+        fence = "`" * max(3, max((len(m[0]) + 1 for m in re.finditer(r"`+", code)), default=0))
         excerpts.append(
             f"**{number}.** "
             + source_link(repository, metadata["commit"], item)
-            + f"\n\n{fence}{language}\n{item['quote']}\n{fence}"
+            + f"\n\n{fence}{language}\n{code}\n{fence}"
         )
     title = "Code with bug" if metadata["finding"]["objective"] == "bug" else "Source evidence"
-    return f"## {title}\n\n" + "\n\n".join(excerpts)
+    note = (
+        "Callouts added by Walleye.\n\n"
+        if any(item.get("annotations") for item in metadata["finding"]["evidence"])
+        else ""
+    )
+    return f"## {title}\n\n" + note + "\n\n".join(excerpts)
 
 
 def explanation_body(repository, metadata):

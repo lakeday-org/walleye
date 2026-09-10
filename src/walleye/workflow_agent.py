@@ -19,6 +19,8 @@ needed; report unsupported if this objective cannot be verified in the supplied 
 Correctness and maintainability are joint requirements. Simplify the existing design instead of
 bolting on nested special cases. Prefer clear standard primitives and explicit names. Do not game
 metrics with compressed lines, clever regular expressions, or moving complexity into closures.
+Inline BUG/ARCHITECTURE callouts are review metadata, not source code. Do not copy them into
+production edits or tests.
 """
     + WRITING
 )

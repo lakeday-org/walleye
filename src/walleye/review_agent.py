@@ -21,6 +21,13 @@ Return one JSON result matching the output schema. A no_finding result is valid.
 Metrics select investigations; they never establish a bug, severity, or refactor benefit.
 A finding must cite a short exact source quote and lines present in the supplied excerpts,
 including evidence inside the target. Explain the causal argument and a concrete validation test.
+Keep each evidence quote verbatim. Add annotations separately: quote_line is the 1-based line
+within that quote, NOT a file line number. Annotate the exact condition, mutation, missing check,
+or responsibility boundary that causes the issue. Use a short, specific explanation of what is
+wrong there, not 'look here' or a restatement of the title. At least one target excerpt needs a
+callout. Leave annotations empty for supporting excerpts with no problematic line. Do not mark
+every line or harmless callers as bugs. The renderer adds BUG/red or ARCHITECTURE/yellow markers;
+do not insert markers or comments into the source quote itself.
 Do not claim a test was run. For a bug, give a reachable trigger, expected and actual behavior.
 For a refactor, give one cohesive proposed change, preserved behavior, and the expected benefit.
 Write context to explain the component's role and the relevant caller or data flow. root_cause
@@ -100,7 +107,17 @@ def response_schema():
                 "type": "array",
                 "maxItems": 8,
                 "items": _object(
-                    {"path": string, "line": integer, "end_line": integer, "quote": string}
+                    {
+                        "path": string,
+                        "line": integer,
+                        "end_line": integer,
+                        "quote": string,
+                        "annotations": {
+                            "type": "array",
+                            "maxItems": 3,
+                            "items": _object({"quote_line": integer, "text": string}),
+                        },
+                    }
                 ),
             },
         }
@@ -346,7 +363,30 @@ def stored_finding(finding):
     """Revalidate older saved findings without inventing missing narrative or evidence."""
     defaults = {"context": "", "impact": "", "explanation": []}
     fields = response_schema()["properties"]["finding"]["anyOf"][0]["properties"]
-    return {key: finding[key] if key in finding else defaults[key] for key in fields}
+    result = {key: finding[key] if key in finding else defaults[key] for key in fields}
+    result["evidence"] = [
+        {**item, "annotations": item.get("annotations", [])} for item in finding["evidence"]
+    ]
+    return result
+
+
+def validate_annotations(evidence):
+    lines = evidence["quote"].splitlines()
+    seen = set()
+    for annotation in evidence["annotations"]:
+        line, text = annotation["quote_line"], annotation["text"]
+        if (
+            line > len(lines)
+            or not lines[line - 1].strip()
+            or line in seen
+            or not text.strip()
+            or len(text) > 180
+            or len(text.splitlines()) != 1
+        ):
+            raise ValueError(
+                "Callouts need a unique quoted line and a short single-line explanation"
+            )
+        seen.add(line)
 
 
 def validate_response(response, packet, index, expansion=(), *, require_detail=True):
@@ -389,6 +429,7 @@ def validate_response(response, packet, index, expansion=(), *, require_detail=T
         ):
             raise ValueError("Every explanation step must reference supplied source evidence")
     target_evidence = False
+    target_callout = False
     for evidence in finding["evidence"]:
         path, start, end = evidence["path"], evidence["line"], evidence["end_line"]
         if not any(
@@ -398,12 +439,17 @@ def validate_response(response, packet, index, expansion=(), *, require_detail=T
             raise ValueError("Finding cites lines the agent was not supplied")
         if not quote_matches(evidence["quote"], index.lines(path), start, end):
             raise ValueError("Finding's source quote does not match its cited lines")
+        validate_annotations(evidence)
         target = packet["target"]
-        target_evidence |= path == target["path"] and max(start, target["line"]) <= min(
+        in_target = path == target["path"] and max(start, target["line"]) <= min(
             end, target["end_line"]
         )
+        target_evidence |= in_target
+        target_callout |= in_target and bool(evidence["annotations"])
     if not target_evidence:
         raise ValueError("Finding lacks evidence in the assigned target")
+    if require_detail and not target_callout:
+        raise ValueError("Finding needs an inline callout in the assigned target")
 
 
 def duplicate(finding, accepted):

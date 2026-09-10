@@ -4,6 +4,7 @@ import pytest
 
 from walleye.github import Repository
 from walleye.github_publication import (
+    annotated_quote,
     ensure_label,
     finding_metadata,
     issue_body,
@@ -46,6 +47,7 @@ def finding():
                 "line": 9,
                 "end_line": 9,
                 "quote": 'const close = path.indexOf("]", cursor + 1);',
+                "annotations": [{"quote_line": 1, "text": "Stops at ] inside a quoted key"}],
             }
         ],
         "task_id": "001",
@@ -77,6 +79,8 @@ def test_issue_contains_actionable_context_and_preserves_machine_record(metadata
     assert f"/blob/{'a' * 40}/src/path.ts#L9-L9" in body
     assert "## Call context" not in body  # Missing graph evidence must not invent a caller.
     assert read_metadata(body, repo) == metadata
+    assert ");  // <-- BUG 🔴 Stops at ] inside a quoted key" in body
+    assert "<-- BUG" not in metadata["finding"]["evidence"][0]["quote"]
 
 
 def test_architecture_issue_explains_benefit_without_bug_severity(metadata):
@@ -88,6 +92,7 @@ def test_architecture_issue_explains_benefit_without_bug_severity(metadata):
     assert "**Trigger:**" not in body and "severity" not in body
     assert "## Code with bug" not in body
     assert "Architecture improvement" in body
+    assert "// <-- ARCHITECTURE 🟡" in body and "BUG 🔴" not in body
     assert "proposed refactor and its tests have not been run" in body
 
 
@@ -112,6 +117,7 @@ def test_issue_links_call_context_and_handles_fences_in_source(finding, metadata
     repo = Repository("acme", "views")
     data = finding_metadata(repo, "a" * 40, "main", metadata["target"], finding, graph=graph)
     data["finding"]["evidence"][0]["quote"] = "const fence = '```';"
+    data["finding"]["evidence"][0]["annotations"] = []
     body = issue_body(repo, data)
     assert len(data["graph"]["edges"]) == 6
     assert body.count("- [render]") == 1
@@ -185,3 +191,27 @@ def test_no_findings_do_not_create_labels_or_issues():
 
     client = SimpleNamespace(pages=lambda _: iter([]), api=unexpected)
     assert publish_findings(client, {"findings": []}, [], None) == []
+
+
+@pytest.mark.parametrize("language,comment", [("python", "#"), ("rust", "//"), ("sql", "--")])
+def test_callouts_anchor_to_quoted_lines_even_with_sparse_source_numbers(language, comment):
+    item = {
+        "quote": "12: first_statement()\n29: dangerous_statement()",
+        "annotations": [{"quote_line": 2, "text": "Reuses the stale handle"}],
+    }
+    result = annotated_quote(item, language, "bug")
+    assert result.splitlines()[0] == "12: first_statement()"
+    assert result.splitlines()[1] == (
+        f"29: dangerous_statement()  {comment} <-- BUG 🔴 Reuses the stale handle"
+    )
+    assert item["quote"] == "12: first_statement()\n29: dangerous_statement()"
+
+
+def test_supporting_excerpt_is_left_unmarked_and_annotation_fences_cannot_escape(metadata):
+    item = metadata["finding"]["evidence"][0]
+    item["annotations"] = []
+    assert annotated_quote(item, "typescript", "bug") == item["quote"]
+    item["annotations"] = [{"quote_line": 1, "text": "Misreads the ``` delimiter"}]
+    body = issue_body(Repository("acme", "views"), metadata)
+    assert "````typescript\n" in body
+    assert "// <-- BUG 🔴 Misreads the ``` delimiter\n````" in body
