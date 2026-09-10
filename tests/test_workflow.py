@@ -543,3 +543,40 @@ def test_workflow_api_uses_stage_schemas_and_reserves_dollars(saved, tmp_path, m
     assert len(calls) == manifest["usage"]["calls"] == 3
     assert manifest["cost"]["spent_usd"] == 0.0021
     assert manifest["verified_resolutions"] == 1
+
+
+@pytest.mark.parametrize("repeat", [False, True])
+def test_invalid_context_request_has_one_budgeted_correction(saved, tmp_path, repeat):
+    _, review = saved
+    output = tmp_path / "improve"
+    _, writer = fake_agent(output)
+    calls = []
+
+    def invoke(prompt, config, limit, *, schema, instructions):
+        calls.append(prompt)
+        if len(calls) == 1 or repeat:
+            return measured(
+                {
+                    "status": "needs_context",
+                    "summary": "Need setup",
+                    "tests": [],
+                    "context_requests": [
+                        {
+                            "resource_id": "file:not-in-catalog",
+                            "line": 1,
+                            "end_line": 2,
+                            "reason": "Need context",
+                        }
+                    ],
+                }
+            )
+        if len(calls) == 2:
+            assert "validation_error" in prompt and "exact resource IDs" in prompt
+        return writer(prompt, config, limit, schema=schema, instructions=instructions)
+
+    manifest, _ = improve(
+        review, output=output, invoke=invoke, config=ReviewConfig(backend="codex")
+    )
+    assert len(calls) == (2 if repeat else 4)
+    assert manifest["verified_resolutions"] == (0 if repeat else 1)
+    assert manifest["usage"]["calls"] == len(calls)

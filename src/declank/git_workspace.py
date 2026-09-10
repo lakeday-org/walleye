@@ -74,6 +74,9 @@ class Workspace:
             "commit",
             "-m",
             message,
+            "--only",
+            "--",
+            *paths,
         )
         commit = git(directory, "rev-parse", "HEAD")
         git(

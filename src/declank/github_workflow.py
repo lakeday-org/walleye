@@ -5,6 +5,7 @@ from urllib.parse import quote
 from .discovery import ScanOptions
 from .git_workspace import git
 from .github_publication import pull_body, read_metadata
+from .project_context import native_packet
 from .project_tests import ProjectTests, checks_passed, freeze_test, reproduced, test_unchanged
 from .review import prepare_review, write_json
 from .review_agent import response_schema, validate_response
@@ -201,7 +202,7 @@ def iterate(
             raise ValueError("Writer repeated a rejected candidate")
         seen.add(fingerprint)
         test_unchanged(root, plan["test_path"], manifest["tests_sha256"])
-        changed = git(root, "diff", "--name-only").splitlines()
+        changed = git(root, "diff", "--name-only", "HEAD").splitlines()
         if set(changed) - {relative, plan["test_path"]}:
             raise ValueError("Project commands changed files outside the assigned source")
         git(root, "add", "--intent-to-add", "--", plan["test_path"])
@@ -288,6 +289,8 @@ def improve_issue(
     manifest, packets, index, output = prepare_review(
         root, 1, finding["objective"], config, output, progress, targets=[target]
     )
+    native_packet(packets[0], index, config.context_tokens)
+    write_json(output / "tasks/001.json", packets[0])
     fields = response_schema()["properties"]["finding"]["anyOf"][0]["properties"]
     validate_response(
         {

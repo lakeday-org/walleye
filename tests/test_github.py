@@ -375,3 +375,52 @@ def test_bad_project_config_is_a_clear_error(tmp_path, config):
     (tmp_path / ".declank.json").write_text(json.dumps(config))
     with pytest.raises(ValueError):
         project_config(tmp_path)
+
+
+def test_native_packets_supply_config_and_tests_for_indirectly_tested_helpers(tmp_path):
+    from declank.project_context import native_packet
+
+    (tmp_path / "calc.py").write_text(
+        "def _internal(x):\n    if x: return x + 1\n    return 0\n"
+        "def public(x):\n    return _internal(x)\n"
+    )
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests/test_calc.py").write_text(
+        "from calc import public\ndef test_value():\n    assert public(1) == 2\n"
+    )
+    (tmp_path / "pyproject.toml").write_text('[tool.pytest.ini_options]\ntestpaths = ["tests"]\n')
+    _, packets, index, _ = prepare_review(tmp_path, issues=1, output=tmp_path / "review")
+    packet = next(p for p in packets if p["target"]["name"] == "_internal")
+    assert not any("tests/" in r["path"] for r in packet["resources"])
+    native_packet(packet, index, 200000)
+    paths = {r["path"] for r in packet["source"]}
+    assert {"tests/test_calc.py", "pyproject.toml"} <= paths
+    index.verify(packet["resources"])
+
+
+def test_native_checks_cannot_stage_unrelated_files_into_the_pr(native_repo, tmp_path, monkeypatch):
+    from declank.project_tests import ProjectTests
+
+    original_commands = ProjectTests.commands
+
+    def commands(self, kind, label):
+        results = original_commands(self, kind, label)
+        if label == "001-checks":
+            (self.root / "unrelated.md").write_text("Unrelated change")
+            git(self.root, "add", "unrelated.md")
+        return results
+
+    monkeypatch.setattr(ProjectTests, "commands", commands)
+    client, workspace, requests = native_repo
+    _, invoke = model()
+    result, _ = improve_issue(
+        client,
+        workspace,
+        1,
+        config=ReviewConfig(backend="codex"),
+        output=tmp_path / "improve",
+        invoke=invoke,
+        progress=lambda x: None,
+    )
+    assert result["status"] == "stopped" and "outside" in result["error"]
+    assert not any(method == "POST" for method, _, _ in requests)

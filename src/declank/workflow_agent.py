@@ -191,6 +191,7 @@ class WorkflowAgent:
     def phase(self, stage, packet, finding, index, directory, detail, expansion):
         previous = None
         rounds = 0
+        invalid_requests = 0
         while True:
             index.verify(packet["resources"])
             prompt = (
@@ -217,9 +218,21 @@ class WorkflowAgent:
                     return response
             elif self.config.max_expansions == 0:
                 return response
-            additions = expand_context(
-                packet, response["context_requests"], index, self.config.expansion_tokens
-            )
+            try:
+                additions = expand_context(
+                    packet, response["context_requests"], index, self.config.expansion_tokens
+                )
+            except ValueError as error:
+                if invalid_requests:
+                    raise
+                invalid_requests += 1
+                previous = {
+                    "response": response,
+                    "validation_error": str(error),
+                    "instruction": "Use exact resource IDs and line bounds from the catalog. "
+                    "No source was added. Correct the request or report unsupported.",
+                }
+                continue
             additions = [
                 s
                 for s in additions

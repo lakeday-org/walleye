@@ -66,7 +66,12 @@ def run_improve(args, github, workspace):
     if args.budget is not None:
         config = replace(config, budget_usd=args.budget)
     manifest, output = improve_issue(
-        github, workspace, args.issue, config=config, output=args.output
+        github,
+        workspace,
+        args.issue,
+        config=config,
+        output=args.output,
+        progress=lambda message: print(message, flush=True),
     )
     print(f"Status: {manifest['status']}")
     if manifest.get("pull_request"):
