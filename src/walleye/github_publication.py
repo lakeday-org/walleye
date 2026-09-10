@@ -7,7 +7,7 @@ import re
 from pathlib import Path
 from urllib.parse import quote
 
-from .languages import EXTENSIONS
+from .languages import BY_EXTENSION
 
 WRITING = """Write issue and pull request text as a concise engineer speaking to another engineer.
 Assume the reader has never seen the review packet or this conversation. Explain the component's
@@ -132,7 +132,7 @@ def issue_summary(finding):
 def source_evidence(repository, metadata):
     excerpts = []
     for number, item in enumerate(metadata["finding"]["evidence"], 1):
-        language = EXTENSIONS.get(Path(item["path"]).suffix.lower(), "")
+        language = BY_EXTENSION.get(Path(item["path"]).suffix, "")
         fence = "`" * max(
             3, max((len(m[0]) + 1 for m in re.finditer(r"`+", item["quote"])), default=0)
         )
