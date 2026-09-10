@@ -13,7 +13,7 @@ or claims of verification you did not receive. Avoid 'leverage', 'delve', 'robus
 'enhance', 'comprehensive', and 'it's worth noting'. Explain why the change matters and what
 was actually tested. Do not mention these writing instructions in the result.
 """
-MARKER = "declank-finding-v1"
+MARKER = "walleye-finding-v1"
 
 
 def finding_metadata(repository, sha, branch, target, finding):
@@ -69,7 +69,7 @@ def issue_body(repository, metadata):
 def read_metadata(body, repository):
     matches = re.findall(r"<!-- " + MARKER + r":([A-Za-z0-9+/=]+) -->", body or "")
     if len(matches) != 1:
-        raise ValueError("Issue needs one declank finding record; start with declank review")
+        raise ValueError("Issue needs one walleye finding record; start with walleye review")
     try:
         value = json.loads(base64.b64decode(matches[0], validate=True))
         if value["version"] != 1 or value["repository"].lower() != repository.full_name.lower():
@@ -78,7 +78,7 @@ def read_metadata(body, repository):
             raise ValueError("Issue metadata has an invalid commit")
         return value
     except (KeyError, TypeError, json.JSONDecodeError) as error:
-        raise ValueError("Invalid declank issue metadata") from error
+        raise ValueError("Invalid walleye issue metadata") from error
 
 
 def publish_findings(github, manifest, packets, workspace, *, output=None):
@@ -127,18 +127,21 @@ def publish_findings(github, manifest, packets, workspace, *, output=None):
     return published
 
 
-def pull_body(issue, summary, card, tests):
+def pull_body(issue, description, card, tests):
     quality = card["maintainability"]["repository"]["score"]
     target = card["maintainability"]["target_quality"]
+    module = card["maintainability"]["region"]["quality"]
     return (
-        summary.strip() + f"\n\nCloses #{issue}.\n<!-- declank-issue:{issue} -->\n\n"
+        description.strip() + f"\n\nCloses #{issue}.\n<!-- walleye-issue:{issue} -->\n\n"
         f"Validation: frozen native tests and all {len(tests)} configured project checks passed. "
         "The independent correctness and maintainability review passed.\n\n"
         "| Structural quality | Before | After |\n| --- | ---: | ---: |\n"
         f"| Changed function | {target['before']:.4f} | {target['after']:.4f} |\n"
+        f"| Changed module, including helpers | {module['before']:.4f} | {module['after']:.4f} |\n"
         f"| Repository | {quality['before']:.4f} | {quality['after']:.4f} |\n\n"
         "Checks run:\n"
         + "\n".join("- `" + " ".join(t["command"]) + "`" for t in tests)
-        + "\n\nScores compare the same parsed source files. "
+        + "\n\nScores compare the same parsed source files. These are candidate scores; "
+        "the base branch changes only after merge. "
         "Unresolved calls and unreviewed behavior remain unknown."
     )

@@ -64,7 +64,7 @@ def _config(dialect: str) -> FluffConfig:
         ignore_local_config=True,
     )
     if dialect == "sqlite":
-        sqlite = load_raw_dialect("sqlite").copy_as("declank_sqlite")
+        sqlite = load_raw_dialect("sqlite").copy_as("walleye_sqlite")
         sqlite.replace(TransactionStatementSegment=SQLiteTransactionStatementSegment)
         # set_value coerces scalar config strings; install the isolated object
         # directly into this configuration's public core section instead.

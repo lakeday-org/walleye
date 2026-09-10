@@ -12,7 +12,9 @@ from .workflow_validation import digest
 
 
 def project_config(root):
-    path = safe_path(root, ".declank.json")
+    path = safe_path(root, ".walleye.json")
+    if not path.exists():
+        path = safe_path(root, ".declank.json")
     if path.exists():
         config = json.loads(path.read_text())
     elif (root / "uv.lock").exists() and (root / "pyproject.toml").exists():
@@ -23,14 +25,14 @@ def project_config(root):
         }
     else:
         raise ValueError(
-            "Native tests need .declank.json with setup, checks, and test_command (JUnit output)"
+            "Native tests need .walleye.json with setup, checks, and test_command (JUnit output)"
         )
     if (
         not isinstance(config, dict)
         or set(config) - {"setup", "checks", "test_command", "format"}
         or not {"setup", "checks", "test_command"}.issubset(config)
     ):
-        raise ValueError(".declank.json needs setup, checks, test_command, and optional format")
+        raise ValueError(".walleye.json needs setup, checks, test_command, and optional format")
     if not all(isinstance(config[k], list) for k in ("setup", "checks", "test_command")):
         raise ValueError("Project command settings must be arrays")
     commands = [*config["setup"], *config["checks"], config["test_command"]]

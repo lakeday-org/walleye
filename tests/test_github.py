@@ -9,12 +9,12 @@ import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 
-from declank.git_workspace import Workspace, git
-from declank.github import GitHub, Repository, repository_input
-from declank.github_publication import finding_metadata, issue_body, publish_findings, read_metadata
-from declank.github_workflow import apply_edits, improve_issue
-from declank.project_tests import project_config, reproduced
-from declank.review import ReviewConfig, prepare_review
+from walleye.git_workspace import Workspace, git
+from walleye.github import GitHub, Repository, repository_input
+from walleye.github_publication import finding_metadata, issue_body, publish_findings, read_metadata
+from walleye.github_workflow import apply_edits, improve_issue
+from walleye.project_tests import project_config, reproduced
+from walleye.review import ReviewConfig, prepare_review
 
 
 @pytest.mark.parametrize(
@@ -93,6 +93,36 @@ def test_missing_or_partial_credentials_fail_before_publishing():
         client.token(required=True)
 
 
+@pytest.mark.parametrize("app", [False, True])
+def test_commit_author_is_resolved_from_authenticated_user_or_app(app):
+    calls = []
+    login = "review-fish[bot]" if app else "owner"
+
+    def request(method, path, token, payload=None):
+        calls.append(path)
+        if path == "/app":
+            assert token == "signed-app-jwt"
+            return {"slug": "review-fish"}
+        assert path == ("/users/review-fish%5Bbot%5D" if app else "/user")
+        assert token == "installation-token" if app else token == "user-token"
+        return {"id": 123, "login": login, "name": None if app else "Repository Owner"}
+
+    env = {"GITHUB_TOKEN": "user-token"}
+    if app:
+        env.update(GITHUB_APP_ID="42", GITHUB_APP_PRIVATE_KEY_PATH="unused.pem")
+    client = GitHub(Repository("acme", "demo"), environ=env, request=request, clock=lambda: 0)
+    if app:
+        client._token, client.expires = "installation-token", 3600
+        client.app_jwt = lambda: "signed-app-jwt"
+    expected = {
+        "name": login if app else "Repository Owner",
+        "email": f"123+{login}@users.noreply.github.com",
+    }
+    assert client.commit_identity() == expected
+    assert client.commit_identity() == expected
+    assert len(calls) == (2 if app else 1)
+
+
 def test_git_does_not_put_tokens_in_argv_or_remote(monkeypatch, tmp_path):
     def run(command, **kwargs):
         assert "secret-token" not in repr(command)
@@ -162,7 +192,7 @@ def native_repo(tmp_path, monkeypatch):
     (source / "tests/test_existing.py").write_text(
         "from clamp import clamp\ndef test_high():\n    assert clamp(20) == 10\n"
     )
-    (source / ".declank.json").write_text(
+    (source / ".walleye.json").write_text(
         json.dumps(
             {
                 "setup": [],
@@ -222,6 +252,9 @@ def native_repo(tmp_path, monkeypatch):
         def token(self, **kwargs):
             return None
 
+        def commit_identity(self):
+            return {"name": "Fixture Owner", "email": "123+fixture@users.noreply.github.com"}
+
         def api(self, method, suffix="", payload=None):
             requests.append((method, suffix, payload))
             if suffix == "":
@@ -237,7 +270,7 @@ def native_repo(tmp_path, monkeypatch):
         def pages(self, suffix):
             return iter([])
 
-    import declank.git_workspace as module
+    import walleye.git_workspace as module
 
     original_git = module.git
 
@@ -258,7 +291,7 @@ def model(replacement=FIXED, reject=False):
         properties = schema["properties"]
         result = {
             "status": "ready",
-            "summary": "Clamp both bounds with standard operations.",
+            "summary": "Tests were not run by the patch author.",
             "context_requests": [],
         }
         if "test_path" in properties:
@@ -271,11 +304,14 @@ def model(replacement=FIXED, reject=False):
         elif "edits" in properties:
             stages.append("patch")
             result.update(
-                title="Clamp negative values to zero", edits=[{"old": ORIGINAL, "new": replacement}]
+                title="Clamp negative values to zero",
+                description="Clamp both bounds with standard operations.",
+                edits=[{"old": ORIGINAL, "new": replacement}],
             )
         else:
             stages.append("review")
             assert "Review this exact patch independently" in prompt
+            assert '"description":"Clamp both bounds with standard operations."' in prompt
             result["checks"] = [
                 {
                     "criterion": c,
@@ -315,8 +351,16 @@ def test_native_worktree_pipeline_runs_real_tests_and_publishes_only_verified_pa
     assert result["cost"]["spent_usd"] == 0.0021
     card = json.loads((output / "attempts/001/scorecard.json").read_text())
     assert card["maintainability"]["region"]["quality"]["delta"] > 0
+    assert card["correctness"]["verified_resolutions"] == 1
+    assert card["correctness"]["confirmed_open"] == {"before": 1, "after": 0, "delta": -1}
     pull = next(p for method, path, p in requests if method == "POST" and path == "/pulls")
     assert "Closes #1" in pull["body"] and pull["base"] == "main"
+    assert pull["body"].startswith("Clamp both bounds with standard operations.")
+    assert "Tests were not run by the patch author" not in pull["body"]
+    assert "Changed module, including helpers" in pull["body"]
+    assert git(Path(result["worktree"]), "log", "-1", "--format=%an <%ae>") == (
+        "Fixture Owner <123+fixture@users.noreply.github.com>"
+    )
     assert git(workspace.repo, "rev-parse", "refs/remotes/origin/main") == workspace.sha
 
 
@@ -372,13 +416,13 @@ def test_issue_publication_is_recoverable_and_deduplicates_existing_records(nati
     ],
 )
 def test_bad_project_config_is_a_clear_error(tmp_path, config):
-    (tmp_path / ".declank.json").write_text(json.dumps(config))
+    (tmp_path / ".walleye.json").write_text(json.dumps(config))
     with pytest.raises(ValueError):
         project_config(tmp_path)
 
 
 def test_native_packets_supply_config_and_tests_for_indirectly_tested_helpers(tmp_path):
-    from declank.project_context import native_packet
+    from walleye.project_context import native_packet
 
     (tmp_path / "calc.py").write_text(
         "def _internal(x):\n    if x: return x + 1\n    return 0\n"
@@ -399,7 +443,7 @@ def test_native_packets_supply_config_and_tests_for_indirectly_tested_helpers(tm
 
 
 def test_native_checks_cannot_stage_unrelated_files_into_the_pr(native_repo, tmp_path, monkeypatch):
-    from declank.project_tests import ProjectTests
+    from walleye.project_tests import ProjectTests
 
     original_commands = ProjectTests.commands
 

@@ -7,6 +7,7 @@ from .workflow import safe_path
 from .workflow_validation import digest
 
 CONFIG_FILES = (
+    ".walleye.json",
     ".declank.json",
     "pyproject.toml",
     "pytest.ini",

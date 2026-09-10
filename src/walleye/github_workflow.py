@@ -69,7 +69,7 @@ def project_scorecard(baseline, candidate, target, finding, before, after):
     return card
 
 
-def review_candidate(agent, packet, finding, index, directory, diff, card, results):
+def review_candidate(agent, packet, finding, index, directory, diff, card, results, patch):
     return agent.phase(
         "quality-review",
         packet,
@@ -80,7 +80,12 @@ def review_candidate(agent, packet, finding, index, directory, diff, card, resul
         "correctness (general fix, meaningful tests, preserved behavior), relevance (the evidenced "
         "issue is addressed), readability (clear code and explanations of non-obvious rules), "
         "simplicity (less cognitive load; no compression or hiding tangled code in helpers). All "
-        "must pass. Reject tests that mirror implementation or only check a hard-coded example.\n"
+        "must pass. Reject tests that mirror implementation or only check a hard-coded example. "
+        "The proposed PR description must accurately describe the change and contain no test "
+        "execution claims; the coordinator adds verified results separately. Reject misleading "
+        "public text under correctness.\nPROPOSED PR TEXT\n"
+        + encode({k: patch[k] for k in ("title", "description")})
+        + "\n"
         "PATCH\n"
         + diff
         + "\nMEASUREMENTS\n"
@@ -100,7 +105,10 @@ def candidate(agent, root, runner, packet, index, finding, plan, before, output,
         "You may add cohesive helpers in this file. Frozen tests and other files cannot change. "
         "Improve maintainability while addressing the objective. Do not compress code or bolt on "
         "nested special cases. The coordinator measures scores; do not calculate Halstead scores. "
-        "title and summary will be used in a public pull request.\nSOURCE FILE\n"
+        "title and description will be used in a public pull request. Describe only the concrete "
+        "problem and changed behavior in description. Do not put test status or execution claims "
+        "there; the coordinator adds verified results after running checks. summary is an internal "
+        "author note and is not published.\nSOURCE FILE\n"
         + original.decode()
         + "\nFROZEN TEST FILE\n"
         + safe_path(root, plan["test_path"]).read_text()
@@ -152,7 +160,7 @@ def publish_candidate(
     write_json(directory.parent.parent / "workflow.json", manifest)
     payload = {
         "title": patch["title"],
-        "body": pull_body(issue, patch["summary"], card, metrics["checks"]),
+        "body": pull_body(issue, patch["description"], card, metrics["checks"]),
         "head": branch,
         "base": workspace.base_branch,
     }
@@ -211,7 +219,7 @@ def iterate(
         review = {"status": "skipped", "summary": "Measured gates failed", "checks": []}
         if metrics["passed"]:
             review = review_candidate(
-                agent, packet, finding, index, directory, diff, card, metrics["checks"]
+                agent, packet, finding, index, directory, diff, card, metrics["checks"], patch
             )
         record = acceptance(
             updated, manifest["tests_sha256"], index.report["source_fingerprint"], metrics, review
@@ -223,6 +231,13 @@ def iterate(
         agent.save()
         if record["passed"]:
             manifest["candidate_sha256"] = fingerprint
+            card["state"] = "verified-candidate"
+            if finding["objective"] == "bug":
+                card["correctness"].update(
+                    confirmed_open={"before": 1, "after": 0, "delta": -1},
+                    verified_resolutions=1,
+                )
+            write_json(directory / "scorecard.json", card)
             return publish_candidate(
                 workspace,
                 root,
@@ -276,12 +291,13 @@ def improve_issue(
     github, workspace, issue_number, *, config, output=None, progress=print, invoke=None
 ):
     for pull in github.pages("/pulls?state=open"):
-        if f"<!-- declank-issue:{issue_number} -->" in (pull.get("body") or ""):
+        if f"<!-- walleye-issue:{issue_number} -->" in (pull.get("body") or ""):
             raise ValueError(f"This finding already has an open pull request: {pull['html_url']}")
     issue = github.api("GET", f"/issues/{issue_number}")
     if issue.get("state") != "open" or "pull_request" in issue:
         raise ValueError("Improve requires an open finding issue")
     metadata = read_metadata(issue.get("body"), github.repository)
+    identity = github.commit_identity()
     root, branch = workspace.worktree(issue_number)
     finding, target = metadata["finding"], metadata["target"]
     if digest(safe_path(root, target["path"]).read_bytes()) != finding["source_sha256"]:
@@ -307,6 +323,7 @@ def improve_issue(
         status="baseline",
         issue=issue["html_url"],
         repository=github.repository.full_name,
+        commit_author=identity,
         base_commit=workspace.sha,
         base_branch=workspace.base_branch,
         worktree=str(root),

@@ -3,8 +3,8 @@ requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [project]
-name = "declank"
-version = "0.7.1"
+name = "walleye"
+version = "0.8.0"
 license = "MIT"
 description = "Tree-sitter powered, multi-language Halstead code quality scanner"
 readme = "README.md"
@@ -21,7 +21,7 @@ dependencies = [
 ]
 
 [project.scripts]
-declank = "declank.cli:main"
+walleye = "walleye.cli:main"
 
 [dependency-groups]
 dev = ["pytest>=8,<10", "ruff>=0.12,<1"]

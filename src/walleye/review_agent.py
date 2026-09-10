@@ -197,7 +197,7 @@ def codex_command(config, directory: Path, token_limit):
 
 def invoke_codex(prompt, config, token_limit, *, schema=None, instructions=None):
     """Fresh process and empty cwd for each call; auth uses the user's existing Codex login."""
-    with tempfile.TemporaryDirectory(prefix="declank-agent-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="walleye-agent-") as temporary:
         directory = Path(temporary).resolve()
         (directory / "instructions.txt").write_text(instructions or INSTRUCTIONS)
         (directory / "schema.json").write_text(encode(schema or response_schema()))

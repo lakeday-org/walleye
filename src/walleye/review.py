@@ -63,7 +63,7 @@ def load_config(path: Path | None = None) -> ReviewConfig:
     explicit = path is not None
     path = (
         path
-        or Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "declank/config.json"
+        or Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "walleye/config.json"
     )
     if not path.exists() and not explicit:
         return ReviewConfig()
@@ -279,7 +279,7 @@ def prepare_review(
     output = (
         output
         or Path.cwd()
-        / ".declank/reviews"
+        / ".walleye/reviews"
         / f"{Path(report['root']).name}-{timestamp}-{uuid4().hex[:6]}"
     ).absolute()
     output.mkdir(parents=True, exist_ok=False)

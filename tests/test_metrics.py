@@ -2,8 +2,8 @@ import math
 
 import pytest
 
-from declank.metrics import halstead
-from declank.scanner import analyze
+from walleye.metrics import halstead
+from walleye.scanner import analyze
 
 
 def one(source: str, language="python"):

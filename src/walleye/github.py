@@ -8,7 +8,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 from urllib.request import Request, urlopen
 
 import jwt
@@ -82,10 +82,11 @@ class GitHub:
         self.key_path = self.env.get("GITHUB_APP_PRIVATE_KEY_PATH")
         self.installation = self.env.get("GITHUB_APP_INSTALLATION_ID")
         self.expires = 0
+        self._identity = None
         if bool(self.app_id) != bool(self.key_path):
             raise ValueError("Set both GITHUB_APP_ID and GITHUB_APP_PRIVATE_KEY_PATH")
         self.auth_kind = "app" if self.app_id else "token" if self._token else "anonymous"
-        if not self.app_id and not self._token and self.env.get("DECLANK_GITHUB_AUTH") == "gh":
+        if not self.app_id and not self._token and self.env.get("WALLEYE_GITHUB_AUTH") == "gh":
             result = subprocess.run(
                 ["gh", "auth", "token", "--hostname", "github.com"],
                 capture_output=True,
@@ -96,17 +97,20 @@ class GitHub:
                 raise ValueError("The requested gh login is unavailable")
             self._token, self.auth_kind = result.stdout.strip(), "gh-user"
 
+    def app_jwt(self):
+        now = int(self.clock())
+        try:
+            return jwt.encode(
+                {"iat": now - 60, "exp": now + 540, "iss": self.app_id},
+                Path(self.key_path).read_bytes(),
+                algorithm="RS256",
+            )
+        except (OSError, ValueError, jwt.PyJWTError):
+            raise ValueError("Cannot read or sign with the GitHub App private key") from None
+
     def token(self, *, required=False):
         if self.app_id and self.clock() >= self.expires - 60:
-            now = int(self.clock())
-            try:
-                signed = jwt.encode(
-                    {"iat": now - 60, "exp": now + 540, "iss": self.app_id},
-                    Path(self.key_path).read_bytes(),
-                    algorithm="RS256",
-                )
-            except (OSError, ValueError, jwt.PyJWTError):
-                raise ValueError("Cannot read or sign with the GitHub App private key") from None
+            signed = self.app_jwt()
             if not self.installation:
                 data = self.request(
                     "GET", f"/repos/{self.repository.full_name}/installation", signed
@@ -129,9 +133,30 @@ class GitHub:
         if required and not self._token:
             raise ValueError(
                 "GitHub publishing needs App credentials or GITHUB_TOKEN; "
-                "use DECLANK_GITHUB_AUTH=gh for an explicit local development fallback"
+                "use WALLEYE_GITHUB_AUTH=gh for an explicit local development fallback"
             )
         return self._token
+
+    def commit_identity(self):
+        if self._identity is None:
+            token = self.token(required=True)
+            if self.app_id:
+                app = self.request("GET", "/app", self.app_jwt())
+                path = "/users/" + quote(app["slug"] + "[bot]", safe="")
+            else:
+                path = "/user"
+            try:
+                account = self.request("GET", path, token)
+            except ValueError as error:
+                raise ValueError(
+                    "Cannot resolve the authenticated commit author. "
+                    "Installation tokens need the App ID and private key credentials."
+                ) from error
+            self._identity = {
+                "name": account.get("name") or account["login"],
+                "email": f"{account['id']}+{account['login']}@users.noreply.github.com",
+            }
+        return self._identity
 
     def api(self, method, suffix="", payload=None):
         return self.request(

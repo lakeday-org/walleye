@@ -40,6 +40,7 @@ def stage_schema(stage):
     elif stage == "native-patch":
         common.update(
             title=string,
+            description=string,
             edits={
                 "type": "array",
                 "maxItems": 20,

@@ -35,7 +35,7 @@ def git(directory, *args, token=None):
 class Workspace:
     def __init__(self, github, directory=None, ref=None):
         self.github = github
-        self.directory = (directory or Path.cwd() / ".declank/jobs" / uuid4().hex).resolve()
+        self.directory = (directory or Path.cwd() / ".walleye/jobs" / uuid4().hex).resolve()
         self.directory.mkdir(parents=True, exist_ok=False)
         self.repo = self.directory / "repo"
         info = github.api("GET")
@@ -58,19 +58,20 @@ class Workspace:
         git(self.repo, "checkout", "--detach", self.sha)
 
     def worktree(self, issue):
-        branch = f"declank/issue-{issue}-{self.sha[:8]}-{uuid4().hex[:6]}"
+        branch = f"walleye/issue-{issue}-{self.sha[:8]}-{uuid4().hex[:6]}"
         directory = self.directory / "worktree"
         git(self.repo, "worktree", "add", "-b", branch, str(directory), self.sha)
         return directory, branch
 
     def publish(self, directory, branch, paths, message):
+        identity = self.github.commit_identity()
         git(directory, "add", "--", *paths)
         git(
             directory,
             "-c",
-            "user.name=declank",
+            "user.name=" + identity["name"],
             "-c",
-            "user.email=declank@users.noreply.github.com",
+            "user.email=" + identity["email"],
             "commit",
             "-m",
             message,

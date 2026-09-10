@@ -1,4 +1,4 @@
-"""The declank command line; report data goes to stdout, diagnostics to stderr."""
+"""The walleye command line; report data goes to stdout, diagnostics to stderr."""
 
 import argparse
 import csv
@@ -180,10 +180,10 @@ def sql_dialect(value: str) -> str:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="declank",
+        prog="walleye",
         description="Scan code and rank function-level maintenance and control-flow hotspots.",
     )
-    parser.add_argument("--version", action="version", version=f"declank {__version__}")
+    parser.add_argument("--version", action="version", version=f"walleye {__version__}")
     commands = parser.add_subparsers(dest="command", required=True)
     languages = commands.add_parser("languages", help="List auto-detected languages and grammars")
     languages.add_argument("--all", action="store_true", help="Include all 173 bundled grammars")
@@ -292,7 +292,7 @@ def build_parser() -> argparse.ArgumentParser:
     reviewer.add_argument(
         "--prepare", action="store_true", help="Write packets without model calls"
     )
-    reviewer.add_argument("--config", type=Path, help="Override ~/.config/declank/config.json")
+    reviewer.add_argument("--config", type=Path, help="Override ~/.config/walleye/config.json")
     reviewer.add_argument("-o", "--output", type=Path, help="New directory for packets and results")
     improver = commands.add_parser(
         "improve", help="Reproduce findings, propose fixes, verify tests, and compare scores"
@@ -322,7 +322,7 @@ def render_table(report: dict, stream, *, terminal: bool = False):
     console = Console(file=stream, force_terminal=terminal, highlight=False)
     summary = report["summary"]
     scores = report.get("scores", {})
-    console.print(Text(f"declank {report['tool']['version']} · {report['root']}", style="bold"))
+    console.print(Text(f"walleye {report['tool']['version']} · {report['root']}", style="bold"))
     console.print(
         Text(
             f"{summary['scanned_files']:,} files · {len(summary['languages'])} languages · "
@@ -769,7 +769,7 @@ def main(argv: list[str] | None = None) -> int:
                     )
                     if proposal["status"] == "verified-candidate":
                         console.print(
-                            Text(f"Apply: declank apply {output / 'proposals' / proposal['id']}")
+                            Text(f"Apply: walleye apply {output / 'proposals' / proposal['id']}")
                         )
                 if proposal.get("error"):
                     console.print(Text(proposal["error"]))
@@ -986,7 +986,7 @@ def main(argv: list[str] | None = None) -> int:
     except (OSError, ValueError) as error:
         if isinstance(error, BrokenPipeError):
             return 0
-        Console(stderr=True).print(Text(f"declank: {error}"))
+        Console(stderr=True).print(Text(f"walleye: {error}"))
         return 2
 
 

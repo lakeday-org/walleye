@@ -1,4 +1,4 @@
-"""Control-flow measurements used by declank's debugging reports.
+"""Control-flow measurements used by walleye's debugging reports.
 
 The Halstead walker is intentionally language independent.  Control flow is a
 different problem: counting a node named ``if_statement`` is only meaningful if

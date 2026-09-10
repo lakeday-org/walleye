@@ -5,9 +5,9 @@ from dataclasses import replace
 
 import pytest
 
-from declank.discovery import ScanOptions
-from declank.review import ReviewConfig, load_config, prepare_review, rank_candidates, select_queue
-from declank.review_agent import (
+from walleye.discovery import ScanOptions
+from walleye.review import ReviewConfig, load_config, prepare_review, rank_candidates, select_queue
+from walleye.review_agent import (
     codex_command,
     duplicate,
     invoke_codex,
@@ -16,8 +16,8 @@ from declank.review_agent import (
     run_review,
     validate_response,
 )
-from declank.review_context import SourceIndex, encode, estimate_tokens, expand_context
-from declank.scanner import scan
+from walleye.review_context import SourceIndex, encode, estimate_tokens, expand_context
+from walleye.scanner import scan
 
 
 def source_repo(tmp_path):
@@ -334,7 +334,7 @@ def test_fresh_process_prepare_cli_is_offline_and_keeps_diagnostics(tmp_path):
         [
             sys.executable,
             "-m",
-            "declank",
+            "walleye",
             "review",
             str(repo),
             "--issues",

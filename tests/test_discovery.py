@@ -1,8 +1,8 @@
 import subprocess
 from pathlib import Path
 
-from declank.discovery import ScanOptions, discover
-from declank.scanner import analyze, scan
+from walleye.discovery import ScanOptions, discover
+from walleye.scanner import analyze, scan
 
 
 def put(root: Path, name: str, content="x = 1\n") -> Path:

@@ -1,4 +1,4 @@
-# declank
+# walleye
 
 Code quality scans and tested fixes for local and GitHub repositories. Supports 64 languages.
 
@@ -11,16 +11,16 @@ Code quality scans and tested fixes for local and GitHub repositories. Supports 
 Python 3.10+ and [uv](https://docs.astral.sh/uv/).
 
 ```sh
-uv tool install git+https://github.com/lakeday-org/declank.git
+uv tool install git+https://github.com/lakeday-org/walleye.git
 ```
 
 ## Commands
 
 ```sh
-declank scan .
-declank scan owner/repo
-declank review owner/repo --issues 5 --budget 5
-declank improve https://github.com/owner/repo/issues/42
+walleye scan .
+walleye scan owner/repo
+walleye review owner/repo --issues 5 --budget 5
+walleye improve https://github.com/owner/repo/issues/42
 ```
 
 | Command | Result |
@@ -39,8 +39,8 @@ Set `GITHUB_APP_ID` and `GITHUB_APP_PRIVATE_KEY_PATH` in the job environment.
 Install the App with read/write access to Contents, Issues, and Pull requests.
 Public scans need no credentials.
 
-Run jobs inside your sandbox. Clones, worktrees, and results stay under `.declank/`.
-Python projects using uv and pytest work automatically; other test runners need a `.declank.json` configuration.
+Run jobs inside your sandbox. Clones, worktrees, and results stay under `.walleye/`.
+Python projects using uv and pytest work automatically; other test runners need a `.walleye.json` configuration.
 
 ## Scores
 

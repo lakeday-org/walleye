@@ -258,7 +258,7 @@ def verify_snapshot(base, hashes):
 
 def scan_candidate(baseline, sources, relative, candidate):
     # Rebuild the same parsed cohort, not a changing git working tree or relative rank sample.
-    with tempfile.TemporaryDirectory(prefix="declank-candidate-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="walleye-candidate-") as temporary:
         directory = Path(temporary)
         for name in baseline["source_hashes"]:
             destination = safe_path(directory, name)
@@ -609,7 +609,7 @@ def apply_proposal(directory):
     verify_snapshot(base, hashes)
     path = safe_path(base, relative)
     mode = stat.S_IMODE(path.stat().st_mode)
-    descriptor, temporary = tempfile.mkstemp(prefix=".declank-apply-", dir=path.parent)
+    descriptor, temporary = tempfile.mkstemp(prefix=".walleye-apply-", dir=path.parent)
     try:
         with os.fdopen(descriptor, "wb") as stream:
             stream.write(candidate)
@@ -625,7 +625,7 @@ def apply_proposal(directory):
         directory,
         application="Applied to original source after hash checks and fresh test execution",
     )
-    regression = safe_path(base, f".declank/regressions/{proposal['tests_sha256']}.json")
+    regression = safe_path(base, f".walleye/regressions/{proposal['tests_sha256']}.json")
     write_json(
         regression,
         {

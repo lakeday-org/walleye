@@ -2,9 +2,9 @@ from pathlib import Path
 
 import pytest
 
-from declank import javascript, shell
-from declank.metrics import is_function, measure, walk
-from declank.scanner import analyze, parser_for
+from walleye import javascript, shell
+from walleye.metrics import is_function, measure, walk
+from walleye.scanner import analyze, parser_for
 
 
 @pytest.mark.parametrize(
@@ -80,7 +80,7 @@ def test_babel_template_interpolation_is_visited_as_code():
 def test_babel_anonymous_arrow_does_not_get_named_async():
     data = b"register(async (value) => value);"
     root, _ = javascript.parse(data, "typescript", "a.ts")
-    from declank.metrics import function_name
+    from walleye.metrics import function_name
 
     node = next(node for node in walk(root) if is_function(node))
     assert function_name(node, data) == "<anonymous>"
