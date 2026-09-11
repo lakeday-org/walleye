@@ -243,9 +243,10 @@ def iterate(
         )
         updated = safe_path(root, relative).read_bytes()
         fingerprint = digest(updated)
-        if fingerprint in seen:
+        candidate_key = (fingerprint, patch["title"], patch["description"])
+        if candidate_key in seen:
             raise ValueError("Writer repeated a rejected candidate")
-        seen.add(fingerprint)
+        seen.add(candidate_key)
         test_unchanged(root, plan["test_path"], manifest["tests_sha256"])
         changed = git(root, "diff", "--name-only", "HEAD").splitlines()
         if set(changed) - {relative, plan["test_path"]}:

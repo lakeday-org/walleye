@@ -39,6 +39,10 @@ cases preserved. In Tests added, name the tests and the behavior each exercises;
 regression from characterization coverage. For bugs, explain how tests trigger the failure and
 check recovery or isolation where relevant, not just a happy path. Use the frozen test file
 supplied. Use one bullet per test or behavior group instead of a list of test names without reasons.
+The frozen test file is NEW and will be included in this PR together with the production patch.
+Describe the complete PR, not just the edits returned in this turn. Do not say no tests were added
+or describe internal workflow restrictions. If review rejects only the public text, correct the
+text while preserving code that already passed; do not make gratuitous source changes.
 Keep detail proportional to the change, but do not reduce the description to 'improves this method'
 or a score claim. Do not put test status or execution claims in description; the coordinator adds
 verified results after running checks. summary is an internal author note and is not published.

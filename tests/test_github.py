@@ -408,6 +408,60 @@ def test_native_readability_rejection_never_pushes_or_creates_a_pr(native_repo, 
     assert (workspace.repo / "clamp.py").read_text() == ORIGINAL
 
 
+def test_description_only_revision_is_reviewed_with_the_same_patch(native_repo, tmp_path):
+    client, workspace, requests = native_repo
+    _, invoke = model()
+    descriptions = [
+        "No tests were added.",
+        "Clamp both bounds and add tests for negative, middle, and high values.",
+    ]
+    patches, reviews = [], []
+
+    def writer(prompt, config, limit, **kwargs):
+        if "checks" in kwargs["schema"]["properties"]:
+            reviews.append(prompt)
+            assert descriptions[len(reviews) - 1] in prompt
+            return {
+                "error": None,
+                "usage": {"input_tokens": 500, "output_tokens": 500},
+                "response": {
+                    "status": "ready",
+                    "summary": "Review the complete change, including its new tests.",
+                    "context_requests": [],
+                    "checks": [
+                        {
+                            "criterion": criterion,
+                            "passed": len(reviews) > 1 or criterion != "correctness",
+                            "reason": "The PR adds tests; correct the description.",
+                        }
+                        for criterion in ("correctness", "relevance", "readability", "simplicity")
+                    ],
+                },
+            }
+        result = invoke(prompt, config, limit, **kwargs)
+        if "edits" in kwargs["schema"]["properties"]:
+            result["response"]["description"] = descriptions[len(patches)]
+            patches.append(result["response"]["edits"])
+        return result
+
+    result, _ = improve_issue(
+        client,
+        workspace,
+        1,
+        config=ReviewConfig(backend="codex"),
+        output=tmp_path / "improve",
+        invoke=writer,
+        progress=lambda _: None,
+    )
+    assert result["status"] == "pull-request", result.get("error")
+    assert patches[0] == patches[1] and len(reviews) == 2
+    assert [a["passed"] for a in result["attempts"]] == [False, True]
+    pull = next(
+        payload for method, path, payload in requests if method == "POST" and path == "/pulls"
+    )
+    assert pull["body"].startswith(descriptions[1])
+
+
 def test_changed_test_collection_cannot_be_published_as_before_after_evidence(
     native_repo, tmp_path, monkeypatch
 ):
