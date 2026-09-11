@@ -7,6 +7,7 @@ from .review import write_json
 from .review_agent import _check_shape, _object, invoke_codex, response_schema
 from .review_context import encode, estimate_tokens, expand_context
 from .review_cost import backend_for, invoke_api, output_allowance, pricing_for, usage_cost
+from .workflow_quality import quality_policy
 
 INSTRUCTIONS = (
     """Work on one source target for one objective using only supplied evidence.
@@ -16,8 +17,13 @@ Tests must check intended behavior, with justified inputs and expected outputs. 
 tests to fit current behavior. Preserve the public signature and fix the cause generally,
 not hard-code test inputs. Missing runtime dependencies are not bugs. Request indexed source when
 needed; report unsupported if this objective cannot be verified in the supplied execution adapter.
-Correctness and maintainability are joint requirements. Simplify the existing design instead of
-bolting on nested special cases. Prefer clear standard primitives and explicit names. Do not game
+Correctness and maintainability are joint requirements. Refactors must improve measured quality
+across the changed region, including helpers. Bug fixes may preserve quality: decreases within
+quality_tolerance_points on the 0-100 scale are negligible at the target, changed region, and
+repository levels. Cyclomatic complexity, decision counts, nesting, and cycle counts must not
+increase for either objective. A bug fix need not simplify already readable code or add unrelated
+refactors to offset a negligible score change. Readability and simplicity must still pass review.
+Prefer clear standard primitives and explicit names. Do not game
 metrics with compressed lines, clever regular expressions, or moving complexity into closures.
 Inline BUG/ARCHITECTURE callouts are review metadata, not source code. Do not copy them into
 production edits or tests.
@@ -199,6 +205,8 @@ class WorkflowAgent:
             index.verify(packet["resources"])
             prompt = (
                 INSTRUCTIONS
+                + "\nACCEPTANCE POLICY\n"
+                + encode(quality_policy(finding["objective"]))
                 + "\n"
                 + detail
                 + "\nREVIEW PACKET\n"

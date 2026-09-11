@@ -48,10 +48,12 @@ walleye improve https://github.com/owner/repo/issues/42
 | --- | --- |
 | `scan` | Scores, ranked functions, source lines, and call graphs. |
 | `review` | Findings filed as GitHub issues. Local reviews save findings to disk. |
-| `improve` | A worktree, tests, a fix, a rescan, and a PR. Requires passing tests and improved maintainability. No automatic merge. |
+| `improve` | A worktree, tests, a fix, a rescan, and a PR. Requires passing tests and independent review. No automatic merge. |
 
 `--issues 5` limits findings. `--budget 5` sets the run's dollar budget.
 Codex spending is an API cost estimate, not a hard cap or subscription charge.
+
+Architecture changes must improve quality. Bug fixes may keep quality flat, allowing up to a 0.01-point decrease on the 0–100 scale. Complexity, nesting, and dependency cycles cannot increase.
 
 ## GitHub App
 

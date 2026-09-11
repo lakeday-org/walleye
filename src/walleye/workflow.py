@@ -20,10 +20,10 @@ from .workflow_quality import (
     MAX_ATTEMPTS,
     acceptance,
     metric_gate,
+    quality_policy,
     review_gate,
     verify_acceptance,
 )
-from .workflow_quality import PROFILE as ACCEPTANCE_PROFILE
 from .workflow_scores import health_snapshot, scorecard
 from .workflow_validation import (
     baseline_gate,
@@ -82,7 +82,7 @@ def _measure_candidate(index, proposal, original, updated, cases, baseline, dire
             "source_hashes": candidate_scan["source_hashes"],
         },
     )
-    return card, metric_gate(card)
+    return card, metric_gate(card, proposal["finding"]["objective"])
 
 
 def _independent_review(agent, packet, finding, index, directory, attempt, cases, card):
@@ -93,13 +93,13 @@ def _independent_review(agent, packet, finding, index, directory, attempt, cases
         finding,
         index,
         directory,
-        "INDEPENDENT REVIEW: decide whether this exact patch improves maintainability "
+        "INDEPENDENT REVIEW: decide whether this exact patch meets its objective's quality policy "
         "and addresses the evidenced objective. Do not author a patch. Inspect the original "
         "and candidate, contracts, callers, and frozen test coverage. Passing tests and metrics "
         "are necessary but insufficient. Check all four criteria exactly once: correctness "
         "(general fix and preserved behavior, boundary cases), relevance (real evidenced "
         "problem, focused change), readability (clear names, ordinary formatting, readable "
-        "parsing expressions), simplicity (less cognitive load, no extra state/abstraction "
+        "parsing expressions), simplicity (no unnecessary state/abstraction "
         "or complexity merely hidden in helpers). Reject a fix that is harder to understand. "
         "Flag missing explanations of non-obvious rules or invariants; do not demand comments "
         "that narrate obvious code or reward comment quantity. "
@@ -212,7 +212,7 @@ def _refine_candidate(
                 "verified-candidate",
                 directory,
                 acceptance_sha256=digest(canonical(record).encode()),
-                verification="Frozen function tests, measured maintainability improvement, "
+                verification="Frozen function tests, objective-specific quality policy, "
                 "and independent quality review passed; project integration tests not run",
             )
             return
@@ -348,9 +348,8 @@ def _run_proposal(agent, packet, finding, index, directory):
             "or edits to tests. "
             "Fix the root cause generally and preserve documented behavior. Return replacement "
             "source as plain text, without markdown fences. The test cases are now immutable. "
-            "Acceptance requires improved quality across the whole changed function (including "
-            "nested helpers), no worse cyclomatic complexity, nesting, repository quality or "
-            "cycle counts, and a separate readability review. Simplify the existing algorithm; "
+            "Acceptance requires the objective-specific quality policy and a separate readability "
+            "review. Preserve a clear implementation; "
             "do not just append more branches or state. Return unsupported if you cannot satisfy "
             "both correctness and maintainability. The coordinator computes metrics and returns "
             "measured feedback; do not hand-calculate Halstead scores.\n"
@@ -486,8 +485,12 @@ def improve(
     manifest["baseline_health"] = health_snapshot(index.report)
     manifest["workflow_profile"] = PROFILE
     manifest["acceptance_policy"] = {
-        "profile": ACCEPTANCE_PROFILE,
-        "requires": ["frozen tests", "measured quality improvement", "independent quality review"],
+        **quality_policy(objective),
+        "requires": [
+            "frozen tests",
+            "objective-specific quality policy",
+            "independent quality review",
+        ],
         "max_patch_attempts": MAX_ATTEMPTS,
         "budget": "All stages and revisions share the run budget",
     }
