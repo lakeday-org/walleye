@@ -13,7 +13,7 @@ from .review_context import encode
 from .scanner import scan
 from .workflow import safe_path
 from .workflow_agent import WorkflowAgent
-from .workflow_quality import MAX_ATTEMPTS, acceptance, metric_gate
+from .workflow_quality import MAX_ATTEMPTS, acceptance, metric_gate, quality_policy
 from .workflow_scores import scorecard
 from .workflow_validation import digest
 
@@ -100,8 +100,9 @@ def review_candidate(agent, packet, finding, index, directory, diff, card, resul
         "Review this exact patch independently. Do not author changes. Assess each criterion once: "
         "correctness (general fix, meaningful tests, preserved behavior), relevance (the evidenced "
         "issue is addressed), readability (clear code and explanations of non-obvious rules), "
-        "simplicity (less cognitive load; no compression or hiding tangled code in helpers). All "
-        "must pass. Reject tests that mirror implementation or only check a hard-coded example. "
+        "simplicity (no unnecessary complexity, compression, or hiding tangled code in helpers). "
+        "All must pass. Reject tests that mirror implementation or only check a "
+        "hard-coded example. "
         "The proposed PR description must accurately describe the change and contain no test "
         "execution claims; the coordinator adds verified results separately. Reject misleading "
         "public text under correctness. Under readability, reject generic titles or descriptions "
@@ -130,7 +131,7 @@ def candidate(agent, root, runner, packet, index, finding, plan, before, output,
         + target["path"]
         + ". Preserve public signatures and contracts. "
         "You may add cohesive helpers in this file. Frozen tests and other files cannot change. "
-        "Improve maintainability while addressing the objective. Do not compress code or bolt on "
+        "Meet the objective-specific quality policy. Do not compress code or bolt on "
         "nested special cases. The coordinator measures scores; do not calculate Halstead scores. "
         + PR_WRITING
         + "\nSOURCE FILE\n"
@@ -172,7 +173,7 @@ def candidate(agent, root, runner, packet, index, finding, plan, before, output,
         return patch, None, {"passed": False, "failures": ["Candidate scan is incomplete"]}
     card = project_scorecard(index.report, scanned, target, finding, before, after)
     write_json(output / "scorecard.json", card)
-    return patch, card, {**metric_gate(card), "checks": checks}
+    return patch, card, {**metric_gate(card, finding["objective"]), "checks": checks}
 
 
 def publish_candidate(
@@ -367,6 +368,7 @@ def improve_issue(
         worktree=str(root),
         branch=branch,
         attempts=[],
+        acceptance_policy=quality_policy(finding["objective"]),
     )
     write_json(output / "baseline.json", index.report)
     agent = WorkflowAgent(manifest, output, config, invoke=invoke, progress=progress)

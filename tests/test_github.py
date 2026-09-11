@@ -196,10 +196,11 @@ def test_high():
 
 
 @pytest.fixture
-def native_repo(tmp_path, monkeypatch):
+def native_repo(tmp_path, monkeypatch, request):
     source, bare = tmp_path / "source", tmp_path / "remote.git"
     source.mkdir()
-    (source / "clamp.py").write_text(ORIGINAL)
+    source_text = getattr(request, "param", ORIGINAL)
+    (source / "clamp.py").write_text(source_text)
     (source / ".gitignore").write_text("__pycache__/\n.pytest_cache/\n")
     (source / "tests").mkdir()
     (source / "tests/test_existing.py").write_text(
@@ -241,7 +242,7 @@ def native_repo(tmp_path, monkeypatch):
     finding = {
         "objective": "bug",
         "title": "Clamp negative inputs to zero",
-        "root_cause": "The lower bound is missing",
+        "root_cause": "The lower bound is not enforced",
         "severity": "medium",
         "confidence": "high",
         "trigger": "clamp(-1)",
@@ -256,7 +257,7 @@ def native_repo(tmp_path, monkeypatch):
                 "path": "clamp.py",
                 "line": 1,
                 "end_line": 4,
-                "quote": ORIGINAL.strip(),
+                "quote": source_text.strip(),
                 "annotations": [
                     {"quote_line": 4, "text": "Returns negative inputs without clamping"}
                 ],
@@ -307,7 +308,7 @@ def native_repo(tmp_path, monkeypatch):
     return client, workspace, requests
 
 
-def model(replacement=FIXED, reject=False):
+def model(replacement=FIXED, reject=False, *, original=ORIGINAL, regression_tests=None):
     stages = []
 
     def invoke(prompt, config, limit, *, schema, instructions):
@@ -322,14 +323,16 @@ def model(replacement=FIXED, reject=False):
             result.update(
                 test_path="tests/test_regression.py",
                 test_content=TESTS,
-                regression_tests=["test_negative"],
+                regression_tests=["test_negative"]
+                if regression_tests is None
+                else regression_tests,
             )
         elif "edits" in properties:
             stages.append("patch")
             result.update(
                 title="Clamp negative values to zero",
                 description="Clamp both bounds with standard operations.",
-                edits=[{"old": ORIGINAL, "new": replacement}],
+                edits=[{"old": original, "new": replacement}],
             )
         else:
             stages.append("review")
@@ -406,6 +409,36 @@ def test_native_readability_rejection_never_pushes_or_creates_a_pr(native_repo, 
     assert result["status"] == "stopped" and "repeated" in result["error"]
     assert not any(method == "POST" for method, _, _ in requests)
     assert (workspace.repo / "clamp.py").read_text() == ORIGINAL
+
+
+@pytest.mark.parametrize(
+    "native_repo",
+    ["def clamp(x):\n    if x > 10:\n        return 10\n    return min(0, x)\n"],
+    indirect=True,
+)
+def test_native_flat_bug_fix_reaches_review_and_publication(native_repo, tmp_path):
+    client, workspace, _ = native_repo
+    original = (workspace.repo / "clamp.py").read_text()
+    stages, invoke = model(
+        original=original,
+        replacement=original.replace("min(0, x)", "max(0, x)"),
+        regression_tests=["test_negative", "test_middle"],
+    )
+    result, output = improve_issue(
+        client,
+        workspace,
+        1,
+        config=ReviewConfig(backend="codex"),
+        output=tmp_path / "improve",
+        invoke=invoke,
+        progress=lambda _: None,
+    )
+    assert result["status"] == "pull-request", result.get("error")
+    assert stages == ["tests", "patch", "review"]
+    card = json.loads((output / "attempts/001/scorecard.json").read_text())
+    assert card["maintainability"]["region"]["quality"]["delta"] == 0
+    assert card["correctness"]["verified_resolutions"] == 1
+    assert result["acceptance_policy"]["quality_tolerance_points"] == 0.01
 
 
 def test_description_only_revision_is_reviewed_with_the_same_patch(native_repo, tmp_path):

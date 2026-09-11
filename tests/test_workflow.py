@@ -30,19 +30,20 @@ CASES = [case("negative", -1, 0, "regression"), case("middle", 5, 5), case("high
 
 
 @pytest.fixture
-def saved(tmp_path):
+def saved(tmp_path, request):
     root = tmp_path / "repo"
     root.mkdir()
-    (root / "clamp.js").write_text(ORIGINAL)
+    source = getattr(request, "param", ORIGINAL)
+    (root / "clamp.js").write_text(source)
     manifest, packets, _, output = prepare_review(root, issues=1, output=tmp_path / "review")
     packet = packets[0]
     finding = {
         "objective": "bug",
         "title": "Negative inputs are not clamped",
         "context": "clamp bounds numeric inputs.",
-        "root_cause": "Lower bound missing",
+        "root_cause": "The lower bound is not enforced",
         "impact": "Negative inputs escape the lower bound.",
-        "explanation": [{"text": "Only the upper bound is checked.", "evidence": [1]}],
+        "explanation": [{"text": "Negative inputs can remain below zero.", "evidence": [1]}],
         "severity": "medium",
         "confidence": "high",
         "trigger": "clamp(-1)",
@@ -57,8 +58,8 @@ def saved(tmp_path):
                 "path": "clamp.js",
                 "line": 1,
                 "end_line": 1,
-                "quote": ORIGINAL,
-                "annotations": [{"quote_line": 1, "text": "Only the upper bound is checked"}],
+                "quote": source,
+                "annotations": [{"quote_line": 1, "text": "Negative inputs can remain below zero"}],
             }
         ],
         "task_id": packet["task_id"],
@@ -185,6 +186,41 @@ def test_test_passing_but_more_complex_fix_is_rejected(saved, tmp_path):
     with pytest.raises(ValueError, match="verified"):
         apply_proposal(directory)
     assert (root / "clamp.js").read_text() == ORIGINAL
+
+
+@pytest.mark.parametrize(
+    "saved", ["function clamp(x) { if (x > 10) return 10; return Math.min(0, x); }"], indirect=True
+)
+@pytest.mark.parametrize("approve", [True, False])
+def test_flat_bug_fix_requires_review_and_can_be_reverified_on_apply(saved, tmp_path, approve):
+    root, _ = saved
+    fixed = (root / "clamp.js").read_text().replace("Math.min", "Math.max")
+    review = approved_review()
+    review["checks"][2]["passed"] = approve
+    tests = [
+        case("negative", -1, 0, "regression"),
+        case("middle", 5, 5, "regression"),
+        case("upper_boundary", 10, 10, "regression"),
+        case("zero", 0, 0),
+        case("high", 20, 10),
+    ]
+    _, manifest, output, calls = run(saved, tmp_path, replacement=fixed, tests=tests, review=review)
+    directory = output / "proposals/001"
+    card = json.loads((directory / "scorecard.json").read_text())
+    assert card["maintainability"]["region"]["quality"]["delta"] == 0
+    assert any("INDEPENDENT REVIEW" in prompt for prompt in calls)
+    assert all('"quality_tolerance_points":0.01' in prompt for prompt in calls)
+    record = json.loads((directory / "acceptance.json").read_text())
+    assert record["metrics"]["passed"] and record["metrics"]["objective"] == "bug"
+    assert record["passed"] == approve
+    if approve:
+        applied, _ = apply_proposal(directory)
+        assert applied["status"] == "applied"
+        assert (root / "clamp.js").read_text() == fixed
+    else:
+        assert manifest["verified_resolutions"] == 0
+        with pytest.raises(ValueError, match="verified"):
+            apply_proposal(directory)
 
 
 def test_rejected_patch_is_revised_with_the_same_frozen_tests(saved, tmp_path):

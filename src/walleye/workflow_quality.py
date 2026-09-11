@@ -2,12 +2,28 @@
 
 from .workflow_validation import canonical, digest
 
-PROFILE = "declank-acceptance-v1"
+PROFILE = "declank-acceptance-v2"
 MAX_ATTEMPTS = 3
 CRITERIA = {"correctness", "relevance", "readability", "simplicity"}
+QUALITY_EPSILON = 0.0001
+BUG_QUALITY_TOLERANCE = 0.01
 
 
-def metric_gate(card):
+def quality_policy(objective):
+    if objective not in {"bug", "refactor"}:
+        raise ValueError("Quality policy requires a bug or refactor objective")
+    return {
+        "profile": PROFILE,
+        "objective": objective,
+        "quality_tolerance_points": BUG_QUALITY_TOLERANCE
+        if objective == "bug"
+        else QUALITY_EPSILON,
+        "requires_quality_improvement": objective == "refactor",
+    }
+
+
+def metric_gate(card, objective):
+    policy = quality_policy(objective)
     maintainability = card["maintainability"]
     target = maintainability["target"]
     region = maintainability["region"]
@@ -24,11 +40,14 @@ def metric_gate(card):
     ]
     failures = []
     for label, change, direction in checks:
-        if change["delta"] is None or direction * change["delta"] < -0.0001:
+        tolerance = policy["quality_tolerance_points"] if direction == 1 else QUALITY_EPSILON
+        if change["delta"] is None or direction * change["delta"] < -tolerance:
             failures.append(f"{label}: {change['before']} -> {change['after']}")
-    if region["quality"]["delta"] is None or region["quality"]["delta"] <= 0.0001:
+    if policy["requires_quality_improvement"] and (
+        region["quality"]["delta"] is None or region["quality"]["delta"] <= QUALITY_EPSILON
+    ):
         failures.append("The whole changed region must show a measured quality improvement")
-    return {"profile": PROFILE, "passed": not failures, "failures": failures}
+    return {**policy, "passed": not failures, "failures": failures}
 
 
 def review_gate(review):
@@ -56,7 +75,11 @@ def acceptance(candidate, tests_hash, baseline_fingerprint, metrics, review):
 
 def verify_acceptance(proposal, record, candidate, tests_hash, baseline, card):
     expected = acceptance(
-        candidate, tests_hash, baseline["source_fingerprint"], metric_gate(card), record["review"]
+        candidate,
+        tests_hash,
+        baseline["source_fingerprint"],
+        metric_gate(card, proposal["finding"]["objective"]),
+        record["review"],
     )
     if (
         not expected["passed"]
