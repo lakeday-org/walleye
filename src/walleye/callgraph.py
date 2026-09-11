@@ -45,12 +45,10 @@ def _use_names(node, prefix=""):
         for child in node.named_children:
             yield from _use_names(child, prefix)
     elif node.type == "use_as_clause":
-        yield (
-            prefix + _text(node.child_by_field_name("path")),
-            _text(node.child_by_field_name("alias")),
-        )
+        path = prefix + _text(node.child_by_field_name("path"))
+        yield path.removesuffix("::self"), _text(node.child_by_field_name("alias"))
     elif node.type != "use_wildcard":
-        path = prefix + _text(node)
+        path = (prefix + _text(node)).removesuffix("::self")
         yield path, path.rsplit("::", 1)[-1]
 
 
