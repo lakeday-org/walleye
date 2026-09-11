@@ -4,11 +4,11 @@ from urllib.parse import quote
 
 from .discovery import ScanOptions
 from .git_workspace import git
-from .github_publication import pull_body, read_metadata
+from .github_publication import PR_WRITING, pull_body, read_metadata
 from .project_context import native_packet
 from .project_tests import ProjectTests, checks_passed, freeze_test, reproduced, test_unchanged
 from .review import prepare_review, write_json
-from .review_agent import response_schema, validate_response
+from .review_agent import stored_finding, validate_response
 from .review_context import encode
 from .scanner import scan
 from .workflow import safe_path
@@ -57,6 +57,8 @@ def module_measurement(report, path):
 
 
 def project_scorecard(baseline, candidate, target, finding, before, after):
+    if {c["name"] for c in before["cases"]} != {c["name"] for c in after["cases"]}:
+        raise ValueError("Frozen test cases changed between baseline and candidate")
     verification = {
         "baseline": {"passed": sum(c["passed"] for c in before["cases"])},
         "candidate": {
@@ -76,6 +78,15 @@ def project_scorecard(baseline, candidate, target, finding, before, after):
     card["correctness"]["assurance"] = (
         "Frozen native cases and all configured project checks passed"
     )
+    baseline_cases = {c["name"]: c for c in before["cases"]}
+    card["correctness"]["test_cases"] = [
+        {
+            "name": case["name"],
+            "before": "Passed" if baseline_cases[case["name"]]["passed"] else "Assertion failed",
+            "after": "Passed" if case["passed"] else "Failed",
+        }
+        for case in after["cases"]
+    ]
     return card
 
 
@@ -93,7 +104,11 @@ def review_candidate(agent, packet, finding, index, directory, diff, card, resul
         "must pass. Reject tests that mirror implementation or only check a hard-coded example. "
         "The proposed PR description must accurately describe the change and contain no test "
         "execution claims; the coordinator adds verified results separately. Reject misleading "
-        "public text under correctness.\nPROPOSED PR TEXT\n"
+        "public text under correctness. Under readability, reject generic titles or descriptions "
+        "that omit the component's role, the concrete problem and consequence, the approach, "
+        "preserved contracts, or what the new tests exercise. The PR must stand on its own for "
+        "a maintainer unfamiliar with the finding. Verify claimed callers and benefits against "
+        "the supplied source. A score increase alone is not a rationale.\nPROPOSED PR TEXT\n"
         + encode({k: patch[k] for k in ("title", "description")})
         + "\n"
         "PATCH\n"
@@ -117,10 +132,8 @@ def candidate(agent, root, runner, packet, index, finding, plan, before, output,
         "You may add cohesive helpers in this file. Frozen tests and other files cannot change. "
         "Improve maintainability while addressing the objective. Do not compress code or bolt on "
         "nested special cases. The coordinator measures scores; do not calculate Halstead scores. "
-        "title and description will be used in a public pull request. Describe only the concrete "
-        "problem and changed behavior in description. Do not put test status or execution claims "
-        "there; the coordinator adds verified results after running checks. summary is an internal "
-        "author note and is not published.\nSOURCE FILE\n"
+        + PR_WRITING
+        + "\nSOURCE FILE\n"
         + original.decode()
         + "\nFROZEN TEST FILE\n"
         + safe_path(root, plan["test_path"]).read_text()
@@ -172,11 +185,16 @@ def publish_candidate(
     if remote["sha"] != workspace.sha:
         raise ValueError("Base branch changed during validation; rerun before publishing")
     commit = workspace.publish(root, branch, [relative, plan["test_path"]], patch["title"])
+    card["scope"]["comparison_url"] = (
+        f"{workspace.github.repository.url}/compare/{workspace.sha}...{commit}"
+    )
     manifest.update(status="branch-pushed", head_commit=commit, branch=branch)
     write_json(directory.parent.parent / "workflow.json", manifest)
     payload = {
         "title": patch["title"],
-        "body": pull_body(issue, patch["description"], card, metrics["checks"]),
+        "body": pull_body(
+            issue, patch["description"], card, metrics["checks"], test_path=plan["test_path"]
+        ),
         "head": branch,
         "base": workspace.base_branch,
     }
@@ -225,9 +243,10 @@ def iterate(
         )
         updated = safe_path(root, relative).read_bytes()
         fingerprint = digest(updated)
-        if fingerprint in seen:
+        candidate_key = (fingerprint, patch["title"], patch["description"])
+        if candidate_key in seen:
             raise ValueError("Writer repeated a rejected candidate")
-        seen.add(fingerprint)
+        seen.add(candidate_key)
         test_unchanged(root, plan["test_path"], manifest["tests_sha256"])
         changed = git(root, "diff", "--name-only", "HEAD").splitlines()
         if set(changed) - {relative, plan["test_path"]}:
@@ -326,16 +345,16 @@ def improve_issue(
     )
     native_packet(packets[0], index, config.context_tokens)
     write_json(output / "tasks/001.json", packets[0])
-    fields = response_schema()["properties"]["finding"]["anyOf"][0]["properties"]
     validate_response(
         {
             "status": "finding",
             "summary": finding["title"],
             "context_requests": [],
-            "finding": {k: finding[k] for k in fields},
+            "finding": stored_finding(finding),
         },
         packets[0],
         index,
+        require_detail=False,
     )
     manifest.update(
         workflow_profile="declank-github-v1",

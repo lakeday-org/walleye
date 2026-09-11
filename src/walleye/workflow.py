@@ -12,7 +12,7 @@ from pathlib import Path, PurePosixPath
 
 from .discovery import ScanOptions
 from .review import ReviewConfig, prepare_review, write_json
-from .review_agent import _check_shape, response_schema, run_review, validate_response
+from .review_agent import _check_shape, run_review, stored_finding, validate_response
 from .review_context import encode
 from .scanner import scan
 from .workflow_agent import WorkflowAgent, WorkflowStopped, stage_schema
@@ -503,12 +503,9 @@ def improve(
                 "status": "finding",
                 "summary": finding["title"],
                 "context_requests": [],
-                "finding": {
-                    k: finding[k]
-                    for k in response_schema()["properties"]["finding"]["anyOf"][0]["properties"]
-                },
+                "finding": stored_finding(finding),
             }
-            validate_response(response, packet, index)
+            validate_response(response, packet, index, require_detail=False)
             manifest["findings"].append({**finding, "task_id": packet["task_id"]})
     else:
         run_review(

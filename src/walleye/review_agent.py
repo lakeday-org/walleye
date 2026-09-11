@@ -21,8 +21,35 @@ Return one JSON result matching the output schema. A no_finding result is valid.
 Metrics select investigations; they never establish a bug, severity, or refactor benefit.
 A finding must cite a short exact source quote and lines present in the supplied excerpts,
 including evidence inside the target. Explain the causal argument and a concrete validation test.
+Keep each evidence quote verbatim. Add annotations separately: quote_line is the 1-based line
+within that quote, NOT a file line number. Annotate the exact condition, mutation, missing check,
+or responsibility boundary that causes the issue. Use a short, specific explanation of what is
+wrong there, not 'look here' or a restatement of the title. At least one target excerpt needs a
+callout. Leave annotations empty for supporting excerpts with no problematic line. Do not mark
+every line or harmless callers as bugs. The renderer adds BUG/red or ARCHITECTURE/yellow markers;
+do not insert markers or comments into the source quote itself.
 Do not claim a test was run. For a bug, give a reachable trigger, expected and actual behavior.
 For a refactor, give one cohesive proposed change, preserved behavior, and the expected benefit.
+Write context to explain the component's role and the relevant caller or data flow. root_cause
+names the defect or maintenance burden. In explanation, trace the causal chain step by step:
+entry point, state/control transition, failure or coupling, and consequence. Each step cites
+one or more 1-based indices into evidence. Each cited excerpt must contain the condition or state
+transition being explained, not just an unrelated opening line. Supply evidence for every material
+hop. For bugs, use impact to bound the affected users, operations, instances or data. Distinguish
+local from process-wide effects and deterministic from timing-dependent triggers when relevant.
+Do not escalate a local problem into global data loss without evidence. State the concrete trigger,
+including ordering/preconditions. Do not repeat irrelevant risk categories or absence-of-evidence
+disclaimers. Write the explanation as direct causal steps, without 'Entry point:' or 'State
+transition:' labels. Describe the original code; put the proposed change in proposed_change.
+For refactors, explain which responsibilities are coupled and which future change or test becomes
+easier; impact should name the maintenance task that is difficult today, not list unrelated bug
+risks. Do not invent a behavioral defect. In expected_benefit, explain the practical result of
+the proposed change. Make validation an actionable test plan with inputs and expected outcomes.
+Recommend a fix that addresses the cause while preserving intentional contracts, locks and gates.
+Do not name an introducing commit or author: the packet supplies current source, not verified
+history. A reviewed commit or a blame line alone does not establish when a bug was introduced.
+Bug titles describe a failure, not an instruction to fix it. Refactor titles identify the
+responsibilities being separated, not a generic request to improve a function.
 Use empty strings for finding fields that do not apply to the objective. Never invent contracts.
 If a necessary contract, type, caller, or enclosing condition is absent, return needs_context
 with specific resource IDs and inclusive lines from the provided catalog. Request the entire
@@ -49,7 +76,19 @@ def response_schema():
         {
             "objective": {"type": "string", "enum": ["bug", "refactor"]},
             "title": string,
+            "context": string,
             "root_cause": string,
+            "impact": string,
+            "explanation": {
+                "type": "array",
+                "maxItems": 8,
+                "items": _object(
+                    {
+                        "text": string,
+                        "evidence": {"type": "array", "maxItems": 8, "items": integer},
+                    }
+                ),
+            },
             "severity": {"type": "string", "enum": ["low", "medium", "high", "critical"]},
             "confidence": {"type": "string", "enum": ["low", "medium", "high"]},
             **{
@@ -66,9 +105,19 @@ def response_schema():
             },
             "evidence": {
                 "type": "array",
-                "maxItems": 4,
+                "maxItems": 8,
                 "items": _object(
-                    {"path": string, "line": integer, "end_line": integer, "quote": string}
+                    {
+                        "path": string,
+                        "line": integer,
+                        "end_line": integer,
+                        "quote": string,
+                        "annotations": {
+                            "type": "array",
+                            "maxItems": 3,
+                            "items": _object({"quote_line": integer, "text": string}),
+                        },
+                    }
                 ),
             },
         }
@@ -310,7 +359,37 @@ def quote_matches(quote, lines, start, end):
     return bool(quoted) and quoted in actual
 
 
-def validate_response(response, packet, index, expansion=()):
+def stored_finding(finding):
+    """Revalidate older saved findings without inventing missing narrative or evidence."""
+    defaults = {"context": "", "impact": "", "explanation": []}
+    fields = response_schema()["properties"]["finding"]["anyOf"][0]["properties"]
+    result = {key: finding[key] if key in finding else defaults[key] for key in fields}
+    result["evidence"] = [
+        {**item, "annotations": item.get("annotations", [])} for item in finding["evidence"]
+    ]
+    return result
+
+
+def validate_annotations(evidence):
+    lines = evidence["quote"].splitlines()
+    seen = set()
+    for annotation in evidence["annotations"]:
+        line, text = annotation["quote_line"], annotation["text"]
+        if (
+            line > len(lines)
+            or not lines[line - 1].strip()
+            or line in seen
+            or not text.strip()
+            or len(text) > 180
+            or len(text.splitlines()) != 1
+        ):
+            raise ValueError(
+                "Callouts need a unique quoted line and a short single-line explanation"
+            )
+        seen.add(line)
+
+
+def validate_response(response, packet, index, expansion=(), *, require_detail=True):
     _check_shape(response, response_schema())
     if not response["summary"].strip():
         raise ValueError("Every result needs a summary")
@@ -336,7 +415,21 @@ def validate_response(response, packet, index, expansion=()):
         raise ValueError("Finding lacks causal explanation or validation")
     if not finding["evidence"]:
         raise ValueError("Finding has no source evidence")
+    if require_detail and (
+        not finding["context"].strip()
+        or not finding["impact"].strip()
+        or not finding["explanation"]
+    ):
+        raise ValueError("Finding needs context, bounded impact, and a causal explanation")
+    for step in finding["explanation"]:
+        if (
+            not step["text"].strip()
+            or not step["evidence"]
+            or any(number > len(finding["evidence"]) for number in step["evidence"])
+        ):
+            raise ValueError("Every explanation step must reference supplied source evidence")
     target_evidence = False
+    target_callout = False
     for evidence in finding["evidence"]:
         path, start, end = evidence["path"], evidence["line"], evidence["end_line"]
         if not any(
@@ -346,12 +439,17 @@ def validate_response(response, packet, index, expansion=()):
             raise ValueError("Finding cites lines the agent was not supplied")
         if not quote_matches(evidence["quote"], index.lines(path), start, end):
             raise ValueError("Finding's source quote does not match its cited lines")
+        validate_annotations(evidence)
         target = packet["target"]
-        target_evidence |= path == target["path"] and max(start, target["line"]) <= min(
+        in_target = path == target["path"] and max(start, target["line"]) <= min(
             end, target["end_line"]
         )
+        target_evidence |= in_target
+        target_callout |= in_target and bool(evidence["annotations"])
     if not target_evidence:
         raise ValueError("Finding lacks evidence in the assigned target")
+    if require_detail and not target_callout:
+        raise ValueError("Finding needs an inline callout in the assigned target")
 
 
 def duplicate(finding, accepted):

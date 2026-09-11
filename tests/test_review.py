@@ -60,7 +60,10 @@ def result_for(packet):
         "finding": {
             "objective": "bug",
             "title": "Unhandled zero input",
+            "context": "calculate divides a value to produce a result.",
             "root_cause": "Zero is admitted",
+            "impact": "Calls with zero fail instead of returning a result.",
+            "explanation": [{"text": "Zero reaches the calculation.", "evidence": [1]}],
             "severity": "medium",
             "confidence": "high",
             "trigger": "Call with zero",
@@ -76,6 +79,9 @@ def result_for(packet):
                     "line": target["line"],
                     "end_line": target["line"],
                     "quote": quote,
+                    "annotations": [
+                        {"quote_line": 1, "text": "Zero is admitted to this calculation"}
+                    ],
                 }
             ],
         },
@@ -89,6 +95,51 @@ def no_finding():
         "finding": None,
         "context_requests": [],
     }
+
+
+@pytest.mark.parametrize("missing", ["context", "impact", "explanation", "citation"])
+def test_findings_require_context_impact_and_cited_causal_steps(prepared, missing):
+    _, packets, index, _ = prepared
+    response = result_for(packets[0])
+    if missing == "citation":
+        response["finding"]["explanation"][0]["evidence"] = [2]
+    else:
+        response["finding"][missing] = [] if missing == "explanation" else ""
+    with pytest.raises(ValueError):
+        validate_response(response, packets[0], index)
+
+
+@pytest.mark.parametrize(
+    "annotations",
+    [
+        [],
+        [{"quote_line": 0, "text": "Invalid anchor"}],
+        [{"quote_line": 2, "text": "Outside the one-line quote"}],
+        [{"quote_line": 1, "text": ""}],
+        [{"quote_line": 1, "text": "First line\nsecond line"}],
+        [{"quote_line": 1, "text": "x" * 181}],
+        [{"quote_line": 1, "text": "First"}, {"quote_line": 1, "text": "Duplicate"}],
+    ],
+)
+def test_agent_callouts_require_a_valid_quoted_line_and_short_explanation(prepared, annotations):
+    _, packets, index, _ = prepared
+    response = result_for(packets[0])
+    response["finding"]["evidence"][0]["annotations"] = annotations
+    with pytest.raises(ValueError):
+        validate_response(response, packets[0], index)
+
+
+def test_legacy_findings_load_without_inventing_or_mutating_annotations(prepared):
+    from walleye.review_agent import stored_finding
+
+    _, packets, index, _ = prepared
+    response = result_for(packets[0])
+    legacy = response["finding"]
+    del legacy["evidence"][0]["annotations"]
+    response["finding"] = stored_finding(legacy)
+    validate_response(response, packets[0], index, require_detail=False)
+    assert response["finding"]["evidence"][0]["annotations"] == []
+    assert "annotations" not in legacy["evidence"][0]
 
 
 def measured(response, input_tokens=1000, output_tokens=200):

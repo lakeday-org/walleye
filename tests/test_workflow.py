@@ -39,7 +39,10 @@ def saved(tmp_path):
     finding = {
         "objective": "bug",
         "title": "Negative inputs are not clamped",
+        "context": "clamp bounds numeric inputs.",
         "root_cause": "Lower bound missing",
+        "impact": "Negative inputs escape the lower bound.",
+        "explanation": [{"text": "Only the upper bound is checked.", "evidence": [1]}],
         "severity": "medium",
         "confidence": "high",
         "trigger": "clamp(-1)",
@@ -49,7 +52,15 @@ def saved(tmp_path):
         "preserved_behavior": "",
         "expected_benefit": "",
         "validation": "Check both bounds",
-        "evidence": [{"path": "clamp.js", "line": 1, "end_line": 1, "quote": ORIGINAL}],
+        "evidence": [
+            {
+                "path": "clamp.js",
+                "line": 1,
+                "end_line": 1,
+                "quote": ORIGINAL,
+                "annotations": [{"quote_line": 1, "text": "Only the upper bound is checked"}],
+            }
+        ],
         "task_id": packet["task_id"],
         "source_sha256": packet["target"]["sha256"],
         "verification": "Source quotes checked; proposed tests not run",
