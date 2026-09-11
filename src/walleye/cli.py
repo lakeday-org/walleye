@@ -703,7 +703,7 @@ def main(argv: list[str] | None = None) -> int:
                 console.print(
                     Text(f"Applied {proposal['target']['path']} · verified and rescanned")
                 )
-                delta = card["maintainability"]["repository"]["score"]
+                delta = card["maintainability"]["observed_repository"]["score"]
                 console.print(
                     f"Repository structural quality: {delta['before']} → {delta['after']}"
                 )
@@ -764,6 +764,7 @@ def main(argv: list[str] | None = None) -> int:
                             label, str(value["before"]), str(value["after"]), str(value["delta"])
                         )
                     console.print(table)
+                    console.print(Text(card["scope"]["quality_comparison"] + "."))
                     console.print(
                         "Architecture is partial. Project integration tests were not run."
                     )

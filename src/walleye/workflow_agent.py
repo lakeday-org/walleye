@@ -23,6 +23,10 @@ quality_tolerance_points on the 0-100 scale are negligible at the target, change
 repository levels. Cyclomatic complexity, decision counts, nesting, and cycle counts must not
 increase for either objective. A bug fix need not simplify already readable code or add unrelated
 refactors to offset a negligible score change. Readability and simplicity must still pass review.
+Before/after quality comparisons hold the original source weights fixed. New helpers share the
+target's weight, so shortening a function cannot dilute its contribution to the module score.
+On revisions, use the best candidate and measured feedback supplied by the coordinator. Keep
+working behavior and resolve remaining failures; do not restart the investigation or repeat edits.
 Prefer clear standard primitives and explicit names. Do not game
 metrics with compressed lines, clever regular expressions, or moving complexity into closures.
 Inline BUG/ARCHITECTURE callouts are review metadata, not source code. Do not copy them into

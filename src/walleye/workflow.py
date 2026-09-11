@@ -17,13 +17,13 @@ from .review_context import encode
 from .scanner import scan
 from .workflow_agent import WorkflowAgent, WorkflowStopped, stage_schema
 from .workflow_quality import (
-    MAX_ATTEMPTS,
     acceptance,
     metric_gate,
     quality_policy,
     review_gate,
     verify_acceptance,
 )
+from .workflow_revisions import NO_PROGRESS_LIMIT, Revisions
 from .workflow_scores import health_snapshot, scorecard
 from .workflow_validation import (
     baseline_gate,
@@ -136,14 +136,14 @@ def _refine_candidate(
     agent, packet, finding, index, directory, proposal, cases, baseline, detail, expansion
 ):
     original = index.sources[proposal["target"]["path"]]
-    feedback = None
-    seen = set()
-    for number in range(1, MAX_ATTEMPTS + 1):
+    revisions = Revisions()
+    number = 1
+    while not revisions.exhausted:
         request = detail
-        if feedback:
+        if revisions.history:
             request += (
-                "\nREJECTED ATTEMPT: revise the implementation, keep every frozen test.\n"
-                + encode(feedback)
+                "\nREVISION HISTORY: revise the best candidate, keep every frozen test.\n"
+                + encode(revisions.feedback())
             )
         patch = agent.phase("patch", packet, finding, index, directory, request, expansion)
         if patch["status"] != "ready":
@@ -153,16 +153,13 @@ def _refine_candidate(
             original, proposal["language"], proposal["target"]["name"], patch["replacement"].strip()
         )
         fingerprint = digest(updated)
-        if updated == original or fingerprint in seen:
-            transition(
-                proposal,
-                proposal["status"] if feedback else "no-progress",
-                directory,
-                error=proposal.get("error", "")
-                + "; writer repeated an unchanged or rejected candidate",
-            )
-            return
-        seen.add(fingerprint)
+        if updated == original:
+            revisions.seen.add(fingerprint)
+        if revisions.repeated(fingerprint):
+            proposal["revisions"] = revisions.feedback()
+            transition(proposal, "revising", directory, error="Writer repeated a checked candidate")
+            number += 1
+            continue
         if (
             digest(canonical(json.loads((directory / "tests.json").read_text())).encode())
             != proposal["tests_sha256"]
@@ -179,9 +176,7 @@ def _refine_candidate(
             patch_summary=patch["summary"],
         )
         if agent.progress:
-            agent.progress(
-                f"{directory.name} · attempt {number}/{MAX_ATTEMPTS} · verifying tests and quality"
-            )
+            agent.progress(f"{directory.name} · revision {number} · verifying tests and quality")
         card, metrics = _measure_candidate(
             index, proposal, original, updated, cases, baseline, attempt
         )
@@ -201,9 +196,12 @@ def _refine_candidate(
                     confirmed_open={"before": 1, "after": 0, "delta": -1}, verified_resolutions=1
                 )
             write_json(attempt / "scorecard.json", card)
-        _publish_attempt(attempt, directory)
-        proposal["scorecard"] = "scorecard.json" if card else None
-        proposal["patch"] = "patch.diff"
+        improved = revisions.record(number, patch, card, metrics, review, attempt)
+        proposal["revisions"] = revisions.feedback()
+        if improved or record["passed"]:
+            _publish_attempt(attempt, directory)
+            proposal["scorecard"] = "scorecard.json" if card else None
+            proposal["patch"] = "patch.diff"
         verify_snapshot(index.base, index.hashes)
         if record["passed"]:
             proposal.pop("error", None)
@@ -216,7 +214,6 @@ def _refine_candidate(
                 "and independent quality review passed; project integration tests not run",
             )
             return
-        feedback = {"replacement": patch["replacement"], "metrics": metrics, "review": review}
         reasons = metrics["failures"] + [c["reason"] for c in review["checks"] if not c["passed"]]
         if not review_gate(review) and not reasons:
             reasons.append(
@@ -224,10 +221,18 @@ def _refine_candidate(
             )
         transition(
             proposal,
-            "quality-rejected" if card else "verification-failed",
+            "revising",
             directory,
             error="; ".join(reasons),
         )
+        number += 1
+    transition(
+        proposal,
+        "no-progress",
+        directory,
+        error="No progress across three consecutive revisions",
+        stop_reason="no_progress",
+    )
 
 
 def safe_path(base, relative):
@@ -414,6 +419,8 @@ def render_workflow(manifest, output):
             ]
             lines += [
                 "",
+                card["scope"]["quality_comparison"] + ".",
+                "Raw scan scores are included in the scorecard.",
                 "Architecture is partial static analysis; unreviewed correctness is unknown.",
                 "Integration tests have not been run. Test variants count as one finding.",
                 "",
@@ -491,7 +498,7 @@ def improve(
             "objective-specific quality policy",
             "independent quality review",
         ],
-        "max_patch_attempts": MAX_ATTEMPTS,
+        "max_attempts_without_progress": NO_PROGRESS_LIMIT,
         "budget": "All stages and revisions share the run budget",
     }
     manifest["proposals"] = []

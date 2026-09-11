@@ -13,7 +13,9 @@ from .review_context import encode
 from .scanner import scan
 from .workflow import safe_path
 from .workflow_agent import WorkflowAgent
-from .workflow_quality import MAX_ATTEMPTS, acceptance, metric_gate, quality_policy
+from .workflow_comparison import paired_quality
+from .workflow_quality import acceptance, metric_gate, quality_policy
+from .workflow_revisions import Revisions
 from .workflow_scores import scorecard
 from .workflow_validation import digest
 
@@ -69,8 +71,29 @@ def project_scorecard(baseline, candidate, target, finding, before, after):
     card = scorecard(baseline, candidate, target, finding, verification, allow_line_shift=True)
     old = module_measurement(baseline, target["path"])
     new = module_measurement(candidate, target["path"])
+    card["maintainability"]["observed_module_quality"] = {
+        "before": old["quality"],
+        "after": new["quality"],
+        "delta": round(new["quality"] - old["quality"], 4),
+    }
+    old["quality"], new["quality"] = paired_quality(
+        [r for r in baseline["records"] if r["kind"] == "function" and r["path"] == target["path"]],
+        [
+            r
+            for r in candidate["records"]
+            if r["kind"] == "function" and r["path"] == target["path"]
+        ],
+        target,
+    )
     card["maintainability"]["region"] = {
-        k: {"before": old[k], "after": new[k], "delta": round(new[k] - old[k], 4)} for k in old
+        k: {
+            "before": old[k],
+            "after": new[k],
+            "delta": round(new[k] - old[k], 4)
+            if old[k] is not None and new[k] is not None
+            else None,
+        }
+        for k in old
     }
     card["maintainability"]["region_scope"] = (
         "All functions in the changed file, including new helpers"
@@ -122,7 +145,21 @@ def review_candidate(agent, packet, finding, index, directory, diff, card, resul
     )
 
 
-def candidate(agent, root, runner, packet, index, finding, plan, before, output, feedback):
+def candidate(
+    agent,
+    root,
+    runner,
+    packet,
+    index,
+    finding,
+    plan,
+    before,
+    output,
+    feedback,
+    *,
+    revisions=None,
+    measured=None,
+):
     target = packet["target"]
     original = index.sources[target["path"]]
     detail = (
@@ -138,7 +175,7 @@ def candidate(agent, root, runner, packet, index, finding, plan, before, output,
         + original.decode()
         + "\nFROZEN TEST FILE\n"
         + safe_path(root, plan["test_path"]).read_text()
-        + "\nPREVIOUS ATTEMPT FEEDBACK\n"
+        + "\nREVISION HISTORY AND BEST CANDIDATE\n"
         + encode(feedback)
     )
     patch = agent.phase("native-patch", packet, finding, index, output, detail, [])
@@ -150,6 +187,22 @@ def candidate(agent, root, runner, packet, index, finding, plan, before, output,
         return patch, None, {"passed": False, "failures": [str(error)]}
     safe_path(root, target["path"]).write_bytes(updated)
     runner.format_file(target["path"], output.name + "-format")
+    fingerprint = digest(safe_path(root, target["path"]).read_bytes())
+    if revisions and revisions.repeated((fingerprint, patch["title"], patch["description"])):
+        return patch, None, {"passed": False, "failures": ["Repeated candidate"], "repeated": True}
+    if measured is not None and fingerprint in measured:
+        card, metrics, previous = measured[fingerprint]
+        write_json(output / "scorecard.json", card)
+        write_json(
+            output / "reused-measurements.json",
+            {
+                "source_sha256": fingerprint,
+                "from": previous,
+                "reason": "Only PR text changed; this source and the frozen tests "
+                "were already checked",
+            },
+        )
+        return patch, card, metrics
     after = runner.frozen(plan["test_path"], output.name + "-frozen")
     checks = runner.commands("checks", output.name + "-checks")
     if (
@@ -173,7 +226,10 @@ def candidate(agent, root, runner, packet, index, finding, plan, before, output,
         return patch, None, {"passed": False, "failures": ["Candidate scan is incomplete"]}
     card = project_scorecard(index.report, scanned, target, finding, before, after)
     write_json(output / "scorecard.json", card)
-    return patch, card, {**metric_gate(card, finding["objective"]), "checks": checks}
+    metrics = {**metric_gate(card, finding["objective"]), "checks": checks}
+    if measured is not None:
+        measured[fingerprint] = card, metrics, str(output)
+    return patch, card, metrics
 
 
 def publish_candidate(
@@ -233,25 +289,40 @@ def iterate(
 ):
     relative = packet["target"]["path"]
     original = index.sources[relative]
-    seen = set()
-    for number in range(start, MAX_ATTEMPTS + 1):
+    revisions = Revisions()
+    measured = {}
+    number = start
+    while not revisions.exhausted:
         safe_path(root, relative).write_bytes(original)
         directory = output / "attempts" / f"{number:03}"
         directory.mkdir(parents=True)
-        progress(f"Attempt {number}/{MAX_ATTEMPTS}: patch, native tests, quality checks")
+        progress(f"Revision {number}: patch, native tests, quality checks")
         patch, card, metrics = candidate(
-            agent, root, runner, packet, index, finding, plan, before, directory, feedback
+            agent,
+            root,
+            runner,
+            packet,
+            index,
+            finding,
+            plan,
+            before,
+            directory,
+            feedback,
+            revisions=revisions,
+            measured=measured,
         )
         updated = safe_path(root, relative).read_bytes()
         fingerprint = digest(updated)
-        candidate_key = (fingerprint, patch["title"], patch["description"])
-        if candidate_key in seen:
-            raise ValueError("Writer repeated a rejected candidate")
-        seen.add(candidate_key)
         test_unchanged(root, plan["test_path"], manifest["tests_sha256"])
         changed = git(root, "diff", "--name-only", "HEAD").splitlines()
         if set(changed) - {relative, plan["test_path"]}:
             raise ValueError("Project commands changed files outside the assigned source")
+        if metrics.get("repeated"):
+            feedback = revisions.feedback()
+            manifest["revisions"] = feedback
+            agent.save()
+            number += 1
+            continue
         git(root, "add", "--intent-to-add", "--", plan["test_path"])
         diff = git(root, "diff", "--", relative, plan["test_path"])
         (directory / "patch.diff").write_text(diff + "\n")
@@ -264,6 +335,8 @@ def iterate(
             updated, manifest["tests_sha256"], index.report["source_fingerprint"], metrics, review
         )
         write_json(directory / "acceptance.json", record)
+        revisions.record(number, patch, card, metrics, review, directory)
+        manifest["revisions"] = revisions.feedback()
         manifest["attempts"].append(
             {"number": number, "passed": record["passed"], "artifacts": str(directory)}
         )
@@ -290,8 +363,19 @@ def iterate(
                 manifest,
                 directory,
             )
-        feedback = {"patch": patch, "metrics": metrics, "review": review}
-    manifest["status"] = "rejected"
+        feedback = revisions.feedback()
+        manifest["status"] = "revising"
+        progress(
+            f"Revision {number} needs changes; retaining best candidate "
+            f"{revisions.best['attempt']} and continuing within the run budget"
+        )
+        agent.save()
+        number += 1
+    manifest.update(
+        status="stopped",
+        error="No progress across three consecutive revisions",
+        stop_reason="no_progress",
+    )
 
 
 def freeze_native_tests(agent, runner, root, packet, finding, index, output, manifest):

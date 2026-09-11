@@ -2,8 +2,7 @@
 
 from .workflow_validation import canonical, digest
 
-PROFILE = "declank-acceptance-v2"
-MAX_ATTEMPTS = 3
+PROFILE = "declank-acceptance-v3"
 CRITERIA = {"correctness", "relevance", "readability", "simplicity"}
 QUALITY_EPSILON = 0.0001
 BUG_QUALITY_TOLERANCE = 0.01
@@ -39,15 +38,27 @@ def metric_gate(card, objective):
         ("Module cycles", card["architecture"]["changes"]["module_cycles"], -1),
     ]
     failures = []
+    distance = 0.0
     for label, change, direction in checks:
         tolerance = policy["quality_tolerance_points"] if direction == 1 else QUALITY_EPSILON
         if change["delta"] is None or direction * change["delta"] < -tolerance:
             failures.append(f"{label}: {change['before']} -> {change['after']}")
+            distance += 100 if change["delta"] is None else -direction * change["delta"] - tolerance
     if policy["requires_quality_improvement"] and (
         region["quality"]["delta"] is None or region["quality"]["delta"] <= QUALITY_EPSILON
     ):
         failures.append("The whole changed region must show a measured quality improvement")
-    return {**policy, "passed": not failures, "failures": failures}
+        distance += (
+            100
+            if region["quality"]["delta"] is None
+            else (QUALITY_EPSILON - region["quality"]["delta"])
+        )
+    return {
+        **policy,
+        "passed": not failures,
+        "failures": failures,
+        "violation_distance": round(distance, 6),
+    }
 
 
 def review_gate(review):

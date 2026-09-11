@@ -174,7 +174,7 @@ def test_test_passing_but_more_complex_fix_is_rejected(saved, tmp_path):
     ugly = "function clamp(x) { if (x < 0) return 0; if (x > 10) return 10; return x; }"
     root, manifest, output, calls = run(saved, tmp_path, replacement=ugly)
     proposal = manifest["proposals"][0]
-    assert proposal["status"] == "quality-rejected"
+    assert proposal["status"] == "no-progress"
     assert manifest["verified_resolutions"] == 0
     assert not any("INDEPENDENT REVIEW" in p for p in calls)  # save money on measured failures
     directory = output / "proposals/001"
@@ -228,7 +228,7 @@ def test_rejected_patch_is_revised_with_the_same_frozen_tests(saved, tmp_path):
     _, manifest, output, calls = run(saved, tmp_path, replacement=[ugly, FIXED])
     assert manifest["proposals"][0]["status"] == "verified-candidate"
     assert len(calls) == 4  # tests, failed patch, revised patch, independent review
-    assert "REJECTED ATTEMPT" in calls[2]
+    assert "REVISION HISTORY" in calls[2]
     directory = output / "proposals/001"
     assert json.loads((directory / "tests.json").read_text()) == CASES
     attempts = [
@@ -244,10 +244,33 @@ def test_independent_readability_rejection_blocks_passing_metrics(saved, tmp_pat
     review = approved_review()
     review["checks"][2].update(passed=False, reason="Reject this illustrative readability defect")
     _, manifest, output, _ = run(saved, tmp_path, review=review)
-    assert manifest["proposals"][0]["status"] == "quality-rejected"
+    assert manifest["proposals"][0]["status"] == "no-progress"
     record = json.loads((output / "proposals/001/acceptance.json").read_text())
     assert record["metrics"]["passed"] and not record["passed"]
     assert manifest["verified_resolutions"] == 0
+
+
+def test_four_improving_revisions_reuse_the_frozen_tests_and_reach_review(saved, tmp_path):
+    tests = [case(f"negative_{-x}", x, 0, "regression") for x in (-4, -3, -2, -1)]
+    tests += [case("middle", 5, 5), case("high", 20, 10)]
+    partial = [
+        "function clamp(x) { return x < " + str(limit) + " ? Math.max(0, x) : Math.min(10, x); }"
+        for limit in (-3, -2, -1)
+    ]
+    _, manifest, output, calls = run(saved, tmp_path, replacement=partial + [FIXED], tests=tests)
+    proposal = manifest["proposals"][0]
+    assert proposal["status"] == "verified-candidate"
+    assert len(calls) == 6  # One test plan, four patches, one independent review.
+    history = proposal["revisions"]["history"]
+    assert len(history) == 4 and all(entry["progress"] for entry in history)
+    directory = output / "proposals/001"
+    attempts = [
+        json.loads((directory / f"attempts/{n:03}/verification.json").read_text())
+        for n in range(1, 5)
+    ]
+    assert [a["candidate"]["passed"] for a in attempts] == [3, 4, 5, 6]
+    assert len({a["tests_sha256"] for a in attempts}) == 1
+    assert '"best_candidate"' in calls[4] and '"attempt":3' in calls[4]
 
 
 def test_complexity_cannot_be_hidden_in_a_nested_helper(saved, tmp_path):
@@ -260,7 +283,7 @@ def test_complexity_cannot_be_hidden_in_a_nested_helper(saved, tmp_path):
       return bounds(x);
     }"""
     _, manifest, output, _ = run(saved, tmp_path, replacement=hidden)
-    assert manifest["proposals"][0]["status"] == "quality-rejected"
+    assert manifest["proposals"][0]["status"] == "no-progress"
     card = json.loads((output / "proposals/001/scorecard.json").read_text())
     assert card["maintainability"]["target"]["cyclomatic_complexity"]["delta"] == -1
     assert card["maintainability"]["region"]["decisions"]["delta"] == 1
@@ -300,7 +323,7 @@ def test_unknown_review_usage_cannot_approve_a_test_passing_patch(saved, tmp_pat
     assert (root / "clamp.js").read_text() == ORIGINAL
 
 
-def test_revision_attempt_limit_does_not_weaken_review(saved, tmp_path):
+def test_no_progress_limit_does_not_weaken_review(saved, tmp_path):
     alternatives = [
         FIXED,
         FIXED.replace("Math.max(0, Math.min(x, 10))", "Math.min(10, Math.max(x, 0))"),
@@ -309,9 +332,9 @@ def test_revision_attempt_limit_does_not_weaken_review(saved, tmp_path):
     review = approved_review()
     review["checks"][2].update(passed=False, reason="An unresolved readability concern")
     _, manifest, output, calls = run(saved, tmp_path, replacement=alternatives, review=review)
-    assert len(calls) == 7  # frozen plan + three writer/reviewer pairs
+    assert len(calls) == 8  # plan + three writer/reviewer pairs + repeated writer
     assert len(list((output / "proposals/001/attempts").iterdir())) == 3
-    assert manifest["proposals"][0]["status"] == "quality-rejected"
+    assert manifest["proposals"][0]["status"] == "no-progress"
     assert manifest["verified_resolutions"] == 0
 
 
@@ -344,7 +367,8 @@ def test_apply_reverifies_preserves_mode_and_updates_actual_scores(saved, tmp_pa
     assert len(list((root / ".walleye/regressions").glob("*.json"))) == 1
     actual = json.loads((output / "proposals/001/applied-scan.json").read_text())
     assert (
-        actual["scores"]["overall_score"] == card["maintainability"]["repository"]["score"]["after"]
+        actual["scores"]["overall_score"]
+        == card["maintainability"]["observed_repository"]["score"]["after"]
     )
     assert json.loads((output / "workflow.json").read_text())["proposal_counts"] == {"applied": 1}
     with pytest.raises(ValueError, match="verified"):
@@ -381,7 +405,7 @@ def test_nonreproducing_tests_stop_before_patch_call(saved, tmp_path):
 
 def test_regression_fix_that_breaks_control_is_not_verified(saved, tmp_path):
     root, manifest, output, _ = run(saved, tmp_path, replacement="function clamp(x) { return 0; }")
-    assert manifest["proposals"][0]["status"] == "verification-failed"
+    assert manifest["proposals"][0]["status"] == "no-progress"
     assert manifest["verified_resolutions"] == 0
     assert (root / "clamp.js").read_text() == ORIGINAL
     assert not (output / "proposals/001/scorecard.json").exists()
@@ -420,6 +444,34 @@ def test_spending_budget_is_shared_between_stages(saved, tmp_path):
     assert len(calls) == 1
     assert manifest["workflow_stop_reason"] == "dollar_limit"
     assert manifest["cost"]["overshoot_usd"] > 0
+
+
+def test_budget_stop_keeps_the_best_candidate_and_its_review_feedback(saved, tmp_path):
+    root, review_path = saved
+    output = tmp_path / "improve"
+    review = approved_review()
+    review["checks"][2].update(passed=False, reason="An unresolved readability concern")
+    calls, writer = fake_agent(output, review=review)
+
+    def invoke(*args, **kwargs):
+        result = writer(*args, **kwargs)
+        if "checks" in kwargs["schema"]["properties"]:
+            result["usage"]["output_tokens"] = 100000
+        return result
+
+    manifest, _ = improve(
+        review_path,
+        output=output,
+        invoke=invoke,
+        config=replace(ReviewConfig(), budget_usd=0.01, backend="codex"),
+    )
+    assert len(calls) == 3 and manifest["workflow_stop_reason"] == "dollar_limit"
+    assert manifest["verified_resolutions"] == 0
+    best = manifest["proposals"][0]["revisions"]["best_candidate"]
+    assert best["patch"]["replacement"] == FIXED
+    assert best["review"]["checks"][2]["reason"] == "An unresolved readability concern"
+    assert (output / "proposals/001/candidate.source").read_text() == FIXED
+    assert (root / "clamp.js").read_text() == ORIGINAL
 
 
 def test_patch_cannot_change_signatures_or_add_unrelated_source():

@@ -1,5 +1,7 @@
 """Versioned scorecards keep measured structure separate from verified findings."""
 
+from .workflow_comparison import RULE, paired_quality, paired_totals
+
 PROFILE = "declank-health-v1"
 
 
@@ -52,8 +54,8 @@ def _change(before, after):
     }
 
 
-def _region(report, target):
-    rows = [
+def _region_rows(report, target):
+    return [
         r
         for r in report["records"]
         if r["path"] == target["path"]
@@ -64,6 +66,10 @@ def _region(report, target):
             or r["qualified_name"].startswith(target["qualified_name"] + ".")
         )
     ]
+
+
+def _region(report, target):
+    rows = _region_rows(report, target)
     weight = sum(max(1, r["sloc"]) for r in rows)
     return {
         "quality": round(
@@ -115,6 +121,24 @@ def scorecard(
     old, new = local(baseline), local(candidate)
     old_region, new_region = _region(baseline, old), _region(candidate, new)
     before, after = health_snapshot(baseline), health_snapshot(candidate)
+    old_region["quality"], new_region["quality"] = paired_quality(
+        _region_rows(baseline, old), _region_rows(candidate, new), target
+    )
+    totals, _ = paired_totals(
+        [row for row in baseline["records"] if row["kind"] == "function"],
+        [row for row in candidate["records"] if row["kind"] == "function"],
+        target,
+    )
+    repository = {}
+    weight = baseline["scores"]["coverage"]["owned_sloc"]
+    for key, (left, right) in totals.items():
+        previous = before["maintainability"][key]
+        compared = (
+            round(previous + (right - left) / weight, 4)
+            if previous is not None and left is not None and right is not None and weight
+            else None
+        )
+        repository[key] = _change(previous, compared)
     bug = finding["objective"] == "bug"
     return {
         "profile": PROFILE,
@@ -131,6 +155,7 @@ def scorecard(
             "baseline_scan_complete": baseline["complete"],
             "baseline_diagnostics": baseline["issues"],
             "rule": "Same successfully parsed source cohort and scoring versions",
+            "quality_comparison": RULE,
         },
         "correctness": {
             "score": None,
@@ -163,7 +188,8 @@ def scorecard(
             "target_quality": _change(
                 round(100 - old["risk_score"], 4), round(100 - new["risk_score"], 4)
             ),
-            "repository": {
+            "repository": repository,
+            "observed_repository": {
                 k: _change(before["maintainability"][k], after["maintainability"][k])
                 for k in ("score", "mi", "control")
             },
