@@ -55,6 +55,8 @@ Codex spending is an API cost estimate, not a hard cap or subscription charge.
 
 Architecture changes must improve quality. Bug fixes may keep quality flat, allowing up to a 0.01-point decrease on the 0–100 scale. Complexity, nesting, and dependency cycles cannot increase.
 
+Fixes reuse frozen tests and revise the best patch until accepted, out of budget, or three revisions make no progress.
+
 ## GitHub App
 
 Set `GITHUB_APP_ID` and `GITHUB_APP_PRIVATE_KEY_PATH` in the job environment.
@@ -89,6 +91,7 @@ Rankings also account for callers, dependents, and dependency cycles.
 | Risk | `100 − Q` |
 
 Repository scores weight measured functions by source lines. Comments do not affect the score.
+Fix comparisons hold the original weights fixed and include new helpers; raw scan scores are also saved.
 Bug estimates and risk scores are not bug probabilities. Actual improvements are measured after tests and a rescan.
 
 [MIT License](LICENSE)

@@ -406,9 +406,50 @@ def test_native_readability_rejection_never_pushes_or_creates_a_pr(native_repo, 
         invoke=invoke,
         progress=lambda x: None,
     )
-    assert result["status"] == "stopped" and "repeated" in result["error"]
+    assert result["status"] == "stopped" and result["stop_reason"] == "no_progress"
     assert not any(method == "POST" for method, _, _ in requests)
     assert (workspace.repo / "clamp.py").read_text() == ORIGINAL
+
+
+def test_native_four_improving_revisions_reach_publication(native_repo, tmp_path):
+    client, workspace, _ = native_repo
+    regressions = [f"test_negative_{-x}" for x in (-4, -3, -2, -1)]
+    tests = "from clamp import clamp\n\n" + "\n".join(
+        f"def test_negative_{-x}():\n    assert clamp({x}) == 0\n" for x in (-4, -3, -2, -1)
+    )
+    tests += "\ndef test_middle():\n    assert clamp(5) == 5\n"
+    alternatives = [
+        f"def clamp(x):\n    return max(0, x) if x < {limit} else min(10, x)\n"
+        for limit in (-3, -2, -1)
+    ] + [FIXED]
+    stages, invoke = model(regression_tests=regressions)
+    patches = []
+
+    def writer(prompt, config, limit, **kwargs):
+        result = invoke(prompt, config, limit, **kwargs)
+        if "test_path" in result["response"]:
+            result["response"]["test_content"] = tests
+        if "edits" in result["response"]:
+            result["response"]["edits"][0]["new"] = alternatives[len(patches)]
+            patches.append(prompt)
+        return result
+
+    result, output = improve_issue(
+        client,
+        workspace,
+        1,
+        config=ReviewConfig(backend="codex"),
+        output=tmp_path / "improve",
+        invoke=writer,
+        progress=lambda _: None,
+    )
+    assert result["status"] == "pull-request", result.get("error")
+    assert stages == ["tests", "patch", "patch", "patch", "patch", "review"]
+    assert all(entry["progress"] for entry in result["revisions"]["history"])
+    assert result["revisions"]["best_candidate"]["attempt"] == 4
+    assert '"best_candidate"' in patches[-1] and '"attempt":3' in patches[-1]
+    frozen = json.loads((output / "test-plan.json").read_text())
+    assert (Path(result["worktree"]) / frozen["test_path"]).read_text() == tests
 
 
 @pytest.mark.parametrize(
@@ -441,7 +482,19 @@ def test_native_flat_bug_fix_reaches_review_and_publication(native_repo, tmp_pat
     assert result["acceptance_policy"]["quality_tolerance_points"] == 0.01
 
 
-def test_description_only_revision_is_reviewed_with_the_same_patch(native_repo, tmp_path):
+def test_description_only_revision_is_reviewed_with_the_same_patch(
+    native_repo, tmp_path, monkeypatch
+):
+    from walleye.project_tests import ProjectTests
+
+    frozen_runs = []
+    original_frozen = ProjectTests.frozen
+
+    def frozen(self, path, label):
+        frozen_runs.append(label)
+        return original_frozen(self, path, label)
+
+    monkeypatch.setattr(ProjectTests, "frozen", frozen)
     client, workspace, requests = native_repo
     _, invoke = model()
     descriptions = [
@@ -488,6 +541,8 @@ def test_description_only_revision_is_reviewed_with_the_same_patch(native_repo, 
     )
     assert result["status"] == "pull-request", result.get("error")
     assert patches[0] == patches[1] and len(reviews) == 2
+    assert frozen_runs == ["baseline-frozen", "001-frozen"]
+    assert (tmp_path / "improve/attempts/002/reused-measurements.json").exists()
     assert [a["passed"] for a in result["attempts"]] == [False, True]
     pull = next(
         payload for method, path, payload in requests if method == "POST" and path == "/pulls"

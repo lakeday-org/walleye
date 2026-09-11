@@ -403,6 +403,8 @@ def pull_body(issue, description, card, tests, *, test_path):
         f"Scores cover the same {card['scope']['source_files']} parsed source files "
         "and all helpers in the changed module. They measure code structure, not bug probability."
     )
+    if comparison_rule := card["scope"].get("quality_comparison"):
+        scores.append(comparison_rule + ". Raw scan scores remain available in the scorecard.")
     if comparison := card["scope"].get("comparison_url"):
         scores.append(f"[Exact commits used for this comparison]({comparison})")
     paragraphs.append("\n\n".join(scores))
