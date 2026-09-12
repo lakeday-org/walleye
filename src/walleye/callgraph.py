@@ -20,6 +20,7 @@ CALL_LANGUAGES = frozenset(
 )
 IMPORT_LANGUAGES = frozenset({"python", "javascript", "typescript", "tsx", "rust"})
 CALL_TYPES = frozenset({"call", "call_expression", "method_invocation"})
+_MODULE_EXTENSIONS = (".ts", ".tsx", ".js", ".jsx", ".mts", ".cts")
 
 
 @dataclass
@@ -240,8 +241,8 @@ class Resolver:
             stem, ext = posixpath.splitext(base)
             if ext in {".js", ".mjs", ".cjs"}:
                 base = stem
-            choices = [base + ext for ext in (".ts", ".tsx", ".js", ".jsx", ".mts", ".cts")]
-            choices += [base + "/index" + ext for ext in (".ts", ".tsx", ".js", ".jsx")]
+            choices = [base + ext for ext in _MODULE_EXTENSIONS]
+            choices += [base + "/index" + ext for ext in _MODULE_EXTENSIONS]
         matches = [p for p in choices if p in self.paths]
         return matches[0] if len(matches) == 1 else None
 
