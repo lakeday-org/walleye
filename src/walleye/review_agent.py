@@ -338,6 +338,8 @@ def invoke_codex(prompt, config, token_limit, *, schema=None, instructions=None)
 def quote_matches(quote, lines, start, end):
     # The packet displays numbered lines. Models may quote those labels, including
     # noncontiguous lines; verify each label against that exact source line.
+    quoted = " ".join(quote.split())
+    raw_match = bool(quoted) and quoted in " ".join("\n".join(lines[start - 1 : end]).split())
     numbered = [
         re.fullmatch(r"\s*(\d+): ?(.*)", line) for line in quote.splitlines() if line.strip()
     ]
@@ -351,12 +353,10 @@ def quote_matches(quote, lines, start, end):
                 or not text
                 or text not in " ".join(lines[line - 1].split())
             ):
-                return False
+                return raw_match
             previous = line
         return True
-    quoted = " ".join(quote.split())
-    actual = " ".join("\n".join(lines[start - 1 : end]).split())
-    return bool(quoted) and quoted in actual
+    return raw_match
 
 
 def stored_finding(finding):
