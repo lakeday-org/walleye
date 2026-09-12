@@ -1,8 +1,12 @@
 """Snapshot-backed, bounded source retrieval. Agents never search the repository."""
 
+import errno
 import hashlib
 import math
+import os
 from collections import defaultdict
+from functools import partial
+from operator import itemgetter
 from pathlib import Path
 
 from .discovery import ScanOptions, discover, exclusion_reason
@@ -52,6 +56,36 @@ def span(node) -> tuple[int, int]:
     return node.start_point.row + 1, max(
         node.start_point.row + 1, node.end_point.row + bool(node.end_point.column)
     )
+
+
+def _open_no_symlinks(base: Path, path: Path, label: str, _callback_path, flags: int) -> int:
+    relative = Path(os.path.relpath(path, base))
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    directory_fd = os.open(base, directory_flags)
+    try:
+        for component in relative.parts[:-1]:
+            next_fd = os.open(component, directory_flags, dir_fd=directory_fd)
+            os.close(directory_fd)
+            directory_fd = next_fd
+        return os.open(relative.parts[-1], flags | os.O_NOFOLLOW, dir_fd=directory_fd)
+    except OSError as error:
+        if error.errno == errno.ELOOP:
+            raise ValueError(f"Source became a symlink: {label}") from error
+        raise
+    finally:
+        os.close(directory_fd)
+
+
+def _open_source(base: Path, relative_path: str):
+    path = base / relative_path
+    if not path.resolve().is_relative_to(base.resolve()):
+        raise ValueError(f"Source escaped the repository: {relative_path}")
+    opener = partial(_open_no_symlinks, base, path, relative_path)
+    try:
+        return path.open("rb", opener=opener)
+    except TypeError:
+        # pathlib.Path.open has no opener parameter on Python 3.10.
+        return open(path, "rb", opener=opener)
 
 
 class SourceIndex:
@@ -209,13 +243,8 @@ class SourceIndex:
 
     def verify(self, resources):
         """Reject stale or redirected source before dispatch and before accepting evidence."""
-        for path in sorted({item["path"] for item in resources}):
-            real = self.base / path
-            if not real.resolve().is_relative_to(self.base.resolve()):
-                raise ValueError(f"Source escaped the repository: {path}")
-            if any(part.is_symlink() for part in [real, *real.parents] if part != self.base):
-                raise ValueError(f"Source became a symlink: {path}")
-            with real.open("rb") as stream:
+        for path in sorted(set(map(itemgetter("path"), resources))):
+            with _open_source(self.base, path) as stream:
                 source = stream.read(len(self.sources[path]) + 1)
             if hashlib.sha256(source).hexdigest() != self.hashes[path]:
                 raise ValueError(f"Source changed since scanning; rescan: {path}")
