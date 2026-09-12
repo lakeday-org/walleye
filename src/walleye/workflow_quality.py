@@ -9,7 +9,7 @@ BUG_QUALITY_TOLERANCE = 0.01
 
 
 def quality_policy(objective):
-    if objective not in {"bug", "refactor"}:
+    if objective not in ("bug", "refactor"):
         raise ValueError("Quality policy requires a bug or refactor objective")
     return {
         "profile": PROFILE,
