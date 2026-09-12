@@ -1,6 +1,8 @@
 """Scanner API shared by terminal and structured reports."""
 
+import errno
 import hashlib
+import os
 import re
 import time
 from collections import Counter, defaultdict
@@ -560,6 +562,12 @@ class _FileScanResult:
     graph_facts: list = field(default_factory=list)
 
 
+def _open_discovered_file(file_path, flags):
+    """Open a discovered path without following its final symlink."""
+
+    return os.open(file_path, flags | os.O_NOFOLLOW)
+
+
 def _process_discovered_file(
     path: Path,
     relative: str,
@@ -573,7 +581,7 @@ def _process_discovered_file(
     result = _FileScanResult()
     try:
         # Bound the actual read, including files that grow after discovery.
-        with path.open("rb") as stream:
+        with open(path, "rb", opener=_open_discovered_file) as stream:
             source = stream.read(options.max_bytes + 1)
         if len(source) > options.max_bytes:
             result.skipped["oversized"] += 1
@@ -626,6 +634,7 @@ def _process_discovered_file(
             if source_snapshot is not None:
                 source_snapshot[relative] = source
     except (OSError, UnicodeError, ValueError, RuntimeError, LookupError) as error:
+        result.skipped["symlink"] += int(getattr(error, "errno", None) == errno.ELOOP)
         result.skipped["read-or-parser-error"] += 1
         result.issues.append({"path": relative, "kind": "read-or-parser", "message": str(error)})
     return result
