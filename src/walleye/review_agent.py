@@ -244,6 +244,54 @@ def codex_command(config, directory: Path, token_limit):
     return [*command, "-"]
 
 
+def _process_codex_event(event, usage, errors, tool_calls):
+    event_type = event.get("type")
+    if event_type == "turn.completed" and isinstance(event.get("usage"), dict):
+        if not all(
+            type(event["usage"].get(key)) is int and event["usage"][key] >= 0
+            for key in ("input_tokens", "output_tokens")
+        ):
+            errors.append("Missing or invalid Codex token accounting")
+            return usage
+        if usage is None:
+            usage = {"input_tokens": 0, "output_tokens": 0, "cached_input_tokens": 0}
+        for key in usage:
+            value = event["usage"].get(key, 0)
+            if type(value) is not int or value < 0:
+                errors.append("Invalid Codex token accounting")
+            else:
+                usage[key] += value
+    if event_type in {"error", "turn.failed"}:
+        errors.append(str(event.get("message") or event.get("error", "Codex turn failed")))
+    item = event.get("item", {})
+    item_type = item.get("type")
+    if item_type in {
+        "command_execution",
+        "file_change",
+        "mcp_tool_call",
+        "web_search",
+    }:
+        tool_calls.append(item_type)
+    return usage
+
+
+def _parse_codex_events(stdout):
+    """Parse Codex JSON-lines output and collect protocol failures."""
+    usage, errors, tool_calls = None, [], []
+    line_error_messages = {
+        json.JSONDecodeError: (),
+        AttributeError: ("Invalid Codex event or item: expected an object",),
+    }
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+            usage = _process_codex_event(event, usage, errors, tool_calls)
+        except (json.JSONDecodeError, AttributeError) as error:
+            errors.extend(line_error_messages[type(error)])
+            continue
+    return usage, errors, tool_calls
+
+
 def invoke_codex(prompt, config, token_limit, *, schema=None, instructions=None):
     """Fresh process and empty cwd for each call; auth uses the user's existing Codex login."""
     with tempfile.TemporaryDirectory(prefix="walleye-agent-") as temporary:
@@ -286,37 +334,7 @@ def invoke_codex(prompt, config, token_limit, *, schema=None, instructions=None)
                 "usage": None,
                 "response": None,
             }
-        usage, errors, tool_calls = None, [], []
-        for line in stdout.splitlines():
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if event.get("type") == "turn.completed" and isinstance(event.get("usage"), dict):
-                if not all(
-                    type(event["usage"].get(key)) is int and event["usage"][key] >= 0
-                    for key in ("input_tokens", "output_tokens")
-                ):
-                    errors.append("Missing or invalid Codex token accounting")
-                    continue
-                if usage is None:
-                    usage = {"input_tokens": 0, "output_tokens": 0, "cached_input_tokens": 0}
-                for key in usage:
-                    value = event["usage"].get(key, 0)
-                    if type(value) is not int or value < 0:
-                        errors.append("Invalid Codex token accounting")
-                    else:
-                        usage[key] += value
-            if event.get("type") in {"error", "turn.failed"}:
-                errors.append(str(event.get("message") or event.get("error", "Codex turn failed")))
-            item = event.get("item", {})
-            if item.get("type") in {
-                "command_execution",
-                "file_change",
-                "mcp_tool_call",
-                "web_search",
-            }:
-                tool_calls.append(item["type"])
+        usage, errors, tool_calls = _parse_codex_events(stdout)
         if process.returncode or errors or tool_calls:
             message = "; ".join(errors) or stderr[-2000:] or f"Codex exited {process.returncode}"
             if tool_calls:
