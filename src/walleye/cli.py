@@ -410,8 +410,8 @@ def render_table(report: dict, stream, *, terminal: bool = False):
         "fan_in": "Callers",
         "dependent_count": "Reach",
     }
-    if wide and selected not in metrics:
-        metrics.insert(-1, selected if selected in fields else "risk_score")
+    if wide and selected in fields and selected not in metrics:
+        metrics.insert(-1, selected)
     table.add_column("#", justify="right", no_wrap=True)
     table.add_column("Source", overflow="fold", ratio=1)
     for metric in metrics:
