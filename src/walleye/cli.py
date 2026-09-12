@@ -675,19 +675,19 @@ def write_report(report: dict, args):
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    if args.command == "languages":
-        names = sorted(LANGUAGES if args.all else EXTENSIONS)
-        rows = [
-            {"language": name, "extensions": EXTENSIONS.get(name, "").split()} for name in names
-        ]
-        if args.format == "json":
-            print(json.dumps(rows, indent=2))
-        else:
-            for row in rows:
-                print(f"{row['language']:18} {' '.join(row['extensions']) or '(use --map)'}")
-            print(f"\n{len(rows)} languages; 173 grammars bundled, no runtime downloads.")
-        return 0
     try:
+        if args.command == "languages":
+            names = sorted(LANGUAGES if args.all else EXTENSIONS)
+            rows = [
+                {"language": name, "extensions": EXTENSIONS.get(name, "").split()} for name in names
+            ]
+            if args.format == "json":
+                print(json.dumps(rows, indent=2))
+            else:
+                for row in rows:
+                    print(f"{row['language']:18} {' '.join(row['extensions']) or '(use --map)'}")
+                print(f"\n{len(rows)} languages; 173 grammars bundled, no runtime downloads.")
+            return 0
         from .github_cli import prepare_remote, run_improve
 
         remote = prepare_remote(args)
