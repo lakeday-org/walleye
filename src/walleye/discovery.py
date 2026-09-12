@@ -144,6 +144,54 @@ def _filesystem_paths(root: Path, options: ScanOptions, result: Discovery):
                 yield path
 
 
+def _git_working_tree_paths(root: Path, result: Discovery) -> list[Path] | None:
+    try:
+        command = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(root),
+                "ls-files",
+                "--cached",
+                "--others",
+                "--exclude-standard",
+                "--deduplicate",
+                "-z",
+                "--",
+                ".",
+            ],
+            capture_output=True,
+            check=False,
+            timeout=60,
+        )
+        if command.returncode != 0:
+            return None
+        paths = [root / os.fsdecode(p) for p in command.stdout.split(b"\0") if p]
+        ignored = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(root),
+                "ls-files",
+                "--others",
+                "--ignored",
+                "--exclude-standard",
+                "--deduplicate",
+                "-z",
+                "--",
+                ".",
+            ],
+            capture_output=True,
+            check=True,
+            timeout=60,
+        )
+        result.skipped["gitignored"] += ignored.stdout.count(b"\0")
+        result.method = "git-working-tree"
+        return paths
+    except (OSError, subprocess.TimeoutExpired, subprocess.CalledProcessError):
+        return None
+
+
 def discover(target: Path, options: ScanOptions) -> Discovery:
     result = Discovery()
     root = target if target.is_dir() else target.parent
@@ -154,30 +202,7 @@ def discover(target: Path, options: ScanOptions) -> Discovery:
     else:
         paths = None
         if options.respect_gitignore:
-            try:
-                command = subprocess.run(
-                    [
-                        "git",
-                        "-C",
-                        str(root),
-                        "ls-files",
-                        "--cached",
-                        "--others",
-                        "--exclude-standard",
-                        "--deduplicate",
-                        "-z",
-                        "--",
-                        ".",
-                    ],
-                    capture_output=True,
-                    check=False,
-                    timeout=60,
-                )
-                if command.returncode == 0:
-                    paths = [root / os.fsdecode(p) for p in command.stdout.split(b"\0") if p]
-                    result.method = "git-working-tree"
-            except (OSError, subprocess.TimeoutExpired):
-                pass
+            paths = _git_working_tree_paths(root, result)
         if paths is None:
             paths = _filesystem_paths(root, options, result)
     for path in paths:
