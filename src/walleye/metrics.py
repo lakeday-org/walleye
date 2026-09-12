@@ -341,7 +341,7 @@ def _scope_name(node: Node, source: bytes) -> str | None:
         )
     if name is None:
         return None
-    return source[name.start_byte : name.end_byte].decode("utf-8", errors="replace")[:160]
+    return source[name.start_byte : name.end_byte].decode("utf-8", errors="replace")
 
 
 def _receiver_name(node: Node, source: bytes) -> str | None:
