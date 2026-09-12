@@ -300,7 +300,7 @@ class Resolver:
 
     def call(self, f: Facts, call: dict) -> str | None:
         reference = call["reference"].replace("::", ".")
-        if not reference or not all(part.isidentifier() for part in reference.split(".")):
+        if not _valid_reference(call["reference"]):
             return None
         first = reference.split(".")[0]
         scope = call["scope"]
@@ -341,6 +341,11 @@ class Resolver:
             if target:
                 return self.symbol(target, name)
         return None
+
+
+def _valid_reference(reference: str) -> bool:
+    path = reference.removeprefix("::").replace("::", ".")
+    return all(part.isidentifier() for part in path.split("."))
 
 
 def structural_metrics(graph: nx.DiGraph) -> tuple[dict, dict]:
