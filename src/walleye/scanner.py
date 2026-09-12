@@ -8,6 +8,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from functools import lru_cache
 from importlib.metadata import version
+from itertools import takewhile
 from math import log
 from pathlib import Path
 
@@ -40,6 +41,10 @@ def parser_for(language: str):
     return get_parser(language)
 
 
+def _is_attribute_item(node) -> bool:
+    return node.type == "attribute_item"
+
+
 def _rust_test_nodes(root, source: bytes) -> set[int]:
     """Omit #[cfg(test)] items and explicit test functions, including attributes."""
     excluded = set()
@@ -51,12 +56,17 @@ def _rust_test_nodes(root, source: bytes) -> set[int]:
             continue
         if not test_attribute.match(source[node.start_byte : node.end_byte]):
             continue
-        sibling = node
-        while sibling is not None:
-            excluded.add(sibling.id)
-            if sibling.type != "attribute_item":
-                break
-            sibling = sibling.next_named_sibling
+        siblings = node.parent.named_children
+        position = siblings.index(node)
+        preceding_attributes = tuple(takewhile(_is_attribute_item, reversed(siblings[:position])))
+        following_attributes = tuple(takewhile(_is_attribute_item, siblings[position:]))
+        excluded.update(
+            sibling.id
+            for sibling in (
+                *reversed(preceding_attributes),
+                *siblings[position : position + len(following_attributes) + 1],
+            )
+        )
     return excluded
 
 
