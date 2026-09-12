@@ -1,7 +1,6 @@
 """API price accounting and preflight reservation, independent of context selection."""
 
 import json
-import math
 import os
 from decimal import ROUND_FLOOR, Decimal
 from urllib.error import HTTPError
@@ -41,7 +40,7 @@ def pricing_for(config):
         raise ValueError(f"No complete price card for {config.model}; configure pricing explicitly")
     for key, value in rates.items():
         dollars(value)
-        if type(value) not in (int, float) or not math.isfinite(value):
+        if type(value) not in (int, float):
             raise ValueError("Price card values must be finite numbers")
         if key == "long_context_threshold" and (type(value) is not int or value < 1):
             raise ValueError("long_context_threshold must be a positive integer")
