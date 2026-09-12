@@ -30,6 +30,12 @@ class OriginalNode:
         return start - 2 if self.node.type == "<" and start - 2 in self.here_strings else start
 
     @property
+    def start_point(self):
+        point = self.node.start_point
+        offset = self.node.start_byte - self.start_byte
+        return type(point)(point.row, point.column - offset)
+
+    @property
     def text(self):
         return self.source[self.start_byte : self.end_byte]
 
