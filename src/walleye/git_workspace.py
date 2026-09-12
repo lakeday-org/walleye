@@ -33,6 +33,15 @@ def git(directory, *args, token=None):
 
 
 class Workspace:
+    def _invalid_branch(self, branch):
+        result = subprocess.run(
+            ["git", "check-ref-format", "--branch", branch],
+            cwd=self.directory,
+            capture_output=True,
+            timeout=300,
+        )
+        return result.returncode != 0
+
     def __init__(self, github, directory=None, ref=None):
         self.github = github
         self.directory = (directory or Path.cwd() / ".walleye/jobs" / uuid4().hex).resolve()
@@ -40,7 +49,7 @@ class Workspace:
         self.repo = self.directory / "repo"
         info = github.api("GET")
         self.base_branch = ref or info["default_branch"]
-        if not self.base_branch or self.base_branch.startswith("-"):
+        if not self.base_branch or self._invalid_branch(self.base_branch):
             raise ValueError("Invalid Git reference")
         git(
             self.directory,
