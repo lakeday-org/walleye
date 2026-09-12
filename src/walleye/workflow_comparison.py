@@ -6,10 +6,14 @@ RULE = "Original source-line weights held fixed; new and removed helpers grouped
 FIELDS = {"score": "risk_score", "mi": "maintainability_index", "control": "complexity_score"}
 
 
+def _group_key(row):
+    return row["path"], row.get("qualified_name", row["name"])
+
+
 def _groups(rows):
     groups = defaultdict(list)
     for row in rows:
-        groups[row["path"], row.get("qualified_name", row["name"])].append(row)
+        groups[_group_key(row)].append(row)
     return groups
 
 
@@ -33,7 +37,7 @@ def paired_totals(before, after, target):
     original weight, together with removed/renamed functions from the same file.
     """
     old, new = _groups(before), _groups(after)
-    target_key = (target["path"], target["name"])
+    target_key = _group_key(target)
     common = (old.keys() & new.keys()) - {target_key}
     pairs = [(old[key], new[key]) for key in sorted(common)]
     unmatched = (old.keys() | new.keys()) - common
