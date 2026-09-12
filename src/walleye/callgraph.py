@@ -20,6 +20,13 @@ CALL_LANGUAGES = frozenset(
 )
 IMPORT_LANGUAGES = frozenset({"python", "javascript", "typescript", "tsx", "rust"})
 CALL_TYPES = frozenset({"call", "call_expression", "method_invocation"})
+_REFERENCE_DOLLAR_REPLACEMENTS = {"javascript": "a", "typescript": "a", "tsx": "a"}
+
+
+def _valid_reference(reference: str, language: str) -> bool:
+    normalized = reference.replace("::", ".")
+    normalized = normalized.replace("$", _REFERENCE_DOLLAR_REPLACEMENTS.get(language, "$"))
+    return len(reference) <= 256 and all(part.isidentifier() for part in normalized.split("."))
 
 
 @dataclass
@@ -183,10 +190,7 @@ def collect_facts(root, source, path, language, nodes, records, excluded) -> Fac
                 }:
                     callee = callee.child_by_field_name("function")
                 reference = _text(callee)
-            normalized = reference.replace("::", ".")
-            if len(reference) > 256 or not all(
-                part.isidentifier() for part in normalized.split(".")
-            ):
+            if not _valid_reference(reference, language):
                 # Reports contain identifiers and locations, never an inline function body
                 # or string arguments from a dynamically computed callee.
                 reference = "<dynamic>"
