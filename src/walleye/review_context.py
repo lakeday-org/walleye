@@ -109,49 +109,52 @@ class SourceIndex:
         }
 
     def declarations(self, path, language):
-        if path in self._declarations:
-            return self._declarations[path]
+        cache_key = (path, language)
+        if cache_key in self._declarations:
+            return self._declarations[cache_key]
         declarations, imports = [], []
         root = syntax(self.sources[path], language)
-        if root is not None:
-            for node in walk(root):
-                if node.type in IMPORTS:
-                    imports.append(
-                        self.resource(
-                            path,
-                            key=f"import:{path}:{node.start_byte}",
-                            line=span(node)[0],
-                            end_line=span(node)[1],
-                        )
+        if root is None:
+            self._declarations[cache_key] = declarations, imports
+            return declarations, imports
+        for node in walk(root):
+            if node.type in IMPORTS:
+                imports.append(
+                    self.resource(
+                        path,
+                        key=f"import:{path}:{node.start_byte}",
+                        line=span(node)[0],
+                        end_line=span(node)[1],
                     )
-                if node.type not in DECLARATIONS:
-                    continue
-                name = node.child_by_field_name("name") or node.child_by_field_name("left")
-                if name is None or not name.text.decode("utf-8").isidentifier():
-                    continue
-                scopes = []
-                parent = node.parent
-                while parent is not None:
-                    if is_function(parent) or parent.type in {
-                        "class_declaration",
-                        "class_definition",
-                        "impl_item",
-                    }:
-                        scopes.append(span(parent))
-                    parent = parent.parent
-                declarations.append(
-                    {
-                        **self.resource(
-                            path,
-                            key=f"declaration:{path}:{node.start_byte}",
-                            name=name.text.decode(),
-                            line=span(node)[0],
-                            end_line=span(node)[1],
-                        ),
-                        "scopes": scopes,
-                    }
                 )
-        self._declarations[path] = declarations, imports
+            if node.type not in DECLARATIONS:
+                continue
+            name = node.child_by_field_name("name") or node.child_by_field_name("left")
+            if name is None or not name.text.decode("utf-8").isidentifier():
+                continue
+            scopes = []
+            parent = node.parent
+            while parent is not None:
+                if is_function(parent) or parent.type in {
+                    "class_declaration",
+                    "class_definition",
+                    "impl_item",
+                }:
+                    scopes.append(span(parent))
+                parent = parent.parent
+            declarations.append(
+                {
+                    **self.resource(
+                        path,
+                        key=f"declaration:{path}:{node.start_byte}",
+                        name=name.text.decode(),
+                        line=span(node)[0],
+                        end_line=span(node)[1],
+                    ),
+                    "scopes": scopes,
+                }
+            )
+        self._declarations[cache_key] = declarations, imports
         return declarations, imports
 
     def index_tests(self, names: set[str], *, max_bytes=None):
