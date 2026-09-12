@@ -95,6 +95,30 @@ def stage_schema(stage):
     return _object(common)
 
 
+_MISSING_CONTEXT_PATH = object()
+
+
+def _new_context_requests(packet, requests, expansion):
+    paths = {resource["id"]: resource["path"] for resource in packet["resources"]}
+    known_sources = [*packet["source"], *expansion]
+    selected = []
+    for request in requests:
+        candidate = {
+            "path": paths.get(request["resource_id"], _MISSING_CONTEXT_PATH),
+            "line": request["line"],
+            "end_line": request["end_line"],
+        }
+        if any(
+            source["path"] == candidate["path"]
+            and source["line"] <= candidate["line"] <= candidate["end_line"] <= source["end_line"]
+            for source in known_sources
+        ):
+            continue
+        selected.append(request)
+        known_sources.append(candidate)
+    return selected
+
+
 class WorkflowStopped(ValueError):
     pass
 
@@ -228,14 +252,15 @@ class WorkflowAgent:
                 if response["context_requests"]:
                     raise ValueError("A completed stage cannot have pending context requests")
                 return response
-            if config_limit := self.config.max_expansions:
-                if rounds >= config_limit:
-                    return response
-            elif self.config.max_expansions == 0:
+            config_limit = self.config.max_expansions
+            if config_limit is not None and rounds >= config_limit:
                 return response
             try:
                 additions = expand_context(
-                    packet, response["context_requests"], index, self.config.expansion_tokens
+                    packet,
+                    _new_context_requests(packet, response["context_requests"], expansion),
+                    index,
+                    self.config.expansion_tokens,
                 )
             except ValueError as error:
                 if invalid_requests:
@@ -248,15 +273,6 @@ class WorkflowAgent:
                     "No source was added. Correct the request or report unsupported.",
                 }
                 continue
-            additions = [
-                s
-                for s in additions
-                if not any(
-                    p["path"] == s["path"]
-                    and p["line"] <= s["line"] <= s["end_line"] <= p["end_line"]
-                    for p in [*packet["source"], *expansion]
-                )
-            ]
             if not additions:
                 raise ValueError("Context request supplied no new source")
             expansion.extend(additions)
