@@ -113,12 +113,20 @@ def record_sort_key(row: dict, key: str) -> tuple:
     return (_descending_component(row, key), row.get("path", ""), row.get("line", 0))
 
 
+_ONE_DECIMAL_METRICS = {
+    "risk_score",
+    "maintainability_index",
+    "complexity_score",
+    "overall_score",
+}
+
+
 def _display_value(value, metric: str) -> str:
     if value is None:
         return "—"
     if metric == "bugs":
         return f"{value:.4f}"
-    if metric in {"risk_score", "maintainability_index", "complexity_score"}:
+    if metric in _ONE_DECIMAL_METRICS:
         return f"{value:.1f}"
     if isinstance(value, int):
         return f"{value:,}"
