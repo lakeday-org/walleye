@@ -226,18 +226,12 @@ def write_json(path, data):
             temporary.unlink(missing_ok=True)
 
 
-def prepare_review(
-    path, issues=10, objective="bug", config=None, output=None, progress=None, *, targets=None
-):
-    if type(issues) is not int or issues < 1:
-        raise ValueError("issues must be positive")
-    config = config or ReviewConfig()
-    if output is not None and output.exists():
-        raise ValueError(f"Review output directory already exists: {output}")
-    sources = {}
-    report = scan(path, ScanOptions(functions=True), source_snapshot=sources)
-    index = SourceIndex(report, sources)
-    candidates = rank_candidates(report, index, objective)
+def _raise_packet_failure(failure):
+    raise ValueError(failure["reason"])
+
+
+def _select_review_queue(candidates, issues, config, targets):
+    skipped = []
     if targets is not None:
         selected = []
         for target in targets:
@@ -254,8 +248,33 @@ def prepare_review(
         queue = selected[:issues]
         for number, candidate in enumerate(queue, 1):
             candidate["task_id"] = f"{number:03}"
-    else:
-        queue = select_queue(candidates, issues * config.tasks_per_issue)
+        return queue, skipped, _raise_packet_failure
+    return select_queue(candidates, issues * config.tasks_per_issue), skipped, skipped.append
+
+
+def _build_review_packets(queue, index, graph, context_tokens, failure_handler):
+    packets = []
+    for candidate in queue:
+        try:
+            packets.append(build_packet(candidate, index, graph, context_tokens))
+        except ValueError as error:
+            failure_handler({"task_id": candidate["task_id"], "reason": str(error)})
+    return packets
+
+
+def prepare_review(
+    path, issues=10, objective="bug", config=None, output=None, progress=None, *, targets=None
+):
+    if type(issues) is not int or issues < 1:
+        raise ValueError("issues must be positive")
+    config = config or ReviewConfig()
+    if output is not None and output.exists():
+        raise ValueError(f"Review output directory already exists: {output}")
+    sources = {}
+    report = scan(path, ScanOptions(functions=True), source_snapshot=sources)
+    index = SourceIndex(report, sources)
+    candidates = rank_candidates(report, index, objective)
+    queue, skipped, failure_handler = _select_review_queue(candidates, issues, config, targets)
     if progress:
         progress(
             f"Scanned {report['summary']['scanned_files']:,} files; "
@@ -269,12 +288,7 @@ def prepare_review(
     for edge in report["callgraph"]["module_edges"]:
         modules[edge["source"].removeprefix("file:")].append(edge["target"].removeprefix("file:"))
     graph = {"unresolved_by_source": unresolved, "modules_by_source": modules}
-    packets, skipped = [], []
-    for candidate in queue:
-        try:
-            packets.append(build_packet(candidate, index, graph, config.context_tokens))
-        except ValueError as error:
-            skipped.append({"task_id": candidate["task_id"], "reason": str(error)})
+    packets = _build_review_packets(queue, index, graph, config.context_tokens, failure_handler)
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
     output = (
         output
