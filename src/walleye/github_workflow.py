@@ -1,5 +1,6 @@
 """GitHub findings become native-tested, measured, independently reviewed pull requests."""
 
+from functools import partial
 from urllib.parse import quote
 
 from .discovery import ScanOptions
@@ -20,13 +21,18 @@ from .workflow_scores import scorecard
 from .workflow_validation import digest
 
 
+def _overlapping_match_count(text, old):
+    starts_with_old = partial(text.startswith, old)
+    return sum(map(starts_with_old, range(len(text) - len(old) + 1)))
+
+
 def apply_edits(original, edits):
     text = original.decode()
     if not edits:
         raise ValueError("Patch contains no edits")
     spans = []
     for number, edit in enumerate(edits, 1):
-        matches = text.count(edit["old"]) if edit["old"] else 0
+        matches = _overlapping_match_count(text, edit["old"]) if edit["old"] else 0
         if matches != 1:
             raise ValueError(
                 f"Edit {number} matches {matches} times; each edit must match exactly once"
