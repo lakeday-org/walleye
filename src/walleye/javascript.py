@@ -7,7 +7,7 @@ and the small node interface consumed by our metrics/control-flow visitors.
 
 import json
 import re
-from bisect import bisect_right
+from bisect import bisect_left, bisect_right
 from functools import lru_cache
 from pathlib import Path
 from types import SimpleNamespace
@@ -191,6 +191,7 @@ def parse(source: bytes, language: str, path: str):
             )
         )
     starts = [node.start_byte for node in tokens]
+    token_texts = [token.text for token in tokens]
 
     def with_tokens(children, start, end):
         assembled = []
@@ -208,17 +209,23 @@ def parse(source: bytes, language: str, path: str):
                 consumed = child.end_byte
         return assembled
 
+    def _empty_parameter_tokens(raw):
+        header_node = raw.get("returnType", raw.get("body"))
+        header_end = bisect_left(starts, offsets[header_node["start"]])
+        close_index = header_end - 1 - token_texts[:header_end][::-1].index(b")")
+        open_index = close_index - 1 - token_texts[:close_index][::-1].index(b"(")
+        return [tokens[open_index], tokens[close_index]]
+
     def convert(raw):
         original_type = raw["type"]
         kind = NODE_TYPES.get(original_type, re.sub(r"(?<!^)(?=[A-Z])", "_", original_type).lower())
         node = Node(kind, offsets[raw["start"]], offsets[raw["end"]], source, lines)
         children = []
         for key, value in raw.items():
-            values = value if isinstance(value, list) else [value]
             converted = [
                 convert(item)
-                for item in values
-                if isinstance(item, dict) and "type" in item and "start" in item
+                for item in (value if isinstance(value, list) else [value])
+                if isinstance(item, dict) and item.keys() >= {"type", "start"}
             ]
             if original_type == "TemplateLiteral" and key == "expressions":
                 wrapped = []
@@ -230,7 +237,8 @@ def parse(source: bytes, language: str, path: str):
                     child.parent = group
                     wrapped.append(group)
                 converted = wrapped
-            if key == "params" and converted:
+            if key == "params":
+                converted = converted or _empty_parameter_tokens(raw)
                 group = Node(
                     "formal_parameters",
                     converted[0].start_byte,
