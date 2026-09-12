@@ -43,6 +43,13 @@ def _progress(card, metrics, review):
     )
 
 
+def _history_fields(metrics, progress):
+    return {
+        "metrics_passed": metrics.get("passed", progress[1]),
+        "failures": metrics.get("failures", []),
+    }
+
+
 class Revisions:
     def __init__(self):
         self.history = []
@@ -90,8 +97,7 @@ class Revisions:
                 "attempt": number,
                 "status": "evaluated",
                 "progress": improved,
-                "metrics_passed": metrics["passed"],
-                "failures": metrics["failures"],
+                **_history_fields(metrics, progress),
                 "review_failures": [
                     c["reason"] for c in review.get("checks", []) if not c["passed"]
                 ],
