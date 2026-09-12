@@ -299,6 +299,25 @@ def _parse_errors(root, path: str) -> list[dict]:
     return errors[:25] or [{"path": path, "kind": "parse", "message": "Incomplete syntax tree"}]
 
 
+def _parse_fallbacks(source: bytes, language: str, path: str, root, errors):
+    """Apply language-specific recovery after the primary parser reports errors."""
+
+    if language == "bash":
+        from .shell import PROFILE as SHELL_PROFILE
+        from .shell import parse_compatible
+
+        compatible = parse_compatible(source, parser_for(language))
+        if compatible is not None:
+            return compatible, [], "tree-sitter+bash-validation", SHELL_PROFILE
+    if language in {"javascript", "typescript", "tsx"}:
+        from .javascript import PROFILE as BABEL_PROFILE
+        from .javascript import parse as parse_javascript
+
+        root, errors = parse_javascript(source, language, path)
+        return root, errors, "babel", BABEL_PROFILE
+    return root, errors, "tree-sitter", PROFILE
+
+
 def analyze_units(
     source: bytes,
     language: str,
@@ -325,20 +344,8 @@ def analyze_units(
     root = tree.root_node
     errors = _parse_errors(root, path)
     parser_name, profile = "tree-sitter", PROFILE
-    if errors and language == "bash":
-        from .shell import PROFILE as SHELL_PROFILE
-        from .shell import parse_compatible
-
-        compatible = parse_compatible(source, parser_for(language))
-        if compatible is not None:
-            root, errors = compatible, []
-            parser_name, profile = "tree-sitter+bash-validation", SHELL_PROFILE
-    if errors and language in {"javascript", "typescript", "tsx"}:
-        from .javascript import PROFILE as BABEL_PROFILE
-        from .javascript import parse as parse_javascript
-
-        root, errors = parse_javascript(source, language, path)
-        parser_name, profile = "babel", BABEL_PROFILE
+    if errors:
+        root, errors, parser_name, profile = _parse_fallbacks(source, language, path, root, errors)
     if errors:
         return [], [], errors
     nonblank = {i for i, line in enumerate(source.splitlines()) if line.strip()}
@@ -369,13 +376,16 @@ def analyze(
 ) -> tuple[list, list]:
     """Return records and diagnostics. A malformed file never receives a clean score."""
 
-    files, function_records, errors = analyze_units(
-        source,
-        language,
-        path,
-        include_tests=include_tests,
-        sql_dialect=sql_dialect,
-    )
+    try:
+        files, function_records, errors = analyze_units(
+            source,
+            language,
+            path,
+            include_tests=include_tests,
+            sql_dialect=sql_dialect,
+        )
+    except UnicodeError as error:
+        return [], [{"path": path, "kind": "read-or-parser", "message": str(error)}]
     return (function_records if functions else files), errors
 
 
