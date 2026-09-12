@@ -528,8 +528,11 @@ def _language_scores(files: list[dict], functions: list[dict]) -> dict:
     return result
 
 
+def _coverage_status_key(item) -> tuple:
+    return (item[0] is not None, str(item[0]))
+
+
 def _coverage(discovery, scanned: Counter, files: list[dict], functions: list[dict]) -> dict:
-    function_files = {row["path"] for row in functions}
     nested = sum(row.get("function_depth", 0) > 0 for row in functions)
     statuses = Counter(row.get("complexity_status") for row in functions)
     return {
@@ -539,11 +542,11 @@ def _coverage(discovery, scanned: Counter, files: list[dict], functions: list[di
         "file_parse_share": round(len(files) / len(discovery.files), 4)
         if discovery.files
         else None,
-        "files_with_functions": len(function_files),
+        "files_with_functions": len({row["path"] for row in functions}),
         "recognized_functions": len(functions),
         "nested_functions": nested,
         "top_level_functions": len(functions) - nested,
-        "complexity_by_function_status": dict(sorted(statuses.items())),
+        "complexity_by_function_status": dict(sorted(statuses.items(), key=_coverage_status_key)),
         "languages": dict(sorted(scanned.items())),
     }
 
