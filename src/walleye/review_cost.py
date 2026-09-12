@@ -214,7 +214,7 @@ def invoke_api(
         raw_usage = response.get("usage")
         usage = None
         if isinstance(raw_usage, dict):
-            details = raw_usage.get("input_tokens_details") or {}
+            details = raw_usage.get("input_tokens_details", {})
             if not isinstance(details, dict):
                 raise ValueError("API returned invalid usage details")
             usage = {
