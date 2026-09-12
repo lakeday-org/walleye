@@ -255,8 +255,6 @@ def _is_default_arm(node: Node) -> bool:
     if node.type in {"default_case", "switch_default"}:
         return True
     text = node.text.decode("utf-8", errors="replace").lstrip()
-    if text.startswith("default"):
-        return True
     if node.type == "match_arm":
         pattern = node.child_by_field_name("pattern")
         if pattern is not None:
@@ -266,6 +264,8 @@ def _is_default_arm(node: Node) -> bool:
         # arm remains a real decision.
         before_arrow = text.split("=>", 1)[0].strip()
         return before_arrow == "_"
+    if text.startswith("default"):
+        return True
     return False
 
 
