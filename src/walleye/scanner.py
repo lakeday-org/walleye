@@ -33,6 +33,10 @@ from .sql import analyze_sql
 
 QUALITY_PROFILE = "declank-quality-v1"
 HIGH_RISK_THRESHOLD = 70.0
+_RUST_TEST_ATTRIBUTE = re.compile(
+    rb"^#\[\s*(?:cfg\s*\(\s*test\s*\)|(?:[\w]+::)?test(?:\([^]]*\))?)\s*\]$"
+)
+_RUST_TEST_SIBLING_TYPES = {"attribute_item", "line_comment", "block_comment"}
 
 
 @lru_cache(maxsize=200)
@@ -43,18 +47,15 @@ def parser_for(language: str):
 def _rust_test_nodes(root, source: bytes) -> set[int]:
     """Omit #[cfg(test)] items and explicit test functions, including attributes."""
     excluded = set()
-    test_attribute = re.compile(
-        rb"^#\[\s*(?:cfg\s*\(\s*test\s*\)|(?:[\w]+::)?test(?:\([^]]*\))?)\s*\]$"
-    )
     for node in walk(root):
         if node.type != "attribute_item":
             continue
-        if not test_attribute.match(source[node.start_byte : node.end_byte]):
+        if not _RUST_TEST_ATTRIBUTE.match(source[node.start_byte : node.end_byte]):
             continue
         sibling = node
         while sibling is not None:
             excluded.add(sibling.id)
-            if sibling.type != "attribute_item":
+            if sibling.type not in _RUST_TEST_SIBLING_TYPES:
                 break
             sibling = sibling.next_named_sibling
     return excluded
