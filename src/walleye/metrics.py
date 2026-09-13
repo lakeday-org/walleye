@@ -356,6 +356,11 @@ def _receiver_name(node: Node, source: bytes) -> str | None:
     return None
 
 
+def _append_unique_part(parts: list[str], part: str | None) -> None:
+    if part and part not in parts:
+        parts.append(part)
+
+
 def qualified_function_name(node: Node, source: bytes) -> str:
     """Build a deterministic lexical path such as ``Service.fetch`` or ``f.g``."""
 
@@ -364,14 +369,13 @@ def qualified_function_name(node: Node, source: bytes) -> str:
     while parent is not None:
         if is_function(parent):
             parts.append(function_name(parent, source))
+            _append_unique_part(parts, _receiver_name(parent, source))
         elif parent.type in SCOPE_TYPES:
             name = _scope_name(parent, source)
             if name:
                 parts.append(name)
         parent = parent.parent
-    receiver = _receiver_name(node, source)
-    if receiver and receiver not in parts:
-        parts.append(receiver)
+    _append_unique_part(parts, _receiver_name(node, source))
     parts.reverse()
     parts.append(function_name(node, source))
     return ".".join(part for part in parts if part) or "<anonymous>"
