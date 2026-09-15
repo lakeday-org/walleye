@@ -53,12 +53,16 @@ async fn object_store_wal_survives_checkpoint_and_reopen_without_duplicate_rows(
         3
     );
     table.close().await.unwrap();
-    let mut reopened = Table::open(
-        config,
-        LanceStorageOptions::default(),
-        LanceDurability::ObjectStore,
+    let mut reopened = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        Table::open(
+            config,
+            LanceStorageOptions::default(),
+            LanceDurability::ObjectStore,
+        ),
     )
     .await
+    .expect("MemWAL reopen must complete within the bounded test deadline")
     .unwrap();
     assert_eq!(
         reopened
