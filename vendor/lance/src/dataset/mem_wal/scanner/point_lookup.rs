@@ -96,6 +96,8 @@ pub struct LsmPointLookupPlanner {
     sstable_cache: Option<Arc<dyn DatasetCache>>,
     /// Optional warmer fired on first open of an SSTable.
     warmer: Option<Arc<dyn SsTableWarmer>>,
+    /// Captured active-memtable visibility, keyed by `(shard, generation)`.
+    visible_counts: HashMap<(uuid::Uuid, u64), usize>,
     /// Precomputed canonical output schema for the no-projection case, so the
     /// hot `lookup(.., None)` path clones an `Arc` instead of rebuilding the
     /// schema on every call.
@@ -130,6 +132,7 @@ impl LsmPointLookupPlanner {
             store_params: None,
             sstable_cache: None,
             warmer: None,
+            visible_counts: HashMap::new(),
             none_target,
             task_ctx: SessionContext::new().task_ctx(),
         }
@@ -160,6 +163,15 @@ impl LsmPointLookupPlanner {
     /// Inject the warmer fired on first open of an SSTable.
     pub fn with_warmer(mut self, warmer: Arc<dyn SsTableWarmer>) -> Self {
         self.warmer = Some(warmer);
+        self
+    }
+
+    /// Pin active-memtable visibility for a point-in-time snapshot.
+    pub fn with_in_memory_visible_counts(
+        mut self,
+        counts: HashMap<(uuid::Uuid, u64), usize>,
+    ) -> Self {
+        self.visible_counts = counts;
         self
     }
 
@@ -212,6 +224,41 @@ impl LsmPointLookupPlanner {
             }
             None => self.empty_plan(projection),
         }
+    }
+
+    /// Build one composable plan for a set of complete primary-key tuples.
+    ///
+    /// Each tuple is resolved independently by the existing point-lookup
+    /// planner, which checks every captured LSM generation newest-first and
+    /// applies tombstone suppression after coalescing. The tiny result is then
+    /// returned as one one-shot batch. Materializing the point results here
+    /// avoids asking DataFusion to merge statistics from independently planned
+    /// composite-key arms (some Lance source arms intentionally report unknown
+    /// statistics with zero columns). This also handles composite primary keys;
+    /// `plan_point_lookup` remains the single-column convenience path used by
+    /// older callers.
+    pub async fn plan_point_lookup_tuples(
+        &self,
+        keys: &[Vec<ScalarValue>],
+        projection: Option<&[String]>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let target =
+            canonical_output_schema(projection, &self.base_schema, &self.pk_columns, false);
+        let mut batches = Vec::with_capacity(keys.len());
+        for key in keys {
+            if let Some(batch) = self.lookup_via_plan(key, projection).await? {
+                batches.push(batch);
+            }
+        }
+        let batch = match batches.len() {
+            0 => RecordBatch::new_empty(target),
+            1 => batches.pop().expect("one point lookup batch"),
+            _ => arrow_select::concat::concat_batches(&target, &batches)?,
+        };
+        let schema = batch.schema();
+        let stream = futures::stream::once(async move { Ok(batch) });
+        let adapter = RecordBatchStreamAdapter::new(schema, stream);
+        Ok(Arc::new(OneShotExec::new(Box::pin(adapter))))
     }
 
     /// Build the coalesced point-lookup plan: each source scanned newest-first,
@@ -682,12 +729,19 @@ impl LsmPointLookupPlanner {
                 batch_store,
                 index_store,
                 schema,
+                shard_id,
+                generation,
                 ..
             } => {
                 use crate::dataset::mem_wal::memtable::scanner::MemTableScanner;
 
                 let mut scanner =
                     MemTableScanner::new(batch_store.clone(), index_store.clone(), schema.clone());
+                if let Some(visible_count) =
+                    self.visible_counts.get(&(*shard_id, generation.as_u64()))
+                {
+                    scanner.with_visible_count(*visible_count);
+                }
                 // Carry `_tombstone` through so the post-coalesce filter can drop
                 // a deleted key; it survives the sort below.
                 let cols = cols_with_tombstone(&cols, schema.column_with_name(TOMBSTONE).is_some());

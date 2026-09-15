@@ -558,6 +558,14 @@ impl MemTableScanner {
         self.visible_count
     }
 
+    /// Override the visibility watermark with a value captured by a higher
+    /// level point-in-time snapshot. The underlying stores remain shared, but
+    /// later appends cannot become visible through this scanner.
+    pub fn with_visible_count(&mut self, visible_count: usize) -> &mut Self {
+        self.visible_count = visible_count;
+        self
+    }
+
     /// Include the _rowaddr column in output.
     ///
     /// Same value as _rowid but named for compatibility with LSM scanner.
