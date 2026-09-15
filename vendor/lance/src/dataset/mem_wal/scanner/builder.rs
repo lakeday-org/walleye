@@ -1060,12 +1060,13 @@ impl LsmScanner {
         let effective_watermarks = watermarks.or_else(|| {
             (!self.fresh_tier_watermarks.is_empty()).then_some(&self.fresh_tier_watermarks)
         });
-        let memberships = super::block_list::fresh_tier_block_list(
+        let memberships = super::block_list::fresh_tier_block_list_with_pk_columns(
             &sources,
             self.session.as_ref(),
             self.store_params.as_ref(),
             self.sstable_cache.as_ref(),
             effective_watermarks,
+            &self.pk_columns,
         )
         .await?;
         let pk_indices = super::exec::resolve_pk_indices(pks, &self.pk_columns)
@@ -2684,6 +2685,168 @@ mod tests {
                 ("scan".to_owned(), "two".to_owned(), 22),
             ],
             "persisted rows must shadow the matching base rows"
+        );
+    }
+
+    #[tokio::test]
+    async fn composite_disk_point_filter_rebuilds_membership_without_pk_sidecar() {
+        // A legacy persisted generation may contain the data dataset but no
+        // standalone PK BTree. The scanner can still preserve newest-per-key
+        // semantics by materializing PK membership from the immutable rows.
+        use crate::dataset::mem_wal::scanner::data_source::ShardSnapshot;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("scope", DataType::Utf8, false),
+            Field::new("entry", DataType::Utf8, false),
+            Field::new("value", DataType::Int32, true),
+        ]));
+        let temp = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp.path().display());
+        let base_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["scan", "scan"])),
+                Arc::new(StringArray::from(vec!["one", "two"])),
+                Arc::new(Int32Array::from(vec![1, 2])),
+            ],
+        )
+        .unwrap();
+        let base_reader =
+            RecordBatchIterator::new(vec![Ok(base_batch)].into_iter(), schema.clone());
+        let base = Arc::new(
+            Dataset::write(base_reader, &base_uri, Some(WriteParams::default()))
+                .await
+                .unwrap(),
+        );
+
+        let shard = Uuid::new_v4();
+        let sstable_uri = format!("{}/_mem_wal/{}/gen_1", base_uri, shard);
+        let sstable_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["scan", "scan"])),
+                Arc::new(StringArray::from(vec!["one", "two"])),
+                Arc::new(Int32Array::from(vec![11, 22])),
+            ],
+        )
+        .unwrap();
+        let sstable_reader = RecordBatchIterator::new(vec![Ok(sstable_batch)].into_iter(), schema);
+        Dataset::write(sstable_reader, &sstable_uri, Some(WriteParams::default()))
+            .await
+            .unwrap();
+        // Deliberately omit `_pk_index`; this is the compatibility path under
+        // test and must not manufacture a failure or return stale base rows.
+
+        let snapshot = ShardSnapshot::new(shard)
+            .with_current_generation(2)
+            .with_sstable(1, "gen_1".to_owned());
+        let scanner = LsmScanner::new(
+            base,
+            vec![snapshot],
+            vec!["scope".to_owned(), "entry".to_owned()],
+        )
+        .filter_expr(
+            col("scope")
+                .in_list(vec![lit("scan")], false)
+                .and(col("entry").in_list(vec![lit("one"), lit("two")], false)),
+        );
+
+        let batches: Vec<RecordBatch> = scanner
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let mut values = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column_by_name("value")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect::<Vec<_>>();
+        values.sort_unstable();
+        assert_eq!(values, vec![11, 22]);
+    }
+
+    #[tokio::test]
+    async fn composite_disk_point_filter_does_not_hide_partial_pk_sidecar() {
+        // A non-empty but unreadable sidecar is corruption, not a legacy
+        // no-sidecar generation. The fallback must preserve that error.
+        use crate::dataset::mem_wal::scanner::data_source::ShardSnapshot;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("scope", DataType::Utf8, false),
+            Field::new("entry", DataType::Utf8, false),
+            Field::new("value", DataType::Int32, true),
+        ]));
+        let temp = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp.path().display());
+        let base_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["scan"])),
+                Arc::new(StringArray::from(vec!["one"])),
+                Arc::new(Int32Array::from(vec![1])),
+            ],
+        )
+        .unwrap();
+        let base_reader =
+            RecordBatchIterator::new(vec![Ok(base_batch)].into_iter(), schema.clone());
+        let base = Arc::new(
+            Dataset::write(base_reader, &base_uri, Some(WriteParams::default()))
+                .await
+                .unwrap(),
+        );
+
+        let shard = Uuid::new_v4();
+        let sstable_uri = format!("{}/_mem_wal/{}/gen_1", base_uri, shard);
+        let sstable_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["scan"])),
+                Arc::new(StringArray::from(vec!["one"])),
+                Arc::new(Int32Array::from(vec![11])),
+            ],
+        )
+        .unwrap();
+        let sstable_reader = RecordBatchIterator::new(vec![Ok(sstable_batch)].into_iter(), schema);
+        Dataset::write(sstable_reader, &sstable_uri, Some(WriteParams::default()))
+            .await
+            .unwrap();
+        let partial_sidecar = std::path::Path::new(&sstable_uri).join("_pk_index");
+        std::fs::create_dir_all(&partial_sidecar).unwrap();
+        std::fs::write(partial_sidecar.join("partial.marker"), b"incomplete").unwrap();
+
+        let snapshot = ShardSnapshot::new(shard)
+            .with_current_generation(2)
+            .with_sstable(1, "gen_1".to_owned());
+        let scanner = LsmScanner::new(
+            base,
+            vec![snapshot],
+            vec!["scope".to_owned(), "entry".to_owned()],
+        )
+        .filter_expr(
+            col("scope")
+                .in_list(vec![lit("scan")], false)
+                .and(col("entry").in_list(vec![lit("one"), lit("two")], false)),
+        );
+
+        let error = match scanner.try_into_stream().await {
+            Ok(_) => panic!("partial PK sidecar must not fall back to row scanning"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("page_lookup")
+                || error.to_string().contains("not found")
+                || error.to_string().contains("Not found"),
+            "partial PK sidecar errors must remain visible: {error}"
         );
     }
 }
