@@ -540,6 +540,18 @@ mod tests {
             options.0.get("pool_max_idle_per_host"),
             Some(&"0".to_owned())
         );
+
+        // Lance's AWS provider parses the storage map into its S3 config map
+        // before constructing object_store::AmazonS3Builder. This assertion
+        // checks the actual provider key, rather than only the accessor map,
+        // so a typo or an unrecognized option cannot silently pass the test.
+        let s3_options = lance_io::object_store::StorageOptions::new(options.0).as_s3_options();
+        assert_eq!(
+            s3_options.get(&object_store::aws::AmazonS3ConfigKey::Client(
+                object_store::ClientConfigKey::PoolMaxIdlePerHost,
+            )),
+            Some(&"0".to_owned())
+        );
     }
     async fn engine(
         dir: &std::path::Path,
