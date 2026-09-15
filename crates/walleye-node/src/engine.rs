@@ -156,6 +156,11 @@ pub struct Engine {
     catalog: Arc<ObjectStore>,
     catalog_path: Path,
     streams: Mutex<BTreeMap<String, Arc<Stream>>>,
+    // The catalog is immutable within one deployment authority except for
+    // definitions admitted through this Engine. Avoid listing object storage
+    // for every SQL request, while still allowing the query path to refresh
+    // once when another node has published a previously unknown stream.
+    catalog_loaded: Mutex<bool>,
     // Requests share this read lock; shutdown waits for all active requests.
     closed: RwLock<bool>,
     writer: Option<Arc<QuorumWriter>>,
@@ -202,6 +207,7 @@ impl Engine {
             catalog,
             catalog_path: prefix.join("streams"),
             streams: Mutex::new(BTreeMap::new()),
+            catalog_loaded: Mutex::new(false),
             closed: RwLock::new(false),
             writer,
         };
@@ -271,6 +277,23 @@ impl Engine {
         self.register(definition).await
     }
     async fn load_catalog(&self) -> Result<(), Error> {
+        let mut loaded = self.catalog_loaded.lock().await;
+        if *loaded {
+            return Ok(());
+        }
+        self.load_catalog_objects().await?;
+        *loaded = true;
+        Ok(())
+    }
+
+    async fn refresh_catalog(&self) -> Result<(), Error> {
+        let mut loaded = self.catalog_loaded.lock().await;
+        self.load_catalog_objects().await?;
+        *loaded = true;
+        Ok(())
+    }
+
+    async fn load_catalog_objects(&self) -> Result<(), Error> {
         let list_started = catalog_stage_start("catalog_list", "*");
         let objects: Vec<_> = match self
             .catalog
@@ -431,15 +454,7 @@ impl Engine {
         stream.table().await?.append(batches).await?;
         Ok(count)
     }
-    pub async fn query(&self, sql: &str) -> Result<Vec<u8>, Error> {
-        if sql.len() > 64 * 1024 {
-            return Err("query text exceeds 64 KiB".into());
-        }
-        let closed = self.closed.read().await;
-        if *closed {
-            return Err("engine is closed".into());
-        }
-        self.load_catalog().await?;
+    async fn query_loaded(&self, sql: &str) -> Result<Vec<u8>, Error> {
         let tables: Vec<_> = self
             .streams
             .lock()
@@ -452,6 +467,29 @@ impl Engine {
         writer.write_batches(&result.iter().collect::<Vec<_>>())?;
         writer.finish()?;
         Ok(writer.into_inner().0)
+    }
+
+    pub async fn query(&self, sql: &str) -> Result<Vec<u8>, Error> {
+        if sql.len() > 64 * 1024 {
+            return Err("query text exceeds 64 KiB".into());
+        }
+        let closed = self.closed.read().await;
+        if *closed {
+            return Err("engine is closed".into());
+        }
+        self.load_catalog().await?;
+        match self.query_loaded(sql).await {
+            Ok(result) => Ok(result),
+            Err(first) if likely_unknown_relation(&first) => {
+                // A sibling node may have admitted a stream after this
+                // process's initial catalog load. Refresh only on an unknown
+                // relation error; malformed SQL and execution failures keep
+                // their original error without paying for another LIST.
+                self.refresh_catalog().await?;
+                self.query_loaded(sql).await.or(Err(first))
+            }
+            Err(error) => Err(error),
+        }
     }
     pub async fn close(&self) {
         let mut closed = self.closed.write().await;
@@ -481,6 +519,15 @@ impl std::io::Write for BoundedOutput {
         Ok(())
     }
 }
+
+fn likely_unknown_relation(error: &Error) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    (message.contains("table") || message.contains("relation"))
+        && (message.contains("not found")
+            || message.contains("does not exist")
+            || message.contains("unknown"))
+}
+
 fn storage_params_from(mut get: impl FnMut(&str) -> Option<String>) -> ObjectStoreParams {
     let mut options = HashMap::new();
     for (env, key) in [
@@ -552,6 +599,15 @@ mod tests {
             )),
             Some(&"0".to_owned())
         );
+    }
+
+    fn composite_definition(name: &str) -> StreamDefinition {
+        serde_json::from_value(json!({"name": name, "columns": [
+            {"name":"scope", "type":"string"},
+            {"name":"entry", "type":"string"},
+            {"name":"value", "type":"int64"}
+        ], "primary_key":["scope", "entry"]}))
+        .unwrap()
     }
     async fn engine(
         dir: &std::path::Path,
@@ -740,5 +796,161 @@ mod tests {
     #[tokio::test]
     async fn bitr_streams_progress_independently_and_reopen() {
         check_independent_streams(true).await;
+    }
+
+    #[tokio::test]
+    async fn composite_key_filters_push_down_and_keep_captured_reads_stable() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = engine(dir.path(), None, "cache").await;
+        e.define(composite_definition("entries")).await.unwrap();
+        e.ingest(
+            "entries",
+            vec![
+                json!({"scope":"a","entry":"one","value":1}),
+                json!({"scope":"a","entry":"two","value":2}),
+                json!({"scope":"b","entry":"one","value":10}),
+            ],
+        )
+        .await
+        .unwrap();
+
+        let entries = e.stream("entries").await.unwrap();
+
+        // Capture a point-in-time view before either a checkpoint or the
+        // overwrite. The active memtable is still mutable at this point; the
+        // snapshot must freeze its visible batch prefix rather than retaining
+        // a live index watermark.
+        struct Captured {
+            schema: Arc<Schema>,
+            snapshot: TableSnapshot,
+        }
+        #[async_trait::async_trait]
+        impl SnapshotSource for Captured {
+            fn schema(&self) -> Arc<Schema> {
+                self.schema.clone()
+            }
+            async fn snapshot(&self) -> Result<TableSnapshot, walleye_lance::LanceError> {
+                Ok(self.snapshot.clone())
+            }
+        }
+        let captured_active = Arc::new(Captured {
+            schema: entries.schema(),
+            snapshot: entries.table().await.unwrap().snapshot().await.unwrap(),
+        });
+
+        // Also capture after the initial generation is on disk. This leaves an
+        // empty active generation in the view and exercises the older/base-arm
+        // block-list when the later overwrite is flushed.
+        entries.table().await.unwrap().checkpoint().await.unwrap();
+        let captured_base = Arc::new(Captured {
+            schema: entries.schema(),
+            snapshot: entries.table().await.unwrap().snapshot().await.unwrap(),
+        });
+
+        e.ingest(
+            "entries",
+            vec![json!({"scope":"a","entry":"one","value":99})],
+        )
+        .await
+        .unwrap();
+        // Force the deterministic flush boundary. The captured source must
+        // still use exactly one representation of the old generation when its
+        // frozen handle is concurrently replaced by the manifest SSTable.
+        entries.table().await.unwrap().checkpoint().await.unwrap();
+
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(
+                &e.query(
+                    "SELECT entry, value FROM entries \
+                     WHERE scope = 'a' AND entry IN ('one', 'two') ORDER BY entry",
+                )
+                .await
+                .unwrap(),
+            )
+            .unwrap(),
+            json!([{"entry":"one","value":99},{"entry":"two","value":2}])
+        );
+
+        // A non-PK predicate keeps the normal filtered LSM path and cannot be
+        // accidentally dropped by the composite point-lookup optimization.
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(
+                &e.query(
+                    "SELECT entry, value FROM entries \
+                     WHERE scope = 'a' AND entry = 'one' AND value = 1",
+                )
+                .await
+                .unwrap(),
+            )
+            .unwrap(),
+            json!([])
+        );
+
+        let result = walleye_lance::query(
+            &e.cache.storage,
+            &[(
+                "entries".into(),
+                captured_active.clone() as Arc<dyn SnapshotSource>,
+            )],
+            "SELECT entry, value FROM entries WHERE scope = 'a' AND entry = 'one'",
+        )
+        .await
+        .unwrap();
+        let mut output = arrow_json::ArrayWriter::new(Vec::new());
+        output
+            .write_batches(&result.iter().collect::<Vec<_>>())
+            .unwrap();
+        output.finish().unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&output.into_inner()).unwrap(),
+            json!([{"entry":"one","value":1}])
+        );
+
+        // A non-PK predicate forces the general LSM plan. Its block-list must
+        // use the captured active-batch watermark too: a live overwrite may
+        // not shadow the old row and then be filtered away, which would make
+        // this query incorrectly return no rows.
+        let result = walleye_lance::query(
+            &e.cache.storage,
+            &[(
+                "entries".into(),
+                captured_active.clone() as Arc<dyn SnapshotSource>,
+            )],
+            "SELECT entry, value FROM entries WHERE value = 1",
+        )
+        .await
+        .unwrap();
+        let mut output = arrow_json::ArrayWriter::new(Vec::new());
+        output
+            .write_batches(&result.iter().collect::<Vec<_>>())
+            .unwrap();
+        output.finish().unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&output.into_inner()).unwrap(),
+            json!([{"entry":"one","value":1}])
+        );
+
+        // The snapshot whose active generation was empty must still expose
+        // the old on-disk row after the overwrite was flushed into a newer
+        // generation. The bounded empty active membership cannot shadow it.
+        let result = walleye_lance::query(
+            &e.cache.storage,
+            &[("entries".into(), captured_base as Arc<dyn SnapshotSource>)],
+            "SELECT entry, value FROM entries WHERE value = 1",
+        )
+        .await
+        .unwrap();
+        let mut output = arrow_json::ArrayWriter::new(Vec::new());
+        output
+            .write_batches(&result.iter().collect::<Vec<_>>())
+            .unwrap();
+        output.finish().unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&output.into_inner()).unwrap(),
+            json!([{"entry":"one","value":1}])
+        );
+
+        e.close().await;
+        e.cache.backend.close().await.unwrap();
     }
 }

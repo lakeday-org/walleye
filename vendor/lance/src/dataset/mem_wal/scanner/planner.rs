@@ -3,7 +3,7 @@
 
 //! Query planner for LSM scanner.
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
@@ -16,7 +16,7 @@ use tracing::instrument;
 use crate::dataset::mem_wal::TOMBSTONE;
 
 use super::collector::LsmDataSourceCollector;
-use super::data_source::LsmDataSource;
+use super::data_source::{FreshTierWatermark, LsmDataSource};
 use super::exec::{MEMTABLE_GEN_COLUMN, MemtableGenTagExec, PkBlockFilterExec, ROW_ADDRESS_COLUMN};
 use super::projection::{
     build_scanner_projection, canonical_output_schema, null_columns, project_to_canonical,
@@ -53,6 +53,11 @@ pub struct LsmScanPlanner {
     sstable_cache: Option<Arc<dyn DatasetCache>>,
     /// Optional warmer fired on first open of an SSTable.
     warmer: Option<Arc<dyn SsTableWarmer>>,
+    /// Captured active-memtable visibility, keyed by `(shard, generation)`.
+    visible_counts: HashMap<(uuid::Uuid, u64), usize>,
+    /// Captured fresh-tier generation/batch boundaries used while building
+    /// cross-generation membership lists.
+    fresh_tier_watermarks: HashMap<uuid::Uuid, FreshTierWatermark>,
 }
 
 impl LsmScanPlanner {
@@ -70,6 +75,8 @@ impl LsmScanPlanner {
             store_params: None,
             sstable_cache: None,
             warmer: None,
+            visible_counts: HashMap::new(),
+            fresh_tier_watermarks: HashMap::new(),
         }
     }
 
@@ -95,6 +102,24 @@ impl LsmScanPlanner {
     /// Inject the warmer fired on first open of an SSTable.
     pub fn with_warmer(mut self, warmer: Arc<dyn SsTableWarmer>) -> Self {
         self.warmer = Some(warmer);
+        self
+    }
+
+    /// Pin active-memtable visibility for a point-in-time snapshot.
+    pub fn with_in_memory_visible_counts(
+        mut self,
+        counts: HashMap<(uuid::Uuid, u64), usize>,
+    ) -> Self {
+        self.visible_counts = counts;
+        self
+    }
+
+    /// Pin fresh-tier membership to a point-in-time snapshot.
+    pub fn with_fresh_tier_watermarks(
+        mut self,
+        watermarks: HashMap<uuid::Uuid, FreshTierWatermark>,
+    ) -> Self {
+        self.fresh_tier_watermarks = watermarks;
         self
     }
 
@@ -150,11 +175,12 @@ impl LsmScanPlanner {
         // Cross-generation block-list keyed by source: a hit drops any row
         // whose PK lives in a newer generation, applied before the union.
         // `Box::pin` keeps the future off `clippy::large_futures`.
-        let block_lists = Box::pin(super::block_list::compute_source_block_lists(
+        let block_lists = Box::pin(super::block_list::compute_source_block_lists_at(
             &sources,
             self.session.as_ref(),
             self.store_params.as_ref(),
             self.sstable_cache.as_ref(),
+            (!self.fresh_tier_watermarks.is_empty()).then_some(&self.fresh_tier_watermarks),
         ))
         .await?;
 
@@ -365,12 +391,19 @@ impl LsmScanPlanner {
                 batch_store,
                 index_store,
                 schema,
+                shard_id,
+                generation,
                 ..
             } => {
                 use crate::dataset::mem_wal::memtable::scanner::MemTableScanner;
 
                 let mut scanner =
                     MemTableScanner::new(batch_store.clone(), index_store.clone(), schema.clone());
+                if let Some(visible_count) =
+                    self.visible_counts.get(&(*shard_id, generation.as_u64()))
+                {
+                    scanner.with_visible_count(*visible_count);
+                }
 
                 let cols =
                     build_scanner_projection(projection, &self.base_schema, &self.pk_columns);
