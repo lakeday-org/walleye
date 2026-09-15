@@ -879,12 +879,13 @@ impl LsmScanner {
         let base_schema = self.schema();
         validate_projection_names(self.projection.as_deref(), &base_schema, &[])?;
 
-        // Fast point-lookup routing: a `pk = lit` / `pk IN (..)` filter on the
-        // single pk column — with no offset and no scan-only system columns —
-        // bypasses the union/dedup scan for the direct BTree point-lookup path
-        // (`LsmPointLookupPlanner`), composed as a normal `ExecutionPlan` so a
-        // `limit` still applies on top. Any other shape falls through to the
-        // general scan, so this never changes results for unmatched queries.
+        // Fast point-lookup routing: a `pk = lit` / `pk IN (..)` filter (or a
+        // conjunction covering every composite-PK column) — with no offset
+        // and no scan-only system columns — can bypass the union/dedup scan
+        // for the direct BTree point-lookup path (`LsmPointLookupPlanner`),
+        // composed as a normal `ExecutionPlan` so a `limit` still applies on
+        // top. Any other shape falls through to the general scan, so this
+        // never changes results for unmatched queries.
         if self.offset.is_none()
             && !self.with_memtable_gen
             && !self.with_row_address
@@ -892,6 +893,45 @@ impl LsmScanner {
             && let Some(filter) = &self.filter
             && let Some(keys) = extract_pk_point_tuples(filter, &self.pk_columns, &base_schema)
         {
+            // A point lookup with multiple keys still has to walk every
+            // persisted generation when the fresh tier does not contain a
+            // key.  Sending each tuple through the point planner turns a
+            // single predicate into N independent SSTable/base plans (and
+            // N cold opens when the cache is empty).  Keep the original
+            // primary-key predicate on the normal LSM planner in that case:
+            // it builds one source plan per generation, applies the captured
+            // visibility/fresh-tier watermarks, and lets each source evaluate
+            // the complete IN/equality predicate in one scan.
+            if keys.len() > 1 && collector.has_on_disk_sources() {
+                let mut planner =
+                    LsmScanPlanner::new(collector, self.pk_columns.clone(), base_schema);
+                planner =
+                    planner.with_in_memory_visible_counts(self.in_memory_visible_counts.clone());
+                planner = planner.with_fresh_tier_watermarks(self.fresh_tier_watermarks.clone());
+                if let Some(session) = &self.session {
+                    planner = planner.with_session(session.clone());
+                }
+                if let Some(store_params) = &self.store_params {
+                    planner = planner.with_store_params(store_params.clone());
+                }
+                if let Some(cache) = &self.sstable_cache {
+                    planner = planner.with_sstable_cache(cache.clone());
+                }
+                if let Some(warmer) = &self.warmer {
+                    planner = planner.with_warmer(warmer.clone());
+                }
+                return planner
+                    .plan_scan(
+                        self.projection.as_deref(),
+                        Some(filter),
+                        self.limit,
+                        self.offset,
+                        self.with_memtable_gen,
+                        self.with_row_address,
+                    )
+                    .await;
+            }
+
             let mut planner =
                 LsmPointLookupPlanner::new(collector, self.pk_columns.clone(), base_schema);
             planner = planner.with_in_memory_visible_counts(self.in_memory_visible_counts.clone());
@@ -1114,12 +1154,19 @@ impl std::fmt::Debug for LsmScanner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{Int32Array, ListArray, StringArray, StructArray, UInt32Array};
+    use arrow_array::{
+        BooleanArray, Int32Array, ListArray, RecordBatchIterator, StringArray, StructArray,
+        UInt32Array,
+    };
     use arrow_buffer::{OffsetBuffer, ScalarBuffer};
-    use arrow_schema::{Field, Fields};
+    use arrow_schema::{DataType, Field, Fields, Schema};
+    use datafusion::physical_plan::displayable;
+    use datafusion::prelude::{col, lit};
+    use futures::TryStreamExt;
     use lance_index::scalar::inverted::{DOC_INDEX_COL, DocumentGranularity, InvertedIndexParams};
 
     use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
+    use crate::dataset::{Dataset, WriteParams};
 
     #[test]
     fn test_lsm_scanner_builder() {
@@ -2359,5 +2406,284 @@ mod tests {
             "offset point-lookup filters must use the scan path: {disp}"
         );
         assert_eq!(collect_ids(plan).await, vec![3, 5]);
+    }
+
+    #[tokio::test]
+    async fn composite_disk_point_filter_batches_sources_and_honors_snapshot() {
+        use crate::dataset::mem_wal::TOMBSTONE;
+        use crate::dataset::mem_wal::scanner::data_source::FreshTierWatermark;
+
+        // A composite scan_state-shaped key. The base contains both rows;
+        // batch 0 updates `scan/one`, while batch 1 tombstones `scan/two`.
+        // The snapshot watermark intentionally exposes only batch 0.
+        let base_schema = Arc::new(Schema::new(vec![
+            Field::new("scope", DataType::Utf8, false),
+            Field::new("entry", DataType::Utf8, false),
+            Field::new("value", DataType::Int32, true),
+        ]));
+        let mem_schema = Arc::new(Schema::new(vec![
+            Field::new("scope", DataType::Utf8, false),
+            Field::new("entry", DataType::Utf8, false),
+            Field::new("value", DataType::Int32, true),
+            Field::new(TOMBSTONE, DataType::Boolean, false),
+        ]));
+        let temp = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp.path().display());
+        let base_batch = RecordBatch::try_new(
+            base_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["scan", "scan"])),
+                Arc::new(StringArray::from(vec!["one", "two"])),
+                Arc::new(Int32Array::from(vec![1, 2])),
+            ],
+        )
+        .unwrap();
+        let base_reader =
+            RecordBatchIterator::new(vec![Ok(base_batch)].into_iter(), base_schema.clone());
+        let base = Arc::new(
+            Dataset::write(base_reader, &base_uri, Some(WriteParams::default()))
+                .await
+                .unwrap(),
+        );
+
+        let live = RecordBatch::try_new(
+            mem_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["scan"])),
+                Arc::new(StringArray::from(vec!["one"])),
+                Arc::new(Int32Array::from(vec![11])),
+                Arc::new(BooleanArray::from(vec![false])),
+            ],
+        )
+        .unwrap();
+        let deleted = RecordBatch::try_new(
+            mem_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["scan"])),
+                Arc::new(StringArray::from(vec!["two"])),
+                Arc::new(Int32Array::from(vec![None])),
+                Arc::new(BooleanArray::from(vec![true])),
+            ],
+        )
+        .unwrap();
+        let batch_store = Arc::new(BatchStore::with_capacity(8));
+        let mut index_store = IndexStore::new();
+        index_store.enable_pk_index(&[("scope".to_string(), 0), ("entry".to_string(), 1)]);
+        for batch in [&live, &deleted] {
+            let (batch_idx, row_offset, _) = batch_store.append(batch.clone()).unwrap();
+            index_store
+                .insert_with_batch_position(batch, row_offset, Some(batch_idx))
+                .unwrap();
+        }
+        let shard = Uuid::new_v4();
+        let scanner = LsmScanner::new(base, vec![], vec!["scope".to_string(), "entry".to_string()])
+            .with_in_memory_memtables(
+                shard,
+                InMemoryMemTables {
+                    active: InMemoryMemTableRef {
+                        batch_store,
+                        index_store: Arc::new(index_store),
+                        schema: mem_schema,
+                        generation: 1,
+                    },
+                    frozen: vec![],
+                },
+            )
+            .with_in_memory_visible_counts(shard, [(1, 1)])
+            .with_fresh_tier_watermarks(
+                [(
+                    shard,
+                    FreshTierWatermark {
+                        active_generation: 1,
+                        active_batch_count: 1,
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            )
+            .filter_expr(
+                col("scope")
+                    .in_list(vec![lit("scan")], false)
+                    .and(col("entry").in_list(vec![lit("one"), lit("two")], false)),
+            );
+
+        let plan = scanner.create_plan().await.unwrap();
+        let display = format!("{}", displayable(plan.as_ref()).indent(true));
+        assert!(
+            !display.contains("OneShotStream"),
+            "persisted multi-key lookup must use one LSM scan, got: {display}"
+        );
+        assert!(
+            display.contains("UnionExec") || display.contains("CoalescePartitionsExec"),
+            "base + fresh tier should have one unioned source plan, got: {display}"
+        );
+
+        let batches: Vec<RecordBatch> = plan
+            .execute(0, SessionContext::new().task_ctx())
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let mut rows = Vec::new();
+        for batch in batches {
+            let scopes = batch
+                .column_by_name("scope")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let entries = batch
+                .column_by_name("entry")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let values = batch
+                .column_by_name("value")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            for row in 0..batch.num_rows() {
+                rows.push((
+                    scopes.value(row).to_owned(),
+                    entries.value(row).to_owned(),
+                    values.value(row),
+                ));
+            }
+        }
+        rows.sort_unstable();
+        assert_eq!(
+            rows,
+            vec![
+                ("scan".to_owned(), "one".to_owned(), 11),
+                ("scan".to_owned(), "two".to_owned(), 2)
+            ],
+            "the captured snapshot must include the visible update and retain the pre-tombstone base row"
+        );
+    }
+
+    #[tokio::test]
+    async fn composite_disk_point_filter_batches_real_sstable_source() {
+        // Exercise the persisted generation path rather than only the base +
+        // active-memtable case above. The sidecar is the same PK index written
+        // by a production flush, so block-list construction and SSTable open
+        // both run through the normal planner.
+        use crate::dataset::mem_wal::scanner::block_list::write_pk_sidecar;
+        use crate::dataset::mem_wal::scanner::data_source::ShardSnapshot;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("scope", DataType::Utf8, false),
+            Field::new("entry", DataType::Utf8, false),
+            Field::new("value", DataType::Int32, true),
+        ]));
+        let temp = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp.path().display());
+        let base_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["scan", "scan"])),
+                Arc::new(StringArray::from(vec!["one", "two"])),
+                Arc::new(Int32Array::from(vec![1, 2])),
+            ],
+        )
+        .unwrap();
+        let base_reader =
+            RecordBatchIterator::new(vec![Ok(base_batch)].into_iter(), schema.clone());
+        let base = Arc::new(
+            Dataset::write(base_reader, &base_uri, Some(WriteParams::default()))
+                .await
+                .unwrap(),
+        );
+
+        let shard = Uuid::new_v4();
+        let sstable_uri = format!("{}/_mem_wal/{}/gen_1", base_uri, shard);
+        let sstable_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["scan", "scan"])),
+                Arc::new(StringArray::from(vec!["one", "two"])),
+                Arc::new(Int32Array::from(vec![11, 22])),
+            ],
+        )
+        .unwrap();
+        let sstable_reader =
+            RecordBatchIterator::new(vec![Ok(sstable_batch.clone())].into_iter(), schema);
+        Dataset::write(sstable_reader, &sstable_uri, Some(WriteParams::default()))
+            .await
+            .unwrap();
+        write_pk_sidecar(&sstable_uri, &[sstable_batch], &["scope", "entry"])
+            .await
+            .unwrap();
+
+        let snapshot = ShardSnapshot::new(shard)
+            .with_current_generation(2)
+            .with_sstable(1, "gen_1".to_owned());
+        let scanner = LsmScanner::new(
+            base,
+            vec![snapshot],
+            vec!["scope".to_owned(), "entry".to_owned()],
+        )
+        .filter_expr(
+            col("scope")
+                .in_list(vec![lit("scan")], false)
+                .and(col("entry").in_list(vec![lit("one"), lit("two")], false)),
+        );
+
+        let plan = scanner.create_plan().await.unwrap();
+        let display = format!("{}", displayable(plan.as_ref()).indent(true));
+        assert!(
+            !display.contains("OneShotStream"),
+            "persisted multi-key lookup must use the one-source-per-generation LSM plan, got: {display}"
+        );
+        assert_eq!(
+            display.matches("LanceRead").count(),
+            2,
+            "the SSTable and base should each be opened once by the batched plan: {display}"
+        );
+
+        let batches: Vec<RecordBatch> = plan
+            .execute(0, SessionContext::new().task_ctx())
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let mut rows = Vec::new();
+        for batch in batches {
+            let scopes = batch
+                .column_by_name("scope")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let entries = batch
+                .column_by_name("entry")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let values = batch
+                .column_by_name("value")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            for row in 0..batch.num_rows() {
+                rows.push((
+                    scopes.value(row).to_owned(),
+                    entries.value(row).to_owned(),
+                    values.value(row),
+                ));
+            }
+        }
+        rows.sort_unstable();
+        assert_eq!(
+            rows,
+            vec![
+                ("scan".to_owned(), "one".to_owned(), 11),
+                ("scan".to_owned(), "two".to_owned(), 22),
+            ],
+            "persisted rows must shadow the matching base rows"
+        );
     }
 }
