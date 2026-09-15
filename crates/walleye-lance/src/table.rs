@@ -4,14 +4,20 @@ use crate::{LanceDurability, LanceStorageOptions, OWNER_DO_ID_KEY, with_owner};
 use arrow_array::{RecordBatch, RecordBatchIterator};
 use arrow_schema::Schema;
 use lance::deps::datafusion::execution::memory_pool::MemoryReservation;
+use lance::deps::datafusion::{
+    common::{DataFusionError, Result as DfResult},
+    logical_expr::Expr,
+    physical_plan::ExecutionPlan,
+};
 use lance::{
     Dataset,
     dataset::mem_wal::{
         DatasetMemWalExt, ShardWriter, ShardWriterConfig,
-        scanner::{LsmScanner, ShardSnapshot},
+        scanner::{FreshTierWatermark, InMemoryMemTables, LsmScanner, ShardSnapshot},
     },
 };
 use std::{
+    collections::HashMap,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -326,9 +332,9 @@ impl Table {
     /// Capture a read view while holding this stream's writer lock. The returned
     /// snapshot can be planned and executed after that lock is released.
     pub async fn snapshot(&self) -> lance::Result<crate::TableSnapshot> {
-        Ok(crate::TableSnapshot::new(
-            self.snapshot_plan(None, None).await?,
-        ))
+        Ok(crate::TableSnapshot::from_source(Arc::new(
+            self.capture_snapshot().await?,
+        )))
     }
 
     pub(crate) async fn snapshot_plan(
@@ -336,6 +342,30 @@ impl Table {
         filter: Option<&str>,
         limit: Option<usize>,
     ) -> lance::Result<Arc<dyn lance::deps::datafusion::physical_plan::ExecutionPlan>> {
+        let snapshot = self.capture_snapshot().await?;
+        snapshot.plan_sql(filter, limit).await
+    }
+
+    async fn capture_snapshot(&self) -> lance::Result<CapturedSnapshot> {
+        // Capture the in-memory handles first, then read the manifest.  A
+        // background flush can commit a generation between those operations;
+        // if it does, the generation is present in both views and we retain
+        // exactly one representation below (the captured in-memory handle).
+        // A generation created after the refs capture cannot be in the refs,
+        // and cannot be in the manifest until the manifest read completes, so
+        // it is excluded from this snapshot.  This ordering avoids the hole
+        // that refs-after-manifest would create when a zero-grace flush evicts
+        // its frozen handle before the second read.
+        let memtables = self.writer.in_memory_memtable_refs().await?;
+        let visible_counts = std::iter::once(&memtables.active)
+            .chain(memtables.frozen.iter())
+            .map(|memtable| {
+                (
+                    (self.writer.shard_id(), memtable.generation),
+                    memtable.index_store.visible_count(),
+                )
+            })
+            .collect::<HashMap<_, _>>();
         let manifest = self
             .writer
             .manifest()
@@ -345,22 +375,51 @@ impl Table {
             ShardSnapshot::new(self.writer.shard_id())
                 .with_spec_id(manifest.shard_spec_id)
                 .with_current_generation(manifest.current_generation),
-            |s, t| s.with_sstable(t.generation, t.path.clone()),
+            |s, t| {
+                // The in-memory Arc is the exact handle captured at the
+                // snapshot boundary.  Prefer it over an SSTable that a
+                // concurrent flush committed after that boundary; otherwise
+                // the same generation would be scanned twice.
+                let captured_in_memory = std::iter::once(&memtables.active)
+                    .chain(memtables.frozen.iter())
+                    .any(|memtable| memtable.generation == t.generation);
+                let created_after_capture = t.generation >= memtables.active.generation;
+                if captured_in_memory || created_after_capture {
+                    // The active generation is the newest generation visible
+                    // at the refs boundary.  A manifest generation at or
+                    // above it either duplicates a captured handle (flush
+                    // raced the capture) or was committed after the capture;
+                    // neither belongs as a second source in this view.
+                    s
+                } else {
+                    s.with_sstable(t.generation, t.path.clone())
+                }
+            },
         );
-        let memtables = self.writer.in_memory_memtable_refs().await?;
-        let mut scanner = LsmScanner::new(
-            self.dataset.clone(),
-            vec![snapshot],
-            self.config.primary_keys.clone(),
-        )
-        .with_in_memory_memtables(self.writer.shard_id(), memtables);
-        if let Some(filter) = filter {
-            scanner = scanner.filter(filter)?;
-        }
-        if let Some(limit) = limit {
-            scanner = scanner.limit(Some(limit as i64), None)?;
-        }
-        scanner.create_plan().await
+        let active_generation = memtables.active.generation;
+        let active_batch_count = visible_counts
+            .get(&(self.writer.shard_id(), active_generation))
+            .copied()
+            .unwrap_or(0);
+        let fresh_tier_watermarks = [(
+            self.writer.shard_id(),
+            FreshTierWatermark {
+                active_generation,
+                active_batch_count: active_batch_count as u64,
+            },
+        )]
+        .into_iter()
+        .collect();
+        Ok(CapturedSnapshot {
+            dataset: self.dataset.clone(),
+            shard_id: self.writer.shard_id(),
+            shard: snapshot,
+            memtables,
+            visible_counts,
+            fresh_tier_watermarks,
+            primary_keys: self.config.primary_keys.clone(),
+            schema: self.config.schema.clone(),
+        })
     }
     /// Flush to Lance SSTables and advance the manifest replay watermark.
     pub async fn checkpoint(&mut self) -> lance::Result<()> {
@@ -371,6 +430,85 @@ impl Table {
     }
     pub fn durability(&self) -> &LanceDurability {
         &self.durability
+    }
+}
+
+/// Immutable inputs needed to build an LSM plan for one point-in-time view.
+/// The manifest and memtable references are captured together while the table
+/// is held by the caller, so repeated SQL scans cannot observe a later write or
+/// checkpoint even when they carry different predicates.
+struct CapturedSnapshot {
+    dataset: Arc<Dataset>,
+    shard_id: Uuid,
+    shard: ShardSnapshot,
+    memtables: InMemoryMemTables,
+    visible_counts: HashMap<(Uuid, u64), usize>,
+    fresh_tier_watermarks: HashMap<Uuid, FreshTierWatermark>,
+    primary_keys: Vec<String>,
+    schema: Arc<Schema>,
+}
+
+impl CapturedSnapshot {
+    fn scanner(&self) -> LsmScanner {
+        LsmScanner::new(
+            self.dataset.clone(),
+            vec![self.shard.clone()],
+            self.primary_keys.clone(),
+        )
+        .with_in_memory_memtables(self.shard_id, self.memtables.clone())
+        .with_in_memory_visible_counts(
+            self.shard_id,
+            self.visible_counts
+                .iter()
+                .map(|((_, generation), count)| (*generation, *count)),
+        )
+        .with_fresh_tier_watermarks(self.fresh_tier_watermarks.clone())
+    }
+
+    async fn plan_sql(
+        &self,
+        filter: Option<&str>,
+        limit: Option<usize>,
+    ) -> lance::Result<Arc<dyn ExecutionPlan>> {
+        let mut scanner = self.scanner();
+        if let Some(filter) = filter {
+            scanner = scanner.filter(filter)?;
+        }
+        if let Some(limit) = limit {
+            scanner = scanner.limit(Some(limit as i64), None)?;
+        }
+        scanner.create_plan().await
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::sql::SnapshotPlanSource for CapturedSnapshot {
+    fn schema(&self) -> Arc<Schema> {
+        self.schema.clone()
+    }
+
+    async fn plan(
+        &self,
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> DfResult<Arc<dyn ExecutionPlan>> {
+        let mut scanner = self.scanner();
+        if let Some((first, rest)) = filters.split_first() {
+            let filter = rest
+                .iter()
+                .cloned()
+                .fold(first.clone(), |all, next| all.and(next));
+            scanner = scanner.filter_expr(filter);
+        }
+        if let Some(limit) = limit {
+            scanner = scanner
+                .limit(Some(limit as i64), None)
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        }
+        scanner
+            .create_plan()
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))
     }
 }
 

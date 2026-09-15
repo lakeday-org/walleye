@@ -102,6 +102,148 @@ fn extract_pk_point_keys(
     }
 }
 
+/// If `filter` is a conjunction of equality/IN predicates covering every
+/// primary-key column, return the Cartesian product of its literal keys.
+///
+/// This is intentionally narrower than a general predicate extractor.  A
+/// point lookup can only replace the LSM scan when every row restriction is a
+/// primary-key restriction; a non-PK predicate must use the normal LSM scan so
+/// it is still evaluated after newest-per-key resolution.  Values are
+/// normalized to the schema types before lookup, which also deduplicates
+/// coercible literals in an IN list.
+fn extract_pk_point_tuples(
+    filter: &Expr,
+    pk_columns: &[String],
+    schema: &SchemaRef,
+) -> Option<Vec<Vec<ScalarValue>>> {
+    // A point lookup materializes one tiny batch per key. If an `IN`
+    // conjunction would expand beyond this planner safety bound, keep the
+    // expression on the ordinary scan path instead. That path evaluates the
+    // same predicate without putting a hard semantic cap on query results;
+    // this guard only prevents unbounded planning allocation.
+    const MAX_POINT_LOOKUP_KEYS: usize = 4096;
+
+    if pk_columns.is_empty() {
+        return None;
+    }
+
+    // Keep the existing single-key extractor as the narrow fast path.  The
+    // conjunction parser below is only needed for composite keys.
+    if pk_columns.len() == 1 {
+        let field = schema.field_with_name(&pk_columns[0]).ok()?;
+        return extract_pk_point_keys(filter, &pk_columns[0], field.data_type()).map(|keys| {
+            keys.into_iter()
+                .map(|key| safe_coerce_scalar(&key, field.data_type()).map(|value| vec![value]))
+                .collect::<Option<Vec<Vec<_>>>>()
+        })?;
+    }
+
+    let mut conjuncts = Vec::new();
+    flatten_conjunction(filter, &mut conjuncts);
+    let mut values: HashMap<String, Vec<ScalarValue>> = HashMap::new();
+
+    for conjunct in conjuncts {
+        let (column, literals) = extract_column_literals(conjunct)?;
+
+        let Some(field) = schema.field_with_name(&column).ok() else {
+            return None;
+        };
+        if !pk_columns.iter().any(|pk| pk == &column) || values.contains_key(&column) {
+            return None;
+        }
+        let mut normalized = Vec::with_capacity(literals.len());
+        let mut seen = HashSet::with_capacity(literals.len());
+        for literal in literals {
+            let value = safe_coerce_scalar(&literal, field.data_type())?;
+            if seen.insert(value.clone()) {
+                normalized.push(value);
+            }
+        }
+        if normalized.is_empty() {
+            return None;
+        }
+        values.insert(column, normalized);
+    }
+
+    if values.len() != pk_columns.len() {
+        return None;
+    }
+
+    let mut tuples = vec![Vec::with_capacity(pk_columns.len())];
+    for column in pk_columns {
+        let column_values = values.get(column)?;
+        let next_len = tuples.len().checked_mul(column_values.len())?;
+        if next_len > MAX_POINT_LOOKUP_KEYS {
+            return None;
+        }
+        let mut next = Vec::with_capacity(next_len);
+        for prefix in &tuples {
+            for value in column_values {
+                let mut tuple = prefix.clone();
+                tuple.push(value.clone());
+                next.push(tuple);
+            }
+        }
+        tuples = next;
+    }
+    Some(tuples)
+}
+
+/// Extract literal values for one column from an equality, IN list, or OR of
+/// equalities. DataFusion commonly rewrites `IN ('a', 'b')` into the latter
+/// shape before it calls a table provider, so both forms must reach the same
+/// point-lookup path.
+fn extract_column_literals(filter: &Expr) -> Option<(String, Vec<ScalarValue>)> {
+    match filter {
+        Expr::BinaryExpr(binary) if matches!(binary.op, Operator::Eq) => {
+            match (binary.left.as_ref(), binary.right.as_ref()) {
+                (Expr::Column(column), Expr::Literal(literal, _))
+                | (Expr::Literal(literal, _), Expr::Column(column)) => {
+                    Some((column.name.clone(), vec![literal.clone()]))
+                }
+                _ => None,
+            }
+        }
+        Expr::InList(in_list) if !in_list.negated => {
+            let Expr::Column(column) = in_list.expr.as_ref() else {
+                return None;
+            };
+            let literals = in_list
+                .list
+                .iter()
+                .map(|expr| {
+                    let Expr::Literal(literal, _) = expr else {
+                        return None;
+                    };
+                    Some(literal.clone())
+                })
+                .collect::<Option<Vec<_>>>()?;
+            Some((column.name.clone(), literals))
+        }
+        Expr::BinaryExpr(binary) if matches!(binary.op, Operator::Or) => {
+            let (left_column, mut left) = extract_column_literals(binary.left.as_ref())?;
+            let (right_column, right) = extract_column_literals(binary.right.as_ref())?;
+            if left_column != right_column {
+                return None;
+            }
+            left.extend(right);
+            Some((left_column, left))
+        }
+        _ => None,
+    }
+}
+
+fn flatten_conjunction<'a>(filter: &'a Expr, out: &mut Vec<&'a Expr>) {
+    if let Expr::BinaryExpr(binary) = filter
+        && matches!(binary.op, Operator::And)
+    {
+        flatten_conjunction(binary.left.as_ref(), out);
+        flatten_conjunction(binary.right.as_ref(), out);
+    } else {
+        out.push(filter);
+    }
+}
+
 /// Either a base Lance table, or an explicit base path used to resolve
 /// SSTable directories when no base dataset is configured.
 enum BaseSource {
@@ -201,6 +343,15 @@ pub struct LsmScanner {
     /// In-memory memtables by shard (active + frozen-awaiting-flush), so
     /// the scanner path carries frozen-undrained generations too.
     in_memory_memtables: HashMap<Uuid, InMemoryMemTables>,
+    /// Optional visibility watermarks captured with a higher-level snapshot.
+    /// The key is `(shard, generation)` and the value is the exclusive batch
+    /// count visible at capture time. When absent, scanners retain their
+    /// historical live-watermark behavior.
+    in_memory_visible_counts: HashMap<(Uuid, u64), usize>,
+    /// Fresh-tier watermarks captured with a higher-level snapshot.  These
+    /// bound cross-generation membership probes as well as row scans, so a
+    /// later append cannot shadow a row that the snapshot never observed.
+    fresh_tier_watermarks: HashMap<Uuid, FreshTierWatermark>,
 
     // Query configuration
     projection: Option<Vec<String>>,
@@ -263,6 +414,8 @@ impl LsmScanner {
             schema: Arc::new(arrow_schema),
             shard_snapshots,
             in_memory_memtables: HashMap::new(),
+            in_memory_visible_counts: HashMap::new(),
+            fresh_tier_watermarks: HashMap::new(),
             projection: None,
             filter: None,
             limit: None,
@@ -306,6 +459,8 @@ impl LsmScanner {
             schema,
             shard_snapshots,
             in_memory_memtables: HashMap::new(),
+            in_memory_visible_counts: HashMap::new(),
+            fresh_tier_watermarks: HashMap::new(),
             projection: None,
             filter: None,
             limit: None,
@@ -349,6 +504,33 @@ impl LsmScanner {
         memtables: InMemoryMemTables,
     ) -> Self {
         self.in_memory_memtables.insert(shard_id, memtables);
+        self
+    }
+
+    /// Pin the visible batch count for each captured memtable generation. This
+    /// is used by point-in-time table snapshots; ordinary callers can omit it
+    /// and continue to read the live visibility watermark.
+    pub fn with_in_memory_visible_counts(
+        mut self,
+        shard_id: Uuid,
+        counts: impl IntoIterator<Item = (u64, usize)>,
+    ) -> Self {
+        self.in_memory_visible_counts.extend(
+            counts
+                .into_iter()
+                .map(|(generation, count)| ((shard_id, generation), count)),
+        );
+        self
+    }
+
+    /// Pin the fresh-tier generation and batch watermarks used by a
+    /// point-in-time snapshot.  This is applied to both normal block-list
+    /// scans and `contains_pks` membership probes.
+    pub fn with_fresh_tier_watermarks(
+        mut self,
+        watermarks: HashMap<Uuid, FreshTierWatermark>,
+    ) -> Self {
+        self.fresh_tier_watermarks = watermarks;
         self
     }
 
@@ -703,18 +885,16 @@ impl LsmScanner {
         // (`LsmPointLookupPlanner`), composed as a normal `ExecutionPlan` so a
         // `limit` still applies on top. Any other shape falls through to the
         // general scan, so this never changes results for unmatched queries.
-        if self.pk_columns.len() == 1
-            && self.offset.is_none()
+        if self.offset.is_none()
             && !self.with_memtable_gen
             && !self.with_row_address
             && !self.projection_has_system_columns()
             && let Some(filter) = &self.filter
-            && let Ok(pk_field) = base_schema.field_with_name(&self.pk_columns[0])
-            && let Some(keys) =
-                extract_pk_point_keys(filter, &self.pk_columns[0], pk_field.data_type())
+            && let Some(keys) = extract_pk_point_tuples(filter, &self.pk_columns, &base_schema)
         {
             let mut planner =
                 LsmPointLookupPlanner::new(collector, self.pk_columns.clone(), base_schema);
+            planner = planner.with_in_memory_visible_counts(self.in_memory_visible_counts.clone());
             if let Some(session) = &self.session {
                 planner = planner.with_session(session.clone());
             }
@@ -728,7 +908,7 @@ impl LsmScanner {
                 planner = planner.with_warmer(warmer.clone());
             }
             let plan = planner
-                .plan_point_lookup(&keys, self.projection.as_deref())
+                .plan_point_lookup_tuples(&keys, self.projection.as_deref())
                 .await?;
             return Ok(match self.limit {
                 Some(n) => Arc::new(GlobalLimitExec::new(plan, 0, Some(n))),
@@ -737,6 +917,8 @@ impl LsmScanner {
         }
 
         let mut planner = LsmScanPlanner::new(collector, self.pk_columns.clone(), base_schema);
+        planner = planner.with_in_memory_visible_counts(self.in_memory_visible_counts.clone());
+        planner = planner.with_fresh_tier_watermarks(self.fresh_tier_watermarks.clone());
         if let Some(session) = &self.session {
             planner = planner.with_session(session.clone());
         }
@@ -835,12 +1017,15 @@ impl LsmScanner {
         watermarks: Option<&HashMap<Uuid, FreshTierWatermark>>,
     ) -> Result<Vec<bool>> {
         let sources = self.build_collector().collect()?;
+        let effective_watermarks = watermarks.or_else(|| {
+            (!self.fresh_tier_watermarks.is_empty()).then_some(&self.fresh_tier_watermarks)
+        });
         let memberships = super::block_list::fresh_tier_block_list(
             &sources,
             self.session.as_ref(),
             self.store_params.as_ref(),
             self.sstable_cache.as_ref(),
-            watermarks,
+            effective_watermarks,
         )
         .await?;
         let pk_indices = super::exec::resolve_pk_indices(pks, &self.pk_columns)
