@@ -175,13 +175,16 @@ impl LsmScanPlanner {
         // Cross-generation block-list keyed by source: a hit drops any row
         // whose PK lives in a newer generation, applied before the union.
         // `Box::pin` keeps the future off `clippy::large_futures`.
-        let block_lists = Box::pin(super::block_list::compute_source_block_lists_at(
-            &sources,
-            self.session.as_ref(),
-            self.store_params.as_ref(),
-            self.sstable_cache.as_ref(),
-            (!self.fresh_tier_watermarks.is_empty()).then_some(&self.fresh_tier_watermarks),
-        ))
+        let block_lists = Box::pin(
+            super::block_list::compute_source_block_lists_at_with_pk_columns(
+                &sources,
+                self.session.as_ref(),
+                self.store_params.as_ref(),
+                self.sstable_cache.as_ref(),
+                (!self.fresh_tier_watermarks.is_empty()).then_some(&self.fresh_tier_watermarks),
+                &self.pk_columns,
+            ),
+        )
         .await?;
 
         // Reverse so the union lists the newest generation first. This is

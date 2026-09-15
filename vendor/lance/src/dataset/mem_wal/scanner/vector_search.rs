@@ -241,12 +241,15 @@ impl LsmVectorSearchPlanner {
 
         // Per-source PK block sets (`NEWER(G)`; base = union of all gens).
         // `Box::pin` keeps the future off `clippy::large_futures`.
-        let block_lists = Box::pin(super::block_list::compute_source_block_lists(
-            &sources,
-            self.session.as_ref(),
-            self.store_params.as_ref(),
-            self.sstable_cache.as_ref(),
-        ))
+        let block_lists = Box::pin(
+            super::block_list::compute_source_block_lists_with_pk_columns(
+                &sources,
+                self.session.as_ref(),
+                self.store_params.as_ref(),
+                self.sstable_cache.as_ref(),
+                &self.pk_columns,
+            ),
+        )
         .await?;
 
         let canonical_schema = canonical_output_schema(

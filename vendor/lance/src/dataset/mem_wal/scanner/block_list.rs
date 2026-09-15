@@ -19,7 +19,9 @@
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
+use arrow_array::RecordBatch;
 use datafusion::common::ScalarValue;
+use futures::TryStreamExt;
 use lance_core::{Error, Result};
 
 use lance_index::metrics::NoOpMetricsCollector;
@@ -33,6 +35,7 @@ use uuid::Uuid;
 
 use super::data_source::{FreshTierWatermark, LsmDataSource, LsmGeneration};
 use super::sstable_cache::{DatasetCache, open_sstable};
+use crate::dataset::Dataset;
 use crate::dataset::mem_wal::index::encode_pk_tuple;
 use crate::dataset::mem_wal::util::PK_INDEX_DIR;
 use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
@@ -161,7 +164,39 @@ pub async fn compute_source_block_lists(
     store_params: Option<&ObjectStoreParams>,
     sstable_cache: Option<&Arc<dyn DatasetCache>>,
 ) -> Result<SourceBlockLists> {
-    compute_source_block_lists_at(sources, session, store_params, sstable_cache, None).await
+    compute_source_block_lists_at_with_pk_columns(
+        sources,
+        session,
+        store_params,
+        sstable_cache,
+        None,
+        &[],
+    )
+    .await
+}
+
+/// [`compute_source_block_lists`] with the table's primary-key columns.
+///
+/// Older callers that do not provide the columns retain the strict sidecar
+/// behavior.  LSM readers pass the columns so a legacy SSTable with no PK
+/// sidecar can rebuild only the membership needed for deduplication from its
+/// immutable rows.
+pub async fn compute_source_block_lists_with_pk_columns(
+    sources: &[LsmDataSource],
+    session: Option<&Arc<Session>>,
+    store_params: Option<&ObjectStoreParams>,
+    sstable_cache: Option<&Arc<dyn DatasetCache>>,
+    pk_columns: &[String],
+) -> Result<SourceBlockLists> {
+    compute_source_block_lists_at_with_pk_columns(
+        sources,
+        session,
+        store_params,
+        sstable_cache,
+        None,
+        pk_columns,
+    )
+    .await
 }
 
 /// [`compute_source_block_lists`] with optional fresh-tier watermarks.  A
@@ -175,6 +210,26 @@ pub async fn compute_source_block_lists_at(
     store_params: Option<&ObjectStoreParams>,
     sstable_cache: Option<&Arc<dyn DatasetCache>>,
     watermarks: Option<&HashMap<Uuid, FreshTierWatermark>>,
+) -> Result<SourceBlockLists> {
+    compute_source_block_lists_at_with_pk_columns(
+        sources,
+        session,
+        store_params,
+        sstable_cache,
+        watermarks,
+        &[],
+    )
+    .await
+}
+
+/// [`compute_source_block_lists_at`] with the table's primary-key columns.
+pub async fn compute_source_block_lists_at_with_pk_columns(
+    sources: &[LsmDataSource],
+    session: Option<&Arc<Session>>,
+    store_params: Option<&ObjectStoreParams>,
+    sstable_cache: Option<&Arc<dyn DatasetCache>>,
+    watermarks: Option<&HashMap<Uuid, FreshTierWatermark>>,
+    pk_columns: &[String],
 ) -> Result<SourceBlockLists> {
     // Membership per non-base source, grouped by shard (generations are
     // per-shard, so supersession is within-shard only).
@@ -236,9 +291,10 @@ pub async fn compute_source_block_lists_at(
                     .is_some_and(|watermark| generation.as_u64() >= watermark.active_generation);
                 if !post_capture {
                     sstable_loads.push(async move {
-                        let index =
-                            open_pk_index(path, session, store_params, sstable_cache).await?;
-                        Ok::<_, Error>((*shard_id, *generation, GenMembership::OnDisk(index)))
+                        let membership =
+                            open_pk_index(path, session, store_params, sstable_cache, pk_columns)
+                                .await?;
+                        Ok::<_, Error>((*shard_id, *generation, membership))
                     });
                 }
             }
@@ -292,6 +348,26 @@ pub async fn fresh_tier_block_list(
     store_params: Option<&ObjectStoreParams>,
     sstable_cache: Option<&Arc<dyn DatasetCache>>,
     watermarks: Option<&HashMap<Uuid, FreshTierWatermark>>,
+) -> Result<Vec<GenMembership>> {
+    fresh_tier_block_list_with_pk_columns(
+        sources,
+        session,
+        store_params,
+        sstable_cache,
+        watermarks,
+        &[],
+    )
+    .await
+}
+
+/// [`fresh_tier_block_list`] with the table's primary-key columns.
+pub async fn fresh_tier_block_list_with_pk_columns(
+    sources: &[LsmDataSource],
+    session: Option<&Arc<Session>>,
+    store_params: Option<&ObjectStoreParams>,
+    sstable_cache: Option<&Arc<dyn DatasetCache>>,
+    watermarks: Option<&HashMap<Uuid, FreshTierWatermark>>,
+    pk_columns: &[String],
 ) -> Result<Vec<GenMembership>> {
     // Membership per source, in source order (`None` = skipped). Flushed
     // PK-BTree opens are cold S3 reads, so collect them tagged with their slot
@@ -351,9 +427,10 @@ pub async fn fresh_tier_block_list(
                     let slot = slots.len();
                     slots.push(None);
                     sstable_loads.push(async move {
-                        let index =
-                            open_pk_index(path, session, store_params, sstable_cache).await?;
-                        Ok::<_, Error>((slot, GenMembership::OnDisk(index)))
+                        let membership =
+                            open_pk_index(path, session, store_params, sstable_cache, pk_columns)
+                                .await?;
+                        Ok::<_, Error>((slot, membership))
                     });
                 }
             }
@@ -412,6 +489,13 @@ fn bounded_in_memory_membership(
 /// are cached in the session's index cache (keyed by the immutable SSTable
 /// path), so repeated probes reuse them with no separate cache path and no
 /// upfront scan; concurrent first-opens may each load before the cache fills.
+///
+/// Older persisted generations can legitimately have no PK sidecar. When the
+/// caller supplies the table PK columns and the sidecar prefix is empty, build
+/// an in-memory membership index from those immutable columns. A non-empty but
+/// unreadable prefix is treated as corruption and returned to the caller; it
+/// must never be silently replaced with a scan.
+///
 /// A stable cache UUID for a non-manifest index identified only by its path.
 ///
 /// `DSIndexCache::for_index` keys by `&Uuid`, but the flushed PK sidecar has no
@@ -435,7 +519,8 @@ async fn open_pk_index(
     session: Option<&Arc<Session>>,
     store_params: Option<&ObjectStoreParams>,
     sstable_cache: Option<&Arc<dyn DatasetCache>>,
-) -> Result<Arc<dyn ScalarIndex>> {
+    pk_columns: &[String],
+) -> Result<GenMembership> {
     let dataset = open_sstable(path, session, store_params, sstable_cache, None).await?;
     // Namespace the session index cache by the (immutable) SSTable path so this
     // sidecar's pages live alongside every other index instead of a bespoke
@@ -444,7 +529,7 @@ async fn open_pk_index(
     let index_dir = dataset.base.clone().join(PK_INDEX_DIR);
     let store: Arc<dyn ScalarIndexStore> = Arc::new(LanceIndexStore::new(
         dataset.object_store.clone(),
-        index_dir,
+        index_dir.clone(),
         Arc::new(index_cache.clone()),
     ));
 
@@ -454,15 +539,70 @@ async fn open_pk_index(
         .get_from_cache(store.clone(), None, &index_cache)
         .await?
     {
-        return Ok(index);
+        return Ok(GenMembership::OnDisk(index));
     }
     let details = prost_types::Any::from_msg(&lance_index::pbold::BTreeIndexDetails::default())
         .map_err(|e| Error::io(e.to_string()))?;
-    let index = plugin
-        .load_index(store, &details, None, &index_cache)
-        .await?;
-    plugin.put_in_cache(&index_cache, index.clone()).await?;
-    Ok(index)
+    match plugin.load_index(store, &details, None, &index_cache).await {
+        Ok(index) => {
+            plugin.put_in_cache(&index_cache, index.clone()).await?;
+            Ok(GenMembership::OnDisk(index))
+        }
+        Err(error)
+            if error.is_not_found()
+                && !pk_columns.is_empty()
+                && !sidecar_has_files(&dataset, &index_dir).await? =>
+        {
+            Ok(rebuild_pk_membership(&dataset, pk_columns).await?)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Return whether the PK sidecar prefix contains any object. Listing is used
+/// rather than a single HEAD because the BTree format has several valid file
+/// layouts (and object stores do not expose directories consistently).
+async fn sidecar_has_files(
+    dataset: &Dataset,
+    index_dir: &object_store::path::Path,
+) -> Result<bool> {
+    let mut files = dataset.object_store.inner.list(Some(index_dir));
+    match files.try_next().await {
+        Ok(Some(_)) => Ok(true),
+        Ok(None) => Ok(false),
+        Err(object_store::Error::NotFound { .. }) => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Reconstruct the PK membership needed by cross-generation deduplication for
+/// an SSTable that predates standalone PK sidecars. The SSTable is immutable,
+/// so scanning only the PK columns is enough; row positions remain the source's
+/// positions and no user columns are retained in this fallback.
+async fn rebuild_pk_membership(dataset: &Dataset, pk_columns: &[String]) -> Result<GenMembership> {
+    let mut scanner = dataset.scan();
+    scanner.project(pk_columns)?;
+    let batches: Vec<RecordBatch> = scanner.try_into_stream().await?.try_collect().await?;
+
+    let pk = pk_columns
+        .iter()
+        .enumerate()
+        .map(|(field_id, column)| (column.clone(), field_id as i32))
+        .collect::<Vec<_>>();
+    let mut index_store = IndexStore::new();
+    index_store.enable_pk_index(&pk);
+    let mut row_offset = 0u64;
+    for batch in batches {
+        index_store.insert(&batch, row_offset)?;
+        row_offset = row_offset
+            .checked_add(batch.num_rows() as u64)
+            .ok_or_else(|| Error::internal("SSTable row count overflow rebuilding PK index"))?;
+    }
+
+    Ok(GenMembership::InMemory {
+        index_store: Arc::new(index_store),
+        max_visible_row: row_offset.checked_sub(1),
+    })
 }
 
 /// Write an SSTable's standalone PK sidecar at `{uri}/_pk_index` from
