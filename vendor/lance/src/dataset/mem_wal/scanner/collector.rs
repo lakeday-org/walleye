@@ -160,12 +160,23 @@ impl LsmDataSourceCollector {
     /// that probe many keys against the same set of memtables; clones no
     /// `Arc`s. Empty when there are no in-memory memtables.
     pub fn in_memory_refs_newest_first(&self) -> Vec<&InMemoryMemTableRef> {
-        let mut refs: Vec<&InMemoryMemTableRef> = Vec::new();
-        for mems in self.in_memory_memtables.values() {
-            refs.push(&mems.active);
-            refs.extend(mems.frozen.iter());
+        self.in_memory_refs_newest_first_with_shard()
+            .into_iter()
+            .map(|(_, memtable)| memtable)
+            .collect()
+    }
+
+    /// The in-memory memtables with their owning shard IDs, newest generation
+    /// first. The shard ID is part of the snapshot watermark key, so callers
+    /// that perform direct probes must retain it rather than reconstructing a
+    /// visibility bound from the live index store.
+    pub fn in_memory_refs_newest_first_with_shard(&self) -> Vec<(Uuid, &InMemoryMemTableRef)> {
+        let mut refs: Vec<(Uuid, &InMemoryMemTableRef)> = Vec::new();
+        for (shard_id, mems) in &self.in_memory_memtables {
+            refs.push((*shard_id, &mems.active));
+            refs.extend(mems.frozen.iter().map(|memtable| (*shard_id, memtable)));
         }
-        refs.sort_by_key(|m| std::cmp::Reverse(m.generation));
+        refs.sort_by_key(|(_, memtable)| std::cmp::Reverse(memtable.generation));
         refs
     }
 
@@ -181,21 +192,25 @@ impl LsmDataSourceCollector {
         &self,
         mut f: impl FnMut(&InMemoryMemTableRef) -> Result<Option<T>>,
     ) -> Result<Option<T>> {
+        self.find_in_memory_newest_first_with_shard(|_, memtable| f(memtable))
+    }
+
+    /// Visit in-memory memtables newest-first while retaining the owning shard
+    /// ID for each callback. Snapshot-aware direct probes use this variant so
+    /// they can apply the captured `(shard, generation)` watermark.
+    pub fn find_in_memory_newest_first_with_shard<T>(
+        &self,
+        mut f: impl FnMut(Uuid, &InMemoryMemTableRef) -> Result<Option<T>>,
+    ) -> Result<Option<T>> {
         // Hot path: one shard, only the active memtable → no Vec, no sort.
         if self.in_memory_memtables.len() == 1 {
-            let mems = self.in_memory_memtables.values().next().unwrap();
+            let (shard_id, mems) = self.in_memory_memtables.iter().next().unwrap();
             if mems.frozen.is_empty() {
-                return f(&mems.active);
+                return f(*shard_id, &mems.active);
             }
         }
-        let mut refs: Vec<&InMemoryMemTableRef> = Vec::new();
-        for mems in self.in_memory_memtables.values() {
-            refs.push(&mems.active);
-            refs.extend(mems.frozen.iter());
-        }
-        refs.sort_by_key(|m| std::cmp::Reverse(m.generation));
-        for m in refs {
-            if let Some(v) = f(m)? {
+        for (shard_id, memtable) in self.in_memory_refs_newest_first_with_shard() {
+            if let Some(v) = f(shard_id, memtable)? {
                 return Ok(Some(v));
             }
         }

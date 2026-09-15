@@ -228,37 +228,200 @@ impl LsmPointLookupPlanner {
 
     /// Build one composable plan for a set of complete primary-key tuples.
     ///
-    /// Each tuple is resolved independently by the existing point-lookup
-    /// planner, which checks every captured LSM generation newest-first and
-    /// applies tombstone suppression after coalescing. The tiny result is then
-    /// returned as one one-shot batch. Materializing the point results here
-    /// avoids asking DataFusion to merge statistics from independently planned
-    /// composite-key arms (some Lance source arms intentionally report unknown
-    /// statistics with zero columns). This also handles composite primary keys;
-    /// `plan_point_lookup` remains the single-column convenience path used by
-    /// older callers.
+    /// Composite-key tuples are probed in the captured in-memory memtables in
+    /// one pass when their PK index is available. This avoids constructing one
+    /// DataFusion plan per `entry IN (...)` value, which is the hot path for
+    /// scan-state queries. Keys that are not found in memory still use the
+    /// existing point-lookup plan so SSTables and the base table retain their
+    /// normal MVCC/tombstone semantics. The result is returned as one one-shot
+    /// batch, which keeps this API composable with the caller's limit.
     pub async fn plan_point_lookup_tuples(
         &self,
         keys: &[Vec<ScalarValue>],
         projection: Option<&[String]>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let target =
-            canonical_output_schema(projection, &self.base_schema, &self.pk_columns, false);
-        let mut batches = Vec::with_capacity(keys.len());
-        for key in keys {
-            if let Some(batch) = self.lookup_via_plan(key, projection).await? {
-                batches.push(batch);
-            }
-        }
-        let batch = match batches.len() {
-            0 => RecordBatch::new_empty(target),
-            1 => batches.pop().expect("one point lookup batch"),
-            _ => arrow_select::concat::concat_batches(&target, &batches)?,
+        let batch = if self.single_column_batch_eligible(keys, projection) {
+            let values: Vec<ScalarValue> = keys.iter().map(|key| key[0].clone()).collect();
+            self.lookup_many(&values, projection).await?
+        } else {
+            self.lookup_many_tuples(keys, projection).await?
         };
         let schema = batch.schema();
         let stream = futures::stream::once(async move { Ok(batch) });
         let adapter = RecordBatchStreamAdapter::new(schema, stream);
         Ok(Arc::new(OneShotExec::new(Box::pin(adapter))))
+    }
+
+    /// Whether a routed point-tuple query can use the existing single-column
+    /// batch probe. Malformed/coercible keys stay on the validating plan path.
+    fn single_column_batch_eligible(
+        &self,
+        keys: &[Vec<ScalarValue>],
+        projection: Option<&[String]>,
+    ) -> bool {
+        if self.pk_columns.len() != 1 || keys.is_empty() {
+            return false;
+        }
+        let target =
+            canonical_output_schema(projection, &self.base_schema, &self.pk_columns, false);
+        let Some(pk_type) = self
+            .base_schema
+            .field_with_name(&self.pk_columns[0])
+            .ok()
+            .map(|field| field.data_type().clone())
+        else {
+            return false;
+        };
+        !target
+            .fields()
+            .iter()
+            .any(|field| is_system_column(field.name()))
+            && keys
+                .iter()
+                .all(|key| key.len() == 1 && key[0].data_type() == pk_type)
+    }
+
+    /// Whether a tuple batch can use the in-memory primary-key index directly.
+    /// The direct gather path only handles exact PK types and logical output
+    /// columns; coercion and system columns stay on the plan path.
+    fn composite_batch_eligible(
+        &self,
+        keys: &[Vec<ScalarValue>],
+        projection: Option<&[String]>,
+    ) -> bool {
+        if self.pk_columns.len() < 2 || keys.is_empty() {
+            return false;
+        }
+        let target =
+            canonical_output_schema(projection, &self.base_schema, &self.pk_columns, false);
+        if target
+            .fields()
+            .iter()
+            .any(|field| is_system_column(field.name()))
+        {
+            return false;
+        }
+        let pk_types: Vec<&DataType> = self
+            .pk_columns
+            .iter()
+            .filter_map(|column| self.base_schema.field_with_name(column).ok())
+            .map(|field| field.data_type())
+            .collect();
+        pk_types.len() == self.pk_columns.len()
+            && keys.iter().all(|key| {
+                key.len() == pk_types.len()
+                    && key
+                        .iter()
+                        .zip(pk_types.iter())
+                        .all(|(value, data_type)| value.data_type() == **data_type)
+            })
+    }
+
+    /// Resolve complete composite PK tuples from the captured in-memory
+    /// memtables. A tuple is resolved at the first (newest) generation that
+    /// contains it. A post-capture write is invisible because every probe uses
+    /// the planner's `(shard,generation)` visibility count, never the live
+    /// `IndexStore::visible_count()`.
+    async fn lookup_many_tuples(
+        &self,
+        keys: &[Vec<ScalarValue>],
+        projection: Option<&[String]>,
+    ) -> Result<RecordBatch> {
+        let target =
+            canonical_output_schema(projection, &self.base_schema, &self.pk_columns, false);
+        if keys.is_empty() {
+            return Ok(RecordBatch::new_empty(target));
+        }
+        if !self.composite_batch_eligible(keys, projection) {
+            return self
+                .lookup_many_tuples_via_per_key(keys, projection, &target)
+                .await;
+        }
+
+        let refs = self.collector.in_memory_refs_newest_first_with_shard();
+        let mut hits: HashMap<(usize, usize), Vec<u32>> = HashMap::new();
+        let mut pending: Vec<Vec<ScalarValue>> = Vec::new();
+
+        for key in keys {
+            let mut resolved = false;
+            for (ri, (shard_id, memtable)) in refs.iter().enumerate() {
+                let visible_count = self
+                    .visible_counts
+                    .get(&(*shard_id, memtable.generation))
+                    .copied();
+                match probe_tuple_position(
+                    &memtable.batch_store,
+                    &memtable.index_store,
+                    key,
+                    visible_count,
+                )? {
+                    ProbePos::Found { batch_idx, row } => {
+                        // A tombstone is the newest visible version and must
+                        // block older generations from resurrecting the key.
+                        if !is_tombstone_at(&memtable.batch_store, batch_idx, row)? {
+                            hits.entry((ri, batch_idx)).or_default().push(row as u32);
+                        }
+                        resolved = true;
+                        break;
+                    }
+                    ProbePos::Miss => continue,
+                    ProbePos::NoIndex => {
+                        // A memtable without its configured PK index still
+                        // needs the scan planner's source-level fallback.
+                        return self
+                            .lookup_many_tuples_via_per_key(keys, projection, &target)
+                            .await;
+                    }
+                }
+            }
+            if !resolved {
+                pending.push(key.clone());
+            }
+        }
+
+        let mut out: Vec<RecordBatch> = Vec::with_capacity(hits.len() + 1);
+        for ((ref_idx, batch_idx), rows) in hits {
+            out.push(gather_rows(
+                &refs[ref_idx].1.batch_store,
+                batch_idx,
+                &rows,
+                &target,
+            )?);
+        }
+        if !pending.is_empty() && self.collector.has_on_disk_sources() {
+            out.push(
+                self.lookup_many_tuples_via_per_key(&pending, projection, &target)
+                    .await?,
+            );
+        }
+
+        match out.len() {
+            0 => Ok(RecordBatch::new_empty(target)),
+            1 => Ok(out.pop().expect("one composite point lookup batch")),
+            _ => Ok(arrow_select::concat::concat_batches(&target, &out)?),
+        }
+    }
+
+    /// Correctness fallback for composite tuple batches. It deliberately keeps
+    /// the existing source planner for keys that need disk, where its captured
+    /// visibility bounds and tombstone coalescing are authoritative.
+    async fn lookup_many_tuples_via_per_key(
+        &self,
+        keys: &[Vec<ScalarValue>],
+        projection: Option<&[String]>,
+        target: &SchemaRef,
+    ) -> Result<RecordBatch> {
+        let mut out: Vec<RecordBatch> = Vec::new();
+        for key in keys {
+            if let Some(batch) = self.lookup_via_plan(key, projection).await? {
+                out.push(batch);
+            }
+        }
+        match out.len() {
+            0 => Ok(RecordBatch::new_empty(target.clone())),
+            1 => Ok(out.pop().expect("one composite point lookup batch")),
+            _ => Ok(arrow_select::concat::concat_batches(target, &out)?),
+        }
     }
 
     /// Build the coalesced point-lookup plan: each source scanned newest-first,
@@ -438,14 +601,17 @@ impl LsmPointLookupPlanner {
                 // Probe in-memory memtables newest-first *by reference* (no
                 // source `Arc` clones / allocation in the single-memtable case),
                 // so concurrent readers don't contend on source refcounts.
-                let outcome = self.collector.find_in_memory_newest_first(
-                    |m| -> Result<Option<FastOutcome>> {
+                let outcome = self.collector.find_in_memory_newest_first_with_shard(
+                    |shard_id, m| -> Result<Option<FastOutcome>> {
+                        let visible_count =
+                            self.visible_counts.get(&(shard_id, m.generation)).copied();
                         match probe_memtable(
                             &m.batch_store,
                             &m.index_store,
                             &self.pk_columns[0],
                             &pk_values[0],
                             target,
+                            visible_count,
                         )? {
                             Probe::Hit(batch) => Ok(Some(FastOutcome::Hit(batch))),
                             Probe::Deleted => Ok(Some(FastOutcome::Deleted)),
@@ -546,15 +712,16 @@ impl LsmPointLookupPlanner {
         }
 
         let pk_col = &self.pk_columns[0];
-        let refs = self.collector.in_memory_refs_newest_first();
+        let refs = self.collector.in_memory_refs_newest_first_with_shard();
         // Hits grouped by (memtable index, batch index) so each source batch is
         // gathered with a single `take`.
         let mut hits: HashMap<(usize, usize), Vec<u32>> = HashMap::new();
         let mut pending: Vec<ScalarValue> = Vec::new();
         for key in keys {
             let mut resolved = false;
-            for (ri, m) in refs.iter().enumerate() {
-                match probe_position(&m.batch_store, &m.index_store, pk_col, key)? {
+            for (ri, (shard_id, m)) in refs.iter().enumerate() {
+                let visible_count = self.visible_counts.get(&(*shard_id, m.generation)).copied();
+                match probe_position(&m.batch_store, &m.index_store, pk_col, key, visible_count)? {
                     ProbePos::Found { batch_idx, row } => {
                         // Newest version is a tombstone → the key is deleted:
                         // resolve it as a miss (emit nothing) and do not fall
@@ -583,7 +750,7 @@ impl LsmPointLookupPlanner {
         let mut out: Vec<RecordBatch> = Vec::with_capacity(hits.len() + 1);
         for ((ri, batch_idx), rows) in hits {
             out.push(gather_rows(
-                &refs[ri].batch_store,
+                &refs[ri].1.batch_store,
                 batch_idx,
                 &rows,
                 &target,
@@ -949,28 +1116,13 @@ fn probe_position(
     index_store: &IndexStore,
     pk_column: &str,
     pk_value: &ScalarValue,
+    captured_visible_count: Option<usize>,
 ) -> Result<ProbePos> {
-    // Visible batches are the committed prefix [0, last_visible_idx]; each
-    // `StoredBatch` carries its cumulative `row_offset`, so visibility and the
-    // position→batch mapping are O(1)/O(log) with no per-probe allocation.
-    let len = batch_store.len();
-    if len == 0 {
-        return Ok(ProbePos::Miss);
-    }
-    // The cursor is an exclusive count, so the last visible batch sits at
-    // `count - 1`. A count of 0 means nothing is visible yet — not "batch 0".
-    let visible_count = index_store.visible_count().min(len);
-    let Some(last_visible_idx) = visible_count.checked_sub(1) else {
+    let Some((last_visible_idx, max_visible_row)) =
+        visible_bounds(batch_store, index_store, captured_visible_count)?
+    else {
         return Ok(ProbePos::Miss);
     };
-    let last = batch_store.get(last_visible_idx).ok_or_else(|| {
-        lance_core::Error::internal("point-lookup: visible batch index out of range")
-    })?;
-    let visible_end = last.row_offset + last.num_rows as u64; // exclusive
-    if visible_end == 0 {
-        return Ok(ProbePos::Miss);
-    }
-    let max_visible_row = visible_end - 1;
 
     // A single-column primary key always has a value-keyed BTree (reused or
     // auto-created — see `IndexStore::enable_pk_index`): collision-free, so one
@@ -980,6 +1132,59 @@ fn probe_position(
         return Ok(ProbePos::NoIndex);
     };
     let Some(pos) = btree.get_newest_visible(pk_value, max_visible_row) else {
+        return Ok(ProbePos::Miss);
+    };
+    let (batch_idx, row) = resolve_position(batch_store, last_visible_idx, pos)?;
+    Ok(ProbePos::Found { batch_idx, row })
+}
+
+/// Resolve the captured visible batch prefix and its final global row. The
+/// optional count is supplied by `CapturedSnapshot`; when absent, callers that
+/// operate outside a snapshot use the live index watermark as before.
+fn visible_bounds(
+    batch_store: &BatchStore,
+    index_store: &IndexStore,
+    captured_visible_count: Option<usize>,
+) -> Result<Option<(usize, u64)>> {
+    let len = batch_store.len();
+    if len == 0 {
+        return Ok(None);
+    }
+    let visible_count = captured_visible_count
+        .unwrap_or_else(|| index_store.visible_count())
+        .min(len);
+    let Some(last_visible_idx) = visible_count.checked_sub(1) else {
+        return Ok(None);
+    };
+    let last = batch_store.get(last_visible_idx).ok_or_else(|| {
+        lance_core::Error::internal("point-lookup: visible batch index out of range")
+    })?;
+    let visible_end = last.row_offset + last.num_rows as u64; // exclusive
+    if visible_end == 0 {
+        return Ok(None);
+    }
+    Ok(Some((last_visible_idx, visible_end - 1)))
+}
+
+/// Probe a complete primary-key tuple through the composite PK BTree. The
+/// position bound is the same captured MVCC bound used by the single-column
+/// probe, so a tuple appended after snapshot capture cannot shadow an older
+/// visible value.
+fn probe_tuple_position(
+    batch_store: &BatchStore,
+    index_store: &IndexStore,
+    pk_values: &[ScalarValue],
+    captured_visible_count: Option<usize>,
+) -> Result<ProbePos> {
+    let Some((last_visible_idx, max_visible_row)) =
+        visible_bounds(batch_store, index_store, captured_visible_count)?
+    else {
+        return Ok(ProbePos::Miss);
+    };
+    if !index_store.has_pk_index() {
+        return Ok(ProbePos::NoIndex);
+    }
+    let Some(pos) = index_store.pk_newest_visible(pk_values, max_visible_row) else {
         return Ok(ProbePos::Miss);
     };
     let (batch_idx, row) = resolve_position(batch_store, last_visible_idx, pos)?;
@@ -1062,8 +1267,15 @@ fn probe_memtable(
     pk_column: &str,
     pk_value: &ScalarValue,
     target: &SchemaRef,
+    captured_visible_count: Option<usize>,
 ) -> Result<Probe> {
-    match probe_position(batch_store, index_store, pk_column, pk_value)? {
+    match probe_position(
+        batch_store,
+        index_store,
+        pk_column,
+        pk_value,
+        captured_visible_count,
+    )? {
         ProbePos::NoIndex => Ok(Probe::NoIndex),
         ProbePos::Miss => Ok(Probe::Miss),
         ProbePos::Found { batch_idx, row } => {
@@ -1086,7 +1298,7 @@ fn probe_memtable(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator, StringArray};
+    use arrow_array::{BooleanArray, Int32Array, RecordBatch, RecordBatchIterator, StringArray};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use datafusion::physical_plan::displayable;
     use std::collections::HashMap;
@@ -1940,6 +2152,340 @@ mod tests {
                 },
             );
         LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema)
+    }
+
+    fn composite_schema() -> Arc<ArrowSchema> {
+        Arc::new(ArrowSchema::new(vec![
+            Field::new("scope", DataType::Utf8, false),
+            Field::new("entry", DataType::Utf8, false),
+            Field::new("value", DataType::Int32, true),
+        ]))
+    }
+
+    fn composite_mem_schema() -> Arc<ArrowSchema> {
+        Arc::new(ArrowSchema::new(vec![
+            Field::new("scope", DataType::Utf8, false),
+            Field::new("entry", DataType::Utf8, false),
+            Field::new("value", DataType::Int32, true),
+            Field::new(TOMBSTONE, DataType::Boolean, false),
+        ]))
+    }
+
+    fn composite_batch(
+        schema: &Arc<ArrowSchema>,
+        rows: &[(&str, &str, Option<i32>, bool)],
+    ) -> RecordBatch {
+        let scopes: Vec<&str> = rows.iter().map(|(scope, _, _, _)| *scope).collect();
+        let entries: Vec<&str> = rows.iter().map(|(_, entry, _, _)| *entry).collect();
+        let values: Vec<Option<i32>> = rows.iter().map(|(_, _, value, _)| *value).collect();
+        let tombstones: Vec<bool> = rows.iter().map(|(_, _, _, tombstone)| *tombstone).collect();
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(scopes)),
+                Arc::new(StringArray::from(entries)),
+                Arc::new(Int32Array::from(values)),
+                Arc::new(BooleanArray::from(tombstones)),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn composite_active_ref(
+        schema: &Arc<ArrowSchema>,
+        batches: &[RecordBatch],
+        generation: u64,
+    ) -> crate::dataset::mem_wal::scanner::collector::InMemoryMemTableRef {
+        use crate::dataset::mem_wal::scanner::collector::InMemoryMemTableRef;
+        let batch_store = Arc::new(BatchStore::with_capacity(16));
+        let mut index_store = IndexStore::new();
+        index_store.enable_pk_index(&[("scope".to_string(), 0), ("entry".to_string(), 1)]);
+        for batch in batches {
+            let (batch_position, row_offset, _) = batch_store.append(batch.clone()).unwrap();
+            index_store
+                .insert_with_batch_position(batch, row_offset, Some(batch_position))
+                .unwrap();
+        }
+        InMemoryMemTableRef {
+            batch_store,
+            index_store: Arc::new(index_store),
+            schema: schema.clone(),
+            generation,
+        }
+    }
+
+    fn composite_values(batch: &RecordBatch) -> Vec<(String, String, Option<i32>)> {
+        let scopes = batch
+            .column_by_name("scope")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let entries = batch
+            .column_by_name("entry")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let values = batch
+            .column_by_name("value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        (0..batch.num_rows())
+            .map(|row| {
+                (
+                    scopes.value(row).to_string(),
+                    entries.value(row).to_string(),
+                    (!values.is_null(row)).then(|| values.value(row)),
+                )
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_plan_point_lookup_tuples_batches_composite_keys() {
+        use crate::dataset::mem_wal::scanner::collector::InMemoryMemTables;
+        use futures::TryStreamExt;
+
+        let base_schema = composite_schema();
+        let mem_schema = composite_mem_schema();
+        let old = composite_batch(
+            &mem_schema,
+            &[
+                ("scan", "one", Some(1), false),
+                ("scan", "two", Some(2), false),
+                ("other", "one", Some(10), false),
+            ],
+        );
+        let latest = composite_batch(
+            &mem_schema,
+            &[
+                ("scan", "one", Some(11), false),
+                ("scan", "three", Some(3), false),
+            ],
+        );
+        let active = composite_active_ref(&mem_schema, &[old, latest], 1);
+        let temp = tempfile::tempdir().unwrap();
+        let shard_id = Uuid::new_v4();
+        let collector = LsmDataSourceCollector::without_base_table(
+            format!("{}/base", temp.path().to_str().unwrap()),
+            vec![],
+        )
+        .with_in_memory_memtables(
+            shard_id,
+            InMemoryMemTables {
+                active,
+                frozen: vec![],
+            },
+        );
+        let planner = LsmPointLookupPlanner::new(
+            collector,
+            vec!["scope".to_string(), "entry".to_string()],
+            base_schema,
+        );
+        let keys = vec![
+            vec![
+                ScalarValue::Utf8(Some("scan".to_string())),
+                ScalarValue::Utf8(Some("one".to_string())),
+            ],
+            vec![
+                ScalarValue::Utf8(Some("scan".to_string())),
+                ScalarValue::Utf8(Some("two".to_string())),
+            ],
+            vec![
+                ScalarValue::Utf8(Some("scan".to_string())),
+                ScalarValue::Utf8(Some("three".to_string())),
+            ],
+            vec![
+                ScalarValue::Utf8(Some("scan".to_string())),
+                ScalarValue::Utf8(Some("missing".to_string())),
+            ],
+        ];
+        let plan = planner.plan_point_lookup_tuples(&keys, None).await.unwrap();
+        let batches: Vec<RecordBatch> = plan
+            .execute(0, datafusion::prelude::SessionContext::new().task_ctx())
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let mut rows = batches
+            .iter()
+            .flat_map(composite_values)
+            .collect::<Vec<_>>();
+        rows.sort_by(|a, b| a.1.cmp(&b.1));
+        assert_eq!(
+            rows,
+            vec![
+                ("scan".to_string(), "one".to_string(), Some(11)),
+                ("scan".to_string(), "three".to_string(), Some(3)),
+                ("scan".to_string(), "two".to_string(), Some(2)),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_plan_point_lookup_tuples_respects_captured_visibility() {
+        use crate::dataset::mem_wal::scanner::collector::InMemoryMemTables;
+        use futures::TryStreamExt;
+
+        let base_schema = composite_schema();
+        let mem_schema = composite_mem_schema();
+        let old = composite_batch(
+            &mem_schema,
+            &[
+                ("scan", "one", Some(1), false),
+                ("scan", "dead", Some(9), false),
+            ],
+        );
+        let active = composite_active_ref(&mem_schema, std::slice::from_ref(&old), 1);
+        let captured_visible_count = active.index_store.visible_count();
+        assert_eq!(captured_visible_count, 1);
+        let batch_store = active.batch_store.clone();
+        let index_store = active.index_store.clone();
+        let temp = tempfile::tempdir().unwrap();
+        let shard_id = Uuid::new_v4();
+        let collector = LsmDataSourceCollector::without_base_table(
+            format!("{}/base", temp.path().to_str().unwrap()),
+            vec![],
+        )
+        .with_in_memory_memtables(
+            shard_id,
+            InMemoryMemTables {
+                active,
+                frozen: vec![],
+            },
+        );
+        let planner = LsmPointLookupPlanner::new(
+            collector,
+            vec!["scope".to_string(), "entry".to_string()],
+            base_schema,
+        )
+        .with_in_memory_visible_counts(HashMap::from([((shard_id, 1), captured_visible_count)]));
+
+        // These rows are appended after the snapshot boundary. They include a
+        // same-key update, a new key, and a tombstone for an old key. All must
+        // remain invisible to this planner, even though the live index now
+        // contains them.
+        let late = composite_batch(
+            &mem_schema,
+            &[
+                ("scan", "one", Some(11), false),
+                ("scan", "new", Some(2), false),
+                ("scan", "dead", None, true),
+            ],
+        );
+        let (batch_position, row_offset, _) = batch_store.append(late.clone()).unwrap();
+        index_store
+            .insert_with_batch_position(&late, row_offset, Some(batch_position))
+            .unwrap();
+        assert_eq!(index_store.visible_count(), 2);
+
+        let keys = vec![
+            vec![
+                ScalarValue::Utf8(Some("scan".to_string())),
+                ScalarValue::Utf8(Some("one".to_string())),
+            ],
+            vec![
+                ScalarValue::Utf8(Some("scan".to_string())),
+                ScalarValue::Utf8(Some("dead".to_string())),
+            ],
+            vec![
+                ScalarValue::Utf8(Some("scan".to_string())),
+                ScalarValue::Utf8(Some("new".to_string())),
+            ],
+        ];
+        let plan = planner.plan_point_lookup_tuples(&keys, None).await.unwrap();
+        let batches: Vec<RecordBatch> = plan
+            .execute(0, datafusion::prelude::SessionContext::new().task_ctx())
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let mut rows = batches
+            .iter()
+            .flat_map(composite_values)
+            .collect::<Vec<_>>();
+        rows.sort_by(|a, b| a.1.cmp(&b.1));
+        assert_eq!(
+            rows,
+            vec![
+                ("scan".to_string(), "dead".to_string(), Some(9)),
+                ("scan".to_string(), "one".to_string(), Some(1)),
+            ],
+            "direct composite probes must honor the captured batch watermark"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_plan_point_lookup_tuples_single_pk_respects_captured_visibility() {
+        use crate::dataset::mem_wal::scanner::collector::InMemoryMemTables;
+        use futures::TryStreamExt;
+
+        let schema = create_pk_schema();
+        let old = create_test_batch(&schema, &[1, 2], "old");
+        let active = active_memtable_ref(&schema, std::slice::from_ref(&old), 1);
+        let captured_visible_count = active.index_store.visible_count();
+        let batch_store = active.batch_store.clone();
+        let index_store = active.index_store.clone();
+        let temp = tempfile::tempdir().unwrap();
+        let shard_id = Uuid::new_v4();
+        let collector = LsmDataSourceCollector::without_base_table(
+            format!("{}/base", temp.path().to_str().unwrap()),
+            vec![],
+        )
+        .with_in_memory_memtables(
+            shard_id,
+            InMemoryMemTables {
+                active,
+                frozen: vec![],
+            },
+        );
+        let planner = LsmPointLookupPlanner::new(collector, vec!["id".to_string()], schema.clone())
+            .with_in_memory_visible_counts(HashMap::from([(
+                (shard_id, 1),
+                captured_visible_count,
+            )]));
+
+        let late = create_test_batch(&schema, &[1, 3], "new");
+        let (batch_position, row_offset, _) = batch_store.append(late.clone()).unwrap();
+        index_store
+            .insert_with_batch_position(&late, row_offset, Some(batch_position))
+            .unwrap();
+
+        let keys = vec![
+            vec![ScalarValue::Int32(Some(1))],
+            vec![ScalarValue::Int32(Some(2))],
+            vec![ScalarValue::Int32(Some(3))],
+        ];
+        let plan = planner.plan_point_lookup_tuples(&keys, None).await.unwrap();
+        let batches: Vec<RecordBatch> = plan
+            .execute(0, datafusion::prelude::SessionContext::new().task_ctx())
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let mut names = batches
+            .iter()
+            .flat_map(|batch| {
+                let values = batch
+                    .column_by_name("name")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                (0..values.len())
+                    .map(|row| values.value(row).to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["old_1".to_string(), "old_2".to_string()],
+            "single-PK lookup_many must honor the captured batch watermark"
+        );
     }
 
     #[tokio::test]
