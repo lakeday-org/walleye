@@ -1,0 +1,1 @@
+- #query-priority-cache: Added an optional pre-creation spill observer and a lease that outlives all temporary-file clones. Tests failed first on the missing hook and now verify reclamation failure prevents file creation and leases end only after physical deletion. All other DataFusion source is unchanged from the published 54.1.0 crate.

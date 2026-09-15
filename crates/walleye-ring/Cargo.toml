@@ -1,0 +1,12 @@
+[package]
+name = "walleye-ring"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+xxhash-rust.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

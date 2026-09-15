@@ -1,0 +1,25 @@
+[package]
+name = "walleye-workload"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+base64 = "0.22.1"
+walleye-lance.workspace = true
+walleye-cache.workspace = true
+walleye-bitr.workspace = true
+walleye-ring.workspace = true
+arrow-array.workspace = true
+arrow-schema.workspace = true
+lance-io = { version = "=11.0.0", default-features = false, features = ["aws"] }
+datafusion-execution = "=54.1.0"
+object_store.workspace = true
+futures.workspace = true
+tokio.workspace = true
+serde_json.workspace = true
+reqwest.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+hex.workspace = true
+uuid.workspace = true

@@ -1,0 +1,30 @@
+{
+  "node_id": "node-1",
+  "listen": "0.0.0.0:8080",
+  "directory": "/data/cache",
+  "memory_bytes": 134217728,
+  "disk_bytes": 536870912,
+  "bitr": true,
+  "members": [
+    {
+      "id": "node-1",
+      "endpoint": "http://node-1:8080",
+      "weight": 1.0
+    },
+    {
+      "id": "node-2",
+      "endpoint": "http://node-2:8080",
+      "weight": 1.0
+    },
+    {
+      "id": "node-3",
+      "endpoint": "http://node-3:8080",
+      "weight": 1.0
+    }
+  ],
+  "token": "acceptance-walleye-token",
+  "api": {
+    "root_uri": "s3://walleye-data/api",
+    "bitr_url": "http://127.0.0.1:30080"
+  }
+}

@@ -1,0 +1,62 @@
+[workspace]
+resolver = "2"
+members = ["crates/walleye-workload", "crates/walleye-node", "crates/walleye-ring", "crates/walleye-bitr", "crates/walleye-bitr-server", "crates/walleye-cache", "crates/walleye-lance"]
+exclude = ["vendor/lance", "vendor/datafusion-execution"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+repository = "https://github.com/lakeday-org/walleye"
+license-file = "LICENSE"
+publish = false
+
+[workspace.dependencies]
+arrow-array = "58"
+arrow-ipc = "58"
+arrow-schema = "58"
+uuid = { version = "1.18", features = ["serde", "v4", "v5", "v7"] }
+axum = "0.8.8"
+bytes = "1.12.0"
+async-trait = "0.1.89"
+foyer = "0.22.3"
+futures = "0.3.31"
+libc = "0.2.180"
+object_store = { version = "0.14.0", features = ["aws", "azure", "gcp"] }
+reqwest = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls", "rustls-tls-native-roots", "rustls-tls-webpki-roots", "blocking", "stream", "http2"] }
+serde = { version = "1.0.228", features = ["derive", "rc"] }
+serde_json = { version = "1.0.149", features = ["raw_value"] }
+sha2 = "0.10.9"
+hmac = "0.12.1"
+chacha20poly1305 = "0.10.1"
+hex = "0.4.3"
+tempfile = "3.20.0"
+thiserror = "2.0.18"
+chrono = "0.4.44"
+tokio = { version = "1.49.0", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+xxhash-rust = { version = "0.8.16", features = ["xxh3"] }
+tracing = "0.1.44"
+tower = { version = "^0.5" }
+walleye-ring = { path = "crates/walleye-ring" }
+walleye-bitr = { path = "crates/walleye-bitr" }
+walleye-cache = { path = "crates/walleye-cache" }
+walleye-lance = { path = "crates/walleye-lance" }
+walleye-bitr-server = { path = "crates/walleye-bitr-server" }
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
+
+[patch.crates-io]
+datafusion-execution = { path = "vendor/datafusion-execution" }
+foyer = { git = "https://github.com/lakeday-org/foyer", rev = "799c9768a0a5d0b92488bb1d5c0147ff8892d865" }
+
+[profile.dev]
+debug = 0
+
+[profile.dev.build-override]
+opt-level = 3
+
+[profile.release]
+debug = 0

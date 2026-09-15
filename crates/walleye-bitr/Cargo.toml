@@ -1,0 +1,25 @@
+[package]
+name = "walleye-bitr"
+description = "Durable Object client protocol for the cloud-owned replica quorum"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+publish.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+chacha20poly1305.workspace = true
+hmac.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+axum.workspace = true
+
+[lints]
+workspace = true

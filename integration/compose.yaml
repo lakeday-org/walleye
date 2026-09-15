@@ -1,0 +1,105 @@
+name: walleye-acceptance
+x-aws: &aws
+  AWS_ACCESS_KEY_ID: walleye-local
+  AWS_SECRET_ACCESS_KEY: walleye-local-secret
+  AWS_REGION: us-east-1
+  AWS_ENDPOINT: http://minio:9000
+  AWS_ALLOW_HTTP: "true"
+x-bitr: &bitr
+  <<: *aws
+  LAKEDAY_DATAPLANE_ROOT_KEY: "ERERERERERERERERERERERERERERERERERERERERERE="
+  WALLEYE_DATA_KEY: "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc="
+  LAKEDAY_REPLICA_INTERNAL_TOKEN: local-bitr-internal-token
+  LAKEDAY_REPLICA_TIER: local
+  LAKEDAY_REPLICA_MEMBERS: node-1=http://node-1:9090,node-2=http://node-2:9090,node-3=http://node-3:9090
+  LAKEDAY_REPLICA_QUORUM: "2"
+  LAKEDAY_REPLICA_ARCHIVE_BUCKET: walleye-archive
+  LAKEDAY_REPLICA_ARCHIVE_PREFIX: commits
+  LAKEDAY_REPLICA_ARCHIVE_BATCH_RECORDS: "1"
+x-node: &node
+  image: walleye:local
+  depends_on:
+    buckets:
+      condition: service_completed_successfully
+  healthcheck:
+    test: [CMD-SHELL, "curl -fsS http://localhost:8080/healthz && curl -fsS http://localhost:30080/healthz"]
+    interval: 2s
+    timeout: 2s
+    retries: 60
+  mem_limit: 2g
+  cpus: 2
+services:
+  minio:
+    image: quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z
+    command: server /data
+    environment:
+      MINIO_ROOT_USER: walleye-local
+      MINIO_ROOT_PASSWORD: walleye-local-secret
+    healthcheck:
+      test: [CMD, curl, -fsS, http://localhost:9000/minio/health/live]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    volumes: [s3-data:/data]
+    ports: ["127.0.0.1:19000:9000"]
+  buckets:
+    image: quay.io/minio/mc:RELEASE.2025-04-16T18-13-26Z
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: [/bin/sh, -ec]
+    command:
+      - mc alias set local http://minio:9000 walleye-local walleye-local-secret && mc mb --ignore-existing local/walleye-data local/walleye-archive
+  node-1:
+    <<: *node
+    environment:
+      <<: *bitr
+      LAKEDAY_REPLICA_NODE_NAME: node-1
+    volumes: ["node-1-data:/data", "./config/node-1.json:/etc/walleye/config.json:ro"]
+    ports: ["127.0.0.1:18081:8080", "127.0.0.1:18091:30080"]
+  node-2:
+    <<: *node
+    environment:
+      <<: *bitr
+      LAKEDAY_REPLICA_NODE_NAME: node-2
+    volumes: ["node-2-data:/data", "./config/node-2.json:/etc/walleye/config.json:ro"]
+    ports: ["127.0.0.1:18082:8080", "127.0.0.1:18092:30080"]
+  node-3:
+    <<: *node
+    environment:
+      <<: *bitr
+      LAKEDAY_REPLICA_NODE_NAME: node-3
+    volumes: ["node-3-data:/data", "./config/node-3.json:/etc/walleye/config.json:ro"]
+    ports: ["127.0.0.1:18083:8080", "127.0.0.1:18093:30080"]
+  single:
+    <<: *node
+    profiles: [workload]
+    environment:
+      <<: *aws
+    healthcheck:
+      test: [CMD, curl, -fsS, http://localhost:8080/healthz]
+      interval: 2s
+      timeout: 2s
+      retries: 60
+    volumes: ["single-data:/data", "./config/single.json:/etc/walleye/config.json:ro"]
+    ports: ["127.0.0.1:18084:8080"]
+  workload:
+    image: walleye:local
+    profiles: [workload]
+    entrypoint: [walleye-workload]
+    environment:
+      <<: *aws
+      WALLEYE_BUCKET: walleye-data
+      WALLEYE_ARCHIVE_BUCKET: walleye-archive
+      WALLEYE_RUN_ID: ${WALLEYE_RUN_ID:-local}
+      WALLEYE_CACHE_NODES: http://node-1:8080,http://node-2:8080,http://node-3:8080
+      WALLEYE_BITR_URL: http://node-1:30080
+      LAKEDAY_DATAPLANE_ROOT_KEY: "ERERERERERERERERERERERERERERERERERERERERERE="
+    mem_limit: 4g
+    cpus: 4
+volumes:
+  s3-data:
+  node-1-data:
+  node-2-data:
+  node-3-data:
+  single-data:

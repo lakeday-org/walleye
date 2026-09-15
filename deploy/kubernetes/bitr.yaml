@@ -1,0 +1,79 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: walleye-bitr
+spec:
+  serviceName: walleye-bitr
+  replicas: 3
+  podManagementPolicy: Parallel
+  persistentVolumeClaimRetentionPolicy: {whenDeleted: Retain, whenScaled: Retain}
+  selector:
+    matchLabels: {app: walleye-bitr}
+  template:
+    metadata:
+      labels: {app: walleye-bitr}
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 60
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels: {app: walleye-bitr}
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: bitr
+          image: walleye:local
+          imagePullPolicy: IfNotPresent
+          command: [/bin/sh, -ec]
+          args:
+            - |
+              members=""
+              for ordinal in 0 1 2; do
+                members="${members}${members:+,}walleye-bitr-${ordinal}=http://walleye-bitr-${ordinal}.walleye-bitr.${POD_NAMESPACE}.svc:9090"
+              done
+              export LAKEDAY_REPLICA_MEMBERS="$members"
+              exec walleye-bitr-server
+          envFrom:
+            - configMapRef: {name: walleye-config}
+            - secretRef: {name: walleye-secrets}
+          env:
+            - name: LAKEDAY_REPLICA_NODE_NAME
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+            - name: POD_NAMESPACE
+              valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
+            - {name: LAKEDAY_REPLICA_TIER, value: kubernetes}
+            - {name: LAKEDAY_REPLICA_QUORUM, value: "2"}
+          ports:
+            - {name: replica, containerPort: 9090}
+            - {name: gateway, containerPort: 30080}
+          resources:
+            requests: {cpu: 500m, memory: 512Mi}
+            limits: {cpu: "2", memory: 2Gi}
+          startupProbe:
+            httpGet: {path: /healthz, port: gateway}
+            periodSeconds: 2
+            failureThreshold: 60
+          readinessProbe:
+            httpGet: {path: /readyz, port: gateway}
+            periodSeconds: 2
+          livenessProbe:
+            httpGet: {path: /healthz, port: gateway}
+            periodSeconds: 10
+          volumeMounts:
+            - {name: wal, mountPath: /data}
+  volumeClaimTemplates:
+    - metadata: {name: wal}
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests: {storage: 10Gi}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: walleye-bitr
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels: {app: walleye-bitr}

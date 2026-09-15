@@ -1,0 +1,25 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: walleye
+images:
+  - name: walleye
+    newName: walleye
+    newTag: local
+resources:
+  - namespace.yaml
+  - discovery.yaml
+  - services.yaml
+  - bitr.yaml
+  - cache.yaml
+configMapGenerator:
+  - name: walleye-config
+    literals:
+      - AWS_REGION=us-east-1
+      - AWS_ENDPOINT=https://s3.us-east-1.amazonaws.com
+      - AWS_ALLOW_HTTP=false
+      - WALLEYE_ROOT_URI=s3://REPLACE_DATA_BUCKET/walleye
+      - LAKEDAY_REPLICA_ARCHIVE_BUCKET=REPLACE_ARCHIVE_BUCKET
+      - LAKEDAY_REPLICA_ARCHIVE_PREFIX=commits
+      - LAKEDAY_REPLICA_ARCHIVE_BATCH_RECORDS=16
+      - WALLEYE_CACHE_MEMORY_BYTES=268435456
+      - WALLEYE_CACHE_DISK_BYTES=1073741824

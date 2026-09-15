@@ -1,0 +1,28 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: walleye
+resources:
+  - ../../deploy/kubernetes
+  - s3.yaml
+configMapGenerator:
+  - name: walleye-config
+    behavior: replace
+    literals:
+      - AWS_REGION=us-east-1
+      - AWS_ENDPOINT=http://minio:9000
+      - AWS_ALLOW_HTTP=true
+      - WALLEYE_ROOT_URI=s3://walleye-data/api
+      - LAKEDAY_REPLICA_ARCHIVE_BUCKET=walleye-archive
+      - LAKEDAY_REPLICA_ARCHIVE_PREFIX=commits
+      - LAKEDAY_REPLICA_ARCHIVE_BATCH_RECORDS=1
+      - WALLEYE_CACHE_MEMORY_BYTES=134217728
+      - WALLEYE_CACHE_DISK_BYTES=536870912
+secretGenerator:
+  - name: walleye-secrets
+    literals:
+      - AWS_ACCESS_KEY_ID=walleye-local
+      - AWS_SECRET_ACCESS_KEY=walleye-local-secret
+      - WALLEYE_TOKEN=acceptance-walleye-token
+      - LAKEDAY_DATAPLANE_ROOT_KEY=ERERERERERERERERERERERERERERERERERERERERERE=
+      - LAKEDAY_REPLICA_INTERNAL_TOKEN=local-bitr-internal-token
+      - WALLEYE_DATA_KEY=BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=

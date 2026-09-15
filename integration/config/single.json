@@ -1,0 +1,11 @@
+{
+  "node_id": "single",
+  "listen": "0.0.0.0:8080",
+  "directory": "/data/cache",
+  "memory_bytes": 134217728,
+  "disk_bytes": 536870912,
+  "bitr": false,
+  "members": [{"id":"single", "endpoint":"http://single:8080", "weight":1.0}],
+  "token": "acceptance-walleye-token",
+  "api": {"root_uri":"s3://walleye-data/api-single"}
+}
