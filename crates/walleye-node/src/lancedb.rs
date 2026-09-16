@@ -328,6 +328,15 @@ async fn query(
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0) as u32,
             metric,
+            // The SDK sends null unless the caller set ef. A single large
+            // graph needs a wider beam than Lance's default to keep recall.
+            ef: Some(
+                body.get("ef")
+                    .and_then(|v| v.as_u64())
+                    .map(|e| e as usize)
+                    .unwrap_or(100)
+                    .max(k),
+            ),
         });
         // The nearest-neighbor plan applies k; a separate limit would double-apply.
         request.limit = None;

@@ -217,6 +217,7 @@ impl LsmVectorSearchPlanner {
         query_vector: &FixedSizeListArray,
         k: usize,
         nprobes: usize,
+        ef: Option<usize>,
         projection: Option<&[String]>,
         refine_base_table: bool,
         overfetch_factor: f64,
@@ -294,8 +295,9 @@ impl LsmVectorSearchPlanner {
                     query_vector,
                     *fetch_k,
                     nprobes,
+                    ef,
                     projection,
-                    *is_base && refine_base,
+                    (*is_base && refine_base) || (!*is_base && refine_base_table),
                 ))
             },
         ))
@@ -417,6 +419,7 @@ impl LsmVectorSearchPlanner {
         query_vector: &FixedSizeListArray,
         k: usize,
         nprobes: usize,
+        ef: Option<usize>,
         projection: Option<&[String]>,
         refine: bool,
     ) -> Result<Arc<dyn ExecutionPlan>> {
@@ -445,6 +448,9 @@ impl LsmVectorSearchPlanner {
                 let query_arr = single_query_array(query_vector);
                 scanner.nearest(&self.vector_column, query_arr.as_ref(), k)?;
                 scanner.nprobes(nprobes);
+                if let Some(ef) = ef {
+                    scanner.ef(ef);
+                }
                 scanner.distance_metric(self.distance_type);
                 // Memtables cover unindexed rows; only search indexed data here.
                 scanner.fast_search();
@@ -478,6 +484,14 @@ impl LsmVectorSearchPlanner {
                 let query_arr = single_query_array(query_vector);
                 scanner.nearest(&self.vector_column, query_arr.as_ref(), k)?;
                 scanner.nprobes(nprobes);
+                if let Some(ef) = ef {
+                    scanner.ef(ef);
+                }
+                if refine {
+                    // SQ codes rank approximately; re-rank this arm's
+                    // candidates with exact distances before the merge.
+                    scanner.refine(1);
+                }
                 scanner.distance_metric(self.distance_type);
                 scanner.fast_search();
                 scanner.create_plan().await

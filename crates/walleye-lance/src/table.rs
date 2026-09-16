@@ -62,6 +62,8 @@ pub struct VectorQuery {
     pub nprobes: usize,
     pub refine_factor: u32,
     pub metric: Option<String>,
+    /// HNSW search beam width on indexed generations.
+    pub ef: Option<usize>,
 }
 fn parse_metric(metric: Option<&str>) -> lance::Result<DistanceType> {
     match metric {
@@ -692,6 +694,9 @@ impl crate::sql::SnapshotPlanSource for CapturedSnapshot {
                 .nprobes(query.nprobes.max(1))
                 .refine(query.refine_factor)
                 .distance_metric(parse_metric(query.metric.as_deref())?);
+            if let Some(ef) = query.ef {
+                scanner = scanner.ef(ef);
+            }
         }
         scanner.create_plan().await
     }
