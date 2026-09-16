@@ -150,6 +150,21 @@ impl TableConfig {
             vector_indexes: Vec::new(),
         })
     }
+    /// Smallest possible encoded row: fixed-width columns at their width,
+    /// variable-width ones at one byte. Used to bound rows per memtable.
+    pub fn min_row_bytes(&self) -> usize {
+        self.schema
+            .fields()
+            .iter()
+            .map(|f| match f.data_type() {
+                arrow_schema::DataType::FixedSizeList(inner, dim) => {
+                    *dim as usize * inner.data_type().primitive_width().unwrap_or(1)
+                }
+                other => other.primitive_width().unwrap_or(1),
+            })
+            .sum::<usize>()
+            .max(1)
+    }
     pub fn with_vector_indexes(mut self, specs: Vec<VectorIndexSpec>) -> lance::Result<Self> {
         for spec in &specs {
             let field = self
@@ -234,6 +249,12 @@ fn open_error_kind(error: &lance::Error) -> &'static str {
 }
 
 impl Table {
+    /// Upper bound on one memtable's bytes.
+    pub const MEMTABLE_BYTES: usize = 16 * 1024 * 1024;
+    /// Row capacity of a memtable's in-memory vector graph.
+    pub const MEMTABLE_ROWS: usize = 100_000;
+    /// Largest single put; see `open` for why it is half the row capacity.
+    pub const PUT_ROWS: usize = 50_000;
     pub async fn open(
         config: TableConfig,
         storage: LanceStorageOptions,
@@ -333,10 +354,15 @@ impl Table {
                 }
             }
         }
+        // The memtable's in-memory vector graph is sized for MEMTABLE_ROWS
+        // rows and a put is never split across memtables, so appends are
+        // chunked to PUT_ROWS rows and the writer freezes a memtable once it
+        // holds half its row capacity. A memtable never exceeds MEMTABLE_ROWS.
         let mut writer_config = ShardWriterConfig::new(config.shard_id)
             .with_durable_write(true)
             .with_max_wal_flush_interval(Duration::from_millis(10))
-            .with_max_memtable_size(16 * 1024 * 1024)
+            .with_max_memtable_size(Self::MEMTABLE_BYTES)
+            .with_max_memtable_rows(Self::MEMTABLE_ROWS)
             .with_max_unflushed_memtable_bytes(32 * 1024 * 1024);
         if let LanceDurability::Bitr(backend) = &durability {
             if backend.stream() != config.stream
@@ -407,9 +433,17 @@ impl Table {
         })
     }
     /// Acknowledge only after the configured WAL authority accepts the Arrow IPC entry.
+    /// Batches are put in slices of at most [`Self::PUT_ROWS`] rows, each its
+    /// own WAL entry, so a large insert can roll across memtables.
     pub async fn append(&mut self, batches: Vec<RecordBatch>) -> lance::Result<()> {
         let mut owned = Vec::new();
-        for b in batches {
+        for b in batches.into_iter().flat_map(|b| {
+            let rows = b.num_rows();
+            (0..rows.max(1))
+                .step_by(Self::PUT_ROWS)
+                .map(move |start| b.slice(start, (rows - start).min(Self::PUT_ROWS)))
+                .collect::<Vec<_>>()
+        }) {
             if !same_fields(b.schema().as_ref(), &self.config.schema)
                 || b.columns()
                     .iter()
@@ -429,7 +463,9 @@ impl Table {
                     .map_err(|e| lance::Error::invalid_input(e.to_string()))?,
             );
         }
-        self.writer.put(owned).await?;
+        for batch in owned {
+            self.writer.put(vec![batch]).await?;
+        }
         Ok(())
     }
     /// Read one stable snapshot spanning base data, flushed generations, and the active log tail.

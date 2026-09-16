@@ -23,7 +23,7 @@ fn config(path: &std::path::Path) -> Config {
         node_id: "n".into(),
         listen: "127.0.0.1:0".into(),
         directory: path.join("cache"),
-        memory_bytes: 32 * 1024 * 1024,
+        memory_bytes: 1024 * 1024 * 1024,
         disk_bytes: 64 * 1024 * 1024,
         token: TOKEN.into(),
         bitr: false,

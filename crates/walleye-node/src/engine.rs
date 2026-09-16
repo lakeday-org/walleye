@@ -258,6 +258,10 @@ struct Stream {
     definition: StreamDefinition,
     config: TableConfig,
     storage: LanceStorageOptions,
+    resources: Arc<walleye_cache::QueryResources>,
+    /// Memory held for this stream's memtables and memtable indexes while
+    /// its writer is open.
+    lease: Mutex<Option<walleye_cache::MemoryLease>>,
     /// Bitr quorum writer in cluster mode; the WAL backend is minted per open
     /// so its epoch matches the MemWAL claim.
     bitr: Option<Arc<QuorumWriter>>,
@@ -269,6 +273,24 @@ struct Stream {
     last_compaction: Mutex<Option<Instant>>,
 }
 impl Stream {
+    /// Bytes this stream's writer may hold in memory: the memtable size and
+    /// unflushed bound the table is opened with, plus every vector index's
+    /// graph and storage at the memtable's row capacity.
+    fn memory_footprint(&self) -> usize {
+        const MEMTABLE_BYTES: usize = 16 * 1024 * 1024 + 32 * 1024 * 1024;
+        const MEMTABLE_ROWS: usize = 100_000;
+        let vectors: usize = self
+            .config
+            .vector_indexes
+            .iter()
+            .filter_map(|spec| self.config.schema.field_with_name(&spec.column).ok())
+            .map(|field| match field.data_type() {
+                DataType::FixedSizeList(_, dim) => MEMTABLE_ROWS * (*dim as usize * 4 + 128),
+                _ => 0,
+            })
+            .sum();
+        MEMTABLE_BYTES + vectors
+    }
     async fn table(&self) -> Result<MappedMutexGuard<'_, Table>, Error> {
         let mut table = self.table.lock().await;
         if table.is_none() {
@@ -303,6 +325,14 @@ impl Stream {
                 }
                 None => LanceDurability::ObjectStore,
             };
+            // Fail closed before opening: a writer we cannot afford must not
+            // exist. Memtable plus unflushed bound, plus the in-memory vector
+            // graph sized for the memtable's row capacity.
+            let lease = self.resources.reserve_memory(
+                &format!("table {}", self.definition.name),
+                self.memory_footprint(),
+            )?;
+            *self.lease.lock().await = Some(lease);
             *table =
                 Some(Table::open(self.config.clone(), self.storage.clone(), durability).await?);
         }
@@ -406,6 +436,8 @@ impl Engine {
                 table: Mutex::new(None),
                 version: AtomicU64::new(1),
                 compacting: std::sync::atomic::AtomicBool::new(false),
+                resources: self.cache.resources.clone(),
+                lease: Mutex::new(None),
                 last_compaction: Mutex::new(None),
             })
         });
@@ -419,6 +451,11 @@ impl Engine {
     pub fn cluster(&self) -> Option<&Cluster> {
         self.cluster.as_ref()
     }
+    /// The one memory and disk budget every allocation in this process
+    /// borrows from.
+    pub fn resources(&self) -> &Arc<walleye_cache::QueryResources> {
+        &self.cache.resources
+    }
     /// A stream this node may write: its definition, after confirming
     /// ownership. A stream that moved to another member has its local writer
     /// closed so the new owner's epoch claim is the only live writer.
@@ -429,6 +466,7 @@ impl Engine {
                 let _ = table.checkpoint().await;
                 let _ = table.close().await;
             }
+            *stream.lease.lock().await = None;
             return Err(Box::new(NotOwner(owner)));
         }
         Ok(stream)
@@ -931,9 +969,39 @@ async fn compact_stream(
     min_sstables: usize,
     query_timeout: std::time::Duration,
 ) -> Result<Option<CompactionResult>, Error> {
-    let compactor = stream.table().await?.compactor();
+    let (compactor, stats) = {
+        let table = stream.table().await?;
+        (table.compactor(), table.lsm_stats().await?)
+    };
     let Some(compactor) = compactor else {
         return Ok(None);
+    };
+    // Merged rows plus the rebuilt vector index pass through memory once.
+    let rows: usize = stats.sstables.iter().map(|s| s.rows as usize).sum();
+    let row_bytes: usize = stream
+        .config
+        .schema
+        .fields()
+        .iter()
+        .map(|f| match f.data_type() {
+            DataType::FixedSizeList(_, dim) => *dim as usize * 4 * 2,
+            DataType::Utf8 => 64,
+            _ => 8,
+        })
+        .sum::<usize>()
+        + 64;
+    let _lease = match stream.resources.reserve_memory(
+        &format!("compaction of {}", stream.definition.name),
+        rows * row_bytes,
+    ) {
+        Ok(lease) => lease,
+        Err(error) => {
+            eprintln!(
+                "walleye.storage compaction stream={} outcome=deferred error={error}",
+                stream.definition.name
+            );
+            return Ok(None);
+        }
     };
     let started = Instant::now();
     let Some(result) = compactor.compact(min_sstables).await? else {
@@ -1137,7 +1205,7 @@ mod tests {
         let cache = CachedStorage::open(
             dir.join(cache_id),
             "test",
-            32 * 1024 * 1024,
+            1024 * 1024 * 1024,
             64 * 1024 * 1024,
             ObjectStoreParams::default(),
             None,

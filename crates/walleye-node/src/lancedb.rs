@@ -61,6 +61,17 @@ fn bad(message: impl Into<String>) -> Response {
 fn engine<'a>(s: &'a Service, h: &HeaderMap) -> Result<&'a engine::Engine, Response> {
     api(s, h).map_err(|(status, body)| (status, body).into_response())
 }
+/// An inbound Arrow body is held raw and decoded at once; reserve both before
+/// decoding so an oversize insert is refused instead of exceeding the budget.
+fn body_lease(
+    engine: &engine::Engine,
+    body: &Bytes,
+) -> Result<walleye_cache::MemoryLease, Response> {
+    engine
+        .resources()
+        .reserve_memory("request body", body.len().saturating_mul(2))
+        .map_err(|e| (StatusCode::PAYLOAD_TOO_LARGE, e.to_string()).into_response())
+}
 fn read_ipc(body: &Bytes) -> Result<(Arc<Schema>, Vec<RecordBatch>), Response> {
     let reader = arrow_ipc::reader::StreamReader::try_new(Cursor::new(body.as_ref()), None)
         .map_err(|e| bad(format!("invalid Arrow IPC stream: {e}")))?;
@@ -125,6 +136,7 @@ async fn create(
     body: Bytes,
 ) -> Reply {
     let engine = engine(&s, &h)?;
+    let _lease = body_lease(engine, &body)?;
     let (schema, batches) = read_ipc(&body)?;
     let definition =
         engine::StreamDefinition::from_arrow(&name, &schema).map_err(|e| error(e.as_ref()))?;
@@ -189,6 +201,7 @@ async fn insert(
             "insert mode=overwrite is not supported; drop and recreate the table",
         ));
     }
+    let _lease = body_lease(engine, &body)?;
     let (_, batches) = read_ipc(&body)?;
     let mut revision = s.revision.lock().await;
     *revision = format!("\"{}\"", uuid::Uuid::new_v4());

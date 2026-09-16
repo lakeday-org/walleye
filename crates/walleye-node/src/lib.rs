@@ -131,6 +131,61 @@ impl Config {
         })
     }
 }
+/// Fixed reservations the engine keeps out of the budgets. Set the budgets to
+/// the machine's memory and the volume's size; nothing else is held back.
+pub struct Budget {
+    /// Memory the cache may use at rest.
+    pub cache_memory: usize,
+    /// Disk the cache may use at rest.
+    pub cache_disk: usize,
+    /// Cap on the Bitr node log, handed to the embedded daemon.
+    pub bitr_log_max: usize,
+}
+impl Budget {
+    /// Binary, tokio, connection buffers, allocator slack.
+    pub const RUNTIME_MEMORY_FLOOR: usize = 256 * 1024 * 1024;
+    /// In-flight replication buffers of the embedded Bitr daemon.
+    pub const BITR_MEMORY_RESERVE: usize = 128 * 1024 * 1024;
+    /// Filesystem metadata, journal, and the cache's own bookkeeping.
+    pub const FILESYSTEM_DISK_FLOOR: usize = 512 * 1024 * 1024;
+    pub fn for_config(config: &Config) -> Self {
+        // Below 512 MiB (test configurations) the floor scales down rather
+        // than swallowing the whole budget.
+        let memory_floor = Self::RUNTIME_MEMORY_FLOOR.min(config.memory_bytes / 2)
+            + if config.bitr {
+                Self::BITR_MEMORY_RESERVE.min(config.memory_bytes / 8)
+            } else {
+                0
+            };
+        let disk_floor = Self::FILESYSTEM_DISK_FLOOR.min(config.disk_bytes / 2);
+        let cache_disk = config.disk_bytes.saturating_sub(disk_floor);
+        Self {
+            cache_memory: config.memory_bytes.saturating_sub(memory_floor).max(1),
+            cache_disk,
+            // The log may take the whole disk budget while the cache is
+            // squeezed down to its working floor.
+            bitr_log_max: cache_disk,
+        }
+    }
+}
+fn directory_bytes(dir: &str) -> usize {
+    fn walk(path: &std::path::Path, total: &mut usize) {
+        let Ok(entries) = std::fs::read_dir(path) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let Ok(meta) = entry.metadata() else { continue };
+            if meta.is_dir() {
+                walk(&entry.path(), total);
+            } else {
+                *total += meta.len() as usize;
+            }
+        }
+    }
+    let mut total = 0;
+    walk(std::path::Path::new(dir), &mut total);
+    total
+}
 pub struct Service {
     pub config: Config,
     pub cache: Arc<LanceFoyerCacheBackend>,
@@ -155,11 +210,24 @@ impl Service {
         {
             return Err("invalid deployment token or node membership".into());
         }
+        // WALLEYE_RAM_GB and WALLEYE_NVME_GB are whole-process budgets. The
+        // cache takes what is left after the fixed floors; everything else
+        // that allocates (memtables, request bodies, index builds, queries,
+        // the Bitr log) borrows from the cache through the governor.
+        let budget = Budget::for_config(&config);
+        let log_max = std::env::var("LAKEDAY_REPLICA_LOG_MAX_BYTES")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| budget.bitr_log_max.to_string());
+        // SAFETY: runs during startup, before the cache, the S3 client, and
+        // the embedded Bitr daemon exist; nothing else reads the environment
+        // concurrently at this point.
+        unsafe { std::env::set_var("LAKEDAY_REPLICA_LOG_MAX_BYTES", log_max) };
         let cache = Arc::new(
             LanceFoyerCacheBackend::new(
                 &config.directory,
-                config.memory_bytes,
-                config.disk_bytes,
+                budget.cache_memory,
+                budget.cache_disk,
                 "walleye",
             )
             .await?,
@@ -207,6 +275,29 @@ impl Service {
             changed: tokio::sync::Notify::new(),
             quiescing: AtomicBool::new(false),
         });
+        if let Some(engine) = &service.engine
+            && service.config.bitr
+        {
+            // The Bitr log lives beside the cache file; report its size so the
+            // cache's disk ceiling tracks it.
+            let resources = engine.resources().clone();
+            let data_dir = std::env::var("LAKEDAY_REPLICA_DATA_DIR")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .unwrap_or_else(|| "/data".into());
+            tokio::spawn(async move {
+                loop {
+                    let dir = data_dir.clone();
+                    let used = tokio::task::spawn_blocking(move || directory_bytes(&dir))
+                        .await
+                        .unwrap_or(0);
+                    if let Err(error) = resources.set_disk_usage("bitr", used).await {
+                        eprintln!("walleye.budget stage=disk_sample outcome=error error={error}");
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                }
+            });
+        }
         // Serve immediately; owned streams open and warm in the background so
         // the first request does not pay for it.
         let warming = service.clone();
@@ -345,8 +436,18 @@ async fn stats(
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     authorize(&s, &headers)?;
+    let budget = s.engine.as_ref().map(|e| {
+        let r = e.resources();
+        serde_json::json!({
+            "memory_budget": r.memory_budget(),
+            "memory_reserved": r.memory_reserved(),
+            "memory_available": r.memory_available(),
+            "disk_budget": r.disk_budget(),
+            "disk_used_elsewhere": r.disk_used_elsewhere(),
+        })
+    });
     Ok(Json(
-        serde_json::json!({"node":s.config.node_id,"members":s.ring.snapshot().members(),"membership_epoch":s.ring.snapshot().epoch(),"hits":s.hits.load(Ordering::Relaxed),"misses":s.misses.load(Ordering::Relaxed),"stores":s.stores.load(Ordering::Relaxed),"entries":s.cache.num_entries().await,"memory_usage":s.cache.memory_usage(),"memory_capacity":s.cache.memory_capacity(),"disk_capacity":s.cache.persistent_capacity()}),
+        serde_json::json!({"node":s.config.node_id,"members":s.ring.snapshot().members(),"membership_epoch":s.ring.snapshot().epoch(),"hits":s.hits.load(Ordering::Relaxed),"misses":s.misses.load(Ordering::Relaxed),"stores":s.stores.load(Ordering::Relaxed),"entries":s.cache.num_entries().await,"memory_usage":s.cache.memory_usage(),"memory_capacity":s.cache.memory_capacity(),"disk_capacity":s.cache.persistent_capacity(),"budget":budget}),
     ))
 }
 async fn flush(

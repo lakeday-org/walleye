@@ -3001,6 +3001,10 @@ impl VerifiedMaintenanceToken {
 pub struct DiskReplica {
     state: Mutex<DiskState>,
     log_path: PathBuf,
+    /// Upper bound on the node log file, from `LAKEDAY_REPLICA_LOG_MAX_BYTES`.
+    /// An append that would cross it is refused so the volume never fills;
+    /// the archive loop drains the log and frees room again.
+    log_max_bytes: Option<u64>,
     data_dir: PathBuf,
     maintenance_path: PathBuf,
     node_name: String,
@@ -3325,6 +3329,10 @@ impl DiskReplica {
                 maintenance,
             }),
             log_path: path.to_owned(),
+            log_max_bytes: std::env::var("LAKEDAY_REPLICA_LOG_MAX_BYTES")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .filter(|v| *v > 0),
             data_dir,
             maintenance_path,
             node_name,
@@ -4097,6 +4105,19 @@ impl DiskReplica {
         }
         let encoded = serde_json::to_vec(&record)
             .map_err(|error| ReplicaError::NodeStorage(error.to_string()))?;
+        if let Some(cap) = self.log_max_bytes {
+            let current = state
+                .file
+                .metadata()
+                .map(|meta| meta.len())
+                .map_err(|error| ReplicaError::NodeStorage(error.to_string()))?;
+            if current.saturating_add(encoded.len() as u64 + 1) > cap {
+                return Err(ReplicaError::NodeStorage(format!(
+                    "node log budget exhausted: {current} bytes used of {cap}; waiting for the \
+                     archive to drain"
+                )));
+            }
+        }
         state
             .file
             .write_all(&encoded)

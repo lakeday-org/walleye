@@ -70,7 +70,7 @@ async fn start(root: &std::path::Path, count: usize) -> Vec<Member> {
             node_id: id.clone(),
             listen: base.clone(),
             directory: root.join("cache").join(&id),
-            memory_bytes: 32 * 1024 * 1024,
+            memory_bytes: 1024 * 1024 * 1024,
             disk_bytes: 64 * 1024 * 1024,
             token: TOKEN.into(),
             bitr: false,

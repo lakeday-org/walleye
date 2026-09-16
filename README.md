@@ -64,6 +64,19 @@ and prints it on startup. Everything else has a default:
 | `WALLEYE_BITR_URL` | none | Bitr gateway; setting it enables cluster mode |
 | `WALLEYE_TRACE_ORIGIN` | unset | Log every request that reaches object storage |
 
+**Budgets.** `WALLEYE_RAM_GB` and `WALLEYE_NVME_GB` are the whole process
+and the whole volume: set them to the machine's memory and the volume's size.
+The node keeps fixed floors out of them and gives the cache the rest, then
+everything else that allocates borrows from the cache through one governor
+and gives it back: each open table's memtables and in-memory vector graph,
+every inbound Arrow body while it is decoded, each compaction's merged rows
+and rebuilt index, every query, and the Bitr log on disk. An allocation the
+budget cannot cover is refused with a clear error rather than exceeded: an
+oversize insert gets a 413, a table that does not fit fails to open, and a
+Bitr append past the disk budget is rejected until the archive drains the
+log. The floors are 256 MiB of memory for the runtime, 128 MiB more when
+Bitr is enabled, and 512 MiB of disk for the filesystem.
+
 `WALLEYE_ROOT_URI` accepts a full `s3://` or `file://` URI in place of
 `WALLEYE_BUCKET`. `WALLEYE_CONFIG` points at a JSON file for deployments that
 need the full config struct.
