@@ -51,7 +51,7 @@ use lance_index::scalar::inverted::query::{FtsQuery as IndexFtsQuery, Operator};
 use lance_index::scalar::inverted::{DOC_INDEX_COL, DOC_INDEX_FIELD, DocumentGranularity};
 use tracing::instrument;
 
-use super::block_list::compute_source_block_lists;
+use super::block_list::compute_source_block_lists_with_pk_columns;
 use super::collector::LsmDataSourceCollector;
 use super::data_source::LsmDataSource;
 use super::exec::PkBlockFilterExec;
@@ -423,11 +423,12 @@ impl LsmFtsSearchPlanner {
         // shard; base = union of all gens). Query-type-agnostic — same call the
         // vector planner makes. `Box::pin` keeps the future off
         // `clippy::large_futures`.
-        let block_lists = Box::pin(compute_source_block_lists(
+        let block_lists = Box::pin(compute_source_block_lists_with_pk_columns(
             &sources,
             self.session.as_ref(),
             self.store_params.as_ref(),
             self.sstable_cache.as_ref(),
+            &self.pk_columns,
         ))
         .await?;
 
