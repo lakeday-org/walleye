@@ -44,14 +44,12 @@ pub fn config_from_env() -> Result<Config, Box<dyn std::error::Error>> {
         "http://{}.{}.{}.svc:8080",
         node_id, discovery.service, discovery.namespace
     );
-    let api = if node_id == format!("{}-0", discovery.service) {
-        Some(ApiConfig {
-            root_uri: std::env::var("WALLEYE_ROOT_URI")?,
-            bitr_url: Some(std::env::var("WALLEYE_BITR_URL")?),
-        })
-    } else {
-        None
-    };
+    // Every pod serves the API; stream ownership is decided per stream on
+    // the ring, so no pod ordinal is special.
+    let api = Some(ApiConfig {
+        root_uri: std::env::var("WALLEYE_ROOT_URI")?,
+        bitr_url: Some(std::env::var("WALLEYE_BITR_URL")?),
+    });
     Ok(Config {
         node_id: node_id.clone(),
         listen: "0.0.0.0:8080".into(),

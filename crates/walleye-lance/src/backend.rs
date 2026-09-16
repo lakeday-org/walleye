@@ -202,6 +202,13 @@ impl BitrWalBackend {
         self.shard_id
     }
 
+    /// The quorum writer this backend appends through, so a reopen can mint
+    /// a backend at the next writer epoch over the same replicas.
+    #[must_use]
+    pub fn writer(&self) -> Arc<QuorumWriter> {
+        self.writer.clone()
+    }
+
     /// Returns the Bitr stream key.
     #[must_use]
     pub fn stream(&self) -> &str {

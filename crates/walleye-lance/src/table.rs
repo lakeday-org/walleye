@@ -372,6 +372,21 @@ impl Table {
                 return Err(error);
             }
         };
+        if let LanceDurability::Bitr(backend) = &durability
+            && backend.writer_epoch() != writer.epoch()
+        {
+            // The Bitr identity was minted from the manifest before the claim;
+            // a concurrent claimant moved the epoch in between. Refuse rather
+            // than write under an epoch Bitr would not fence correctly.
+            let claimed = writer.epoch();
+            let _ = writer.close().await;
+            return Err(lance::Error::io(format!(
+                "Bitr epoch {} does not match the claimed writer epoch {}; another node \
+                 claimed the stream during open, retry",
+                backend.writer_epoch(),
+                claimed
+            )));
+        }
         Ok(Self {
             config,
             dataset: Arc::new(dataset),
@@ -516,6 +531,10 @@ impl Table {
     }
     pub fn config(&self) -> &TableConfig {
         &self.config
+    }
+    /// The MemWAL writer epoch this table claimed when it opened.
+    pub fn writer_epoch(&self) -> u64 {
+        self.writer.epoch()
     }
     /// A handle for merging flushed generations that outlives the caller's
     /// lock on this table.
@@ -704,4 +723,29 @@ fn same_fields(left: &Schema, right: &Schema) -> bool {
             .iter()
             .zip(right.fields())
             .all(|(a, b)| a.name() == b.name() && a.data_type() == b.data_type())
+}
+
+/// The epoch the next `Table::open` will claim for this shard: one past the
+/// manifest's current writer epoch, or 1 for a shard that has never been
+/// opened. A Bitr backend built with this epoch is fenced exactly like the
+/// MemWAL writer it accompanies.
+pub async fn next_writer_epoch(
+    storage: &LanceStorageOptions,
+    uri: &str,
+    shard_id: Uuid,
+) -> lance::Result<u64> {
+    use lance::dataset::mem_wal::ShardManifestStore;
+    let dataset = match storage.open_dataset(uri).await {
+        Ok(dataset) => dataset,
+        Err(lance::Error::DatasetNotFound { .. }) => return Ok(1),
+        Err(error) => return Err(error),
+    };
+    let object_store = dataset.object_store(None).await?;
+    let base_path = dataset.branch_location().path;
+    let store = ShardManifestStore::new(object_store, &base_path, shard_id, 64);
+    Ok(store
+        .read_latest()
+        .await?
+        .map(|m| m.writer_epoch + 1)
+        .unwrap_or(1))
 }

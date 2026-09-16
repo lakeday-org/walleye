@@ -46,6 +46,8 @@ type Reply = Result<Response, Response>;
 fn error(e: &(dyn std::error::Error + 'static)) -> Response {
     let status = if e.downcast_ref::<engine::TableNotFound>().is_some() {
         StatusCode::NOT_FOUND
+    } else if e.downcast_ref::<crate::cluster::NotOwner>().is_some() {
+        StatusCode::CONFLICT
     } else {
         StatusCode::BAD_REQUEST
     };

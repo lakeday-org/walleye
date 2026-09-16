@@ -298,3 +298,21 @@ impl ExecutionPlan for SnapshotExec {
         self.0.execute(partition, context)
     }
 }
+
+/// Table names a SQL statement reads, for routing a query to the node that
+/// owns them. Names are returned as written (case preserved, unqualified).
+pub fn sql_table_names(sql: &str) -> lance::Result<Vec<String>> {
+    use lance::deps::datafusion::sql::{parser::DFParser, resolve::resolve_table_references};
+    let statements = DFParser::parse_sql(sql).map_err(err)?;
+    let mut names = Vec::new();
+    for statement in &statements {
+        let (tables, _ctes) = resolve_table_references(statement, true).map_err(err)?;
+        for table in tables {
+            let name = table.table().to_string();
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+    }
+    Ok(names)
+}

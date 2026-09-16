@@ -1,5 +1,6 @@
 //! One deployment's stream registry. Definitions use object-store create-if-absent;
 //! one designated ingress owns a separately locked memshard for each stream.
+use crate::cluster::{Cluster, NotOwner};
 use arrow_array::{Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use base64::Engine as _;
@@ -24,6 +25,7 @@ use walleye_lance::{
     LanceStorageOptions, LsmStats, SearchRequest, SnapshotSource, Table, TableConfig,
     TableSnapshot, VectorIndexSpec,
 };
+use walleye_ring::Node;
 
 /// Merge flushed generations once this many exist.
 pub const COMPACT_MIN_SSTABLES: usize = 8;
@@ -256,7 +258,9 @@ struct Stream {
     definition: StreamDefinition,
     config: TableConfig,
     storage: LanceStorageOptions,
-    durability: LanceDurability,
+    /// Bitr quorum writer in cluster mode; the WAL backend is minted per open
+    /// so its epoch matches the MemWAL claim.
+    bitr: Option<Arc<QuorumWriter>>,
     table: Mutex<Option<Table>>,
     /// Monotonic write version reported to LanceDB clients.
     version: AtomicU64,
@@ -268,14 +272,25 @@ impl Stream {
     async fn table(&self) -> Result<MappedMutexGuard<'_, Table>, Error> {
         let mut table = self.table.lock().await;
         if table.is_none() {
-            *table = Some(
-                Table::open(
-                    self.config.clone(),
-                    self.storage.clone(),
-                    self.durability.clone(),
-                )
-                .await?,
-            );
+            let durability = match &self.bitr {
+                Some(writer) => {
+                    let epoch = walleye_lance::next_writer_epoch(
+                        &self.storage,
+                        &self.config.uri,
+                        self.config.shard_id,
+                    )
+                    .await?;
+                    LanceDurability::Bitr(Arc::new(BitrWalBackend::new(
+                        writer.clone(),
+                        &self.config.stream,
+                        self.config.shard_id,
+                        epoch,
+                    )?))
+                }
+                None => LanceDurability::ObjectStore,
+            };
+            *table =
+                Some(Table::open(self.config.clone(), self.storage.clone(), durability).await?);
         }
         Ok(MutexGuard::map(table, |table| {
             table.as_mut().expect("initialized writer")
@@ -311,12 +326,14 @@ pub struct Engine {
     // Requests share this read lock; shutdown waits for all active requests.
     closed: RwLock<bool>,
     writer: Option<Arc<QuorumWriter>>,
+    cluster: Option<Cluster>,
 }
 impl Engine {
     pub async fn open(
         config: ApiConfig,
         cache: CachedStorage,
         params: ObjectStoreParams,
+        cluster: Option<Cluster>,
     ) -> Result<Self, Error> {
         let (catalog, prefix) = ObjectStore::from_uri_and_params(
             Arc::new(ObjectStoreRegistry::default()),
@@ -358,30 +375,19 @@ impl Engine {
             catalog_loaded: Mutex::new(false),
             closed: RwLock::new(false),
             writer,
+            cluster,
         };
         // Open writers lazily: the combined Bitr service starts after configuration loads.
         Ok(engine)
     }
-    fn durability(&self, config: &TableConfig) -> Result<LanceDurability, Error> {
-        Ok(match &self.writer {
-            Some(w) => LanceDurability::Bitr(Arc::new(BitrWalBackend::new(
-                w.clone(),
-                &config.stream,
-                config.shard_id,
-                1,
-            )?)),
-            None => LanceDurability::ObjectStore,
-        })
-    }
     async fn register(&self, definition: StreamDefinition) -> Result<Arc<Stream>, Error> {
         let config = definition.table_config(&self.config.root_uri)?;
-        let durability = self.durability(&config)?;
         let mut streams = self.streams.lock().await;
         let stream = streams.entry(definition.name.clone()).or_insert_with(|| {
             Arc::new(Stream {
                 definition,
                 config,
-                durability,
+                bitr: self.writer.clone(),
                 storage: self.cache.storage.clone(),
                 table: Mutex::new(None),
                 version: AtomicU64::new(1),
@@ -391,7 +397,31 @@ impl Engine {
         });
         Ok(stream.clone())
     }
+    /// The member that owns `name`, or `None` when this node does. Single
+    /// node deployments own everything.
+    pub fn owner(&self, name: &str) -> Option<Node> {
+        self.cluster.as_ref().and_then(|c| c.owner(name))
+    }
+    pub fn cluster(&self) -> Option<&Cluster> {
+        self.cluster.as_ref()
+    }
+    /// A stream this node may write: its definition, after confirming
+    /// ownership. A stream that moved to another member has its local writer
+    /// closed so the new owner's epoch claim is the only live writer.
     async fn stream(&self, name: &str) -> Result<Arc<Stream>, Error> {
+        let stream = self.definition(name).await?;
+        if let Some(owner) = self.owner(name) {
+            if let Some(mut table) = stream.table.lock().await.take() {
+                let _ = table.checkpoint().await;
+                let _ = table.close().await;
+            }
+            return Err(Box::new(NotOwner(owner)));
+        }
+        Ok(stream)
+    }
+    /// The registered definition, loading it from the catalog if needed.
+    /// Does not open a writer and does not check ownership.
+    async fn definition(&self, name: &str) -> Result<Arc<Stream>, Error> {
         if let Some(stream) = self.streams.lock().await.get(name).cloned() {
             return Ok(stream);
         }
@@ -471,7 +501,7 @@ impl Engine {
                 .filename()
                 .and_then(|s| s.strip_suffix(".json"))
             {
-                self.stream(name).await?;
+                self.definition(name).await?;
             }
         }
         Ok(())
@@ -1075,6 +1105,7 @@ mod tests {
             },
             cache,
             ObjectStoreParams::default(),
+            None,
         )
         .await
         .unwrap();

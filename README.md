@@ -116,13 +116,29 @@ flowchart LR
 ```
 
 **Cluster: Bitr.** Set `WALLEYE_BITR_URL` and `WALLEYE_MEMBERS`. Writes are
-acknowledged once two of three replicas have them on NVMe, then
-archived to S3. See `deploy/kubernetes` for the manifests.
+acknowledged once two of three replicas have them on NVMe, then archived to
+S3. See `deploy/kubernetes` for the manifests.
 
 ```mermaid
 flowchart LR
     A[Stream] --> B[Walleye Cluster<br/>NVMe Bitr] --> C[(S3)]
 ```
+
+**Any node, any request.** Every member serves the full API. Each stream is
+owned by one member, chosen by rendezvous hashing the stream name over the
+membership ring, and only the owner holds its MemWAL writer. A request that
+reaches a non-owner is forwarded to the owner, so clients need no knowledge
+of the topology and never see a 503. Reads go through the owner too, so they
+always include the memtable. SQL that spans tables with different owners is
+refused with a 400 rather than answered from a partial view.
+
+**Fencing.** A new owner claims the next MemWAL writer epoch through a
+manifest CAS; the previous owner's WAL appends and manifest commits fail from
+that point. In Bitr mode the Bitr writer epoch is minted from the same claim,
+so the replicas fence a stale owner as well. Forwarded requests carry the
+sender's membership fingerprint and are refused with a 409 if the receiver
+sees a different membership, and a forwarded request that lands on a
+non-owner is refused instead of forwarded again.
 
 ## Crates
 

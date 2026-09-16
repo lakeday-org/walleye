@@ -1,4 +1,5 @@
 //! Single-deployment stream API, Foyer peer service, and Bitr node composition.
+pub mod cluster;
 mod engine;
 mod lancedb;
 mod processor;
@@ -171,8 +172,17 @@ impl Service {
                 peers,
             )
             .await?;
+            let cluster = (config.members.len() > 1 || config.kubernetes.is_some())
+                .then(|| {
+                    cluster::Cluster::new(
+                        config.node_id.clone(),
+                        ring.clone(),
+                        config.token.clone(),
+                    )
+                })
+                .transpose()?;
             Some(
-                engine::Engine::open(api, cached, params)
+                engine::Engine::open(api, cached, params, cluster)
                     .await
                     .map_err(|e| e.to_string())?,
             )
@@ -223,10 +233,14 @@ pub fn router(service: Arc<Service>) -> Router {
         .route("/v1/query", post(query))
         .layer(DefaultBodyLimit::max(8 * 1024 * 1024))
         .merge(lancedb::routes())
+        .layer(axum::middleware::from_fn_with_state(
+            service.clone(),
+            cluster::route_to_owner,
+        ))
         .with_state(service)
 }
 /// Accepts either `Authorization: Bearer <token>` or the LanceDB SDK's `x-api-key`.
-fn authorize(s: &Service, headers: &HeaderMap) -> Result<(), StatusCode> {
+pub(crate) fn authorize(s: &Service, headers: &HeaderMap) -> Result<(), StatusCode> {
     let presented = match headers.get("x-api-key").and_then(|v| v.to_str().ok()) {
         Some(key) => key.to_string(),
         None => headers

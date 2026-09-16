@@ -35,6 +35,5 @@ metadata:
 spec:
   selector:
     app: walleye-cache
-    statefulset.kubernetes.io/pod-name: walleye-cache-0
   ports:
     - {name: http, port: 8080, targetPort: 8080}

@@ -25,6 +25,20 @@ fn setup(uri: String) -> (TableConfig, Arc<BitrWalBackend>, Arc<Schema>) {
     );
     (config, backend, schema)
 }
+/// A reopen claims the next MemWAL epoch, so its Bitr identity must be
+/// minted at that epoch over the same quorum writer, as the engine does.
+async fn reopen_backend(config: &TableConfig, previous: &BitrWalBackend) -> Arc<BitrWalBackend> {
+    let epoch = walleye_lance::next_writer_epoch(
+        &LanceStorageOptions::default(),
+        &config.uri,
+        config.shard_id,
+    )
+    .await
+    .unwrap();
+    Arc::new(
+        BitrWalBackend::new(previous.writer(), &config.stream, config.shard_id, epoch).unwrap(),
+    )
+}
 fn row(schema: Arc<Schema>, id: i64, payload: &str) -> RecordBatch {
     RecordBatch::try_new(
         schema,
@@ -70,6 +84,7 @@ async fn checkpoints_release_payloads_and_reopen_recovers_only_the_new_tail() {
     backend.checkpointed(config.shard_id, 1).await;
     assert_eq!(backend.retained_wal_bytes().await, tail);
     table.close().await.unwrap();
+    let backend = reopen_backend(&config, &backend).await;
     let mut reopened = Table::open(
         config,
         LanceStorageOptions::default(),
