@@ -11,7 +11,10 @@ use lance::{
         scanner::{LsmScanner, ShardSnapshot},
     },
 };
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use uuid::Uuid;
 
 #[derive(Clone, Debug)]
@@ -87,33 +90,154 @@ pub struct Table {
     storage: LanceStorageOptions,
     durability: LanceDurability,
 }
+
+/// Emit bounded, stage-level open diagnostics without exposing a dataset URI,
+/// credentials, or row data. A start event is deliberately emitted before
+/// every remote operation so a supervisor that kills a stalled process still
+/// leaves enough evidence to identify the operation that was waiting.
+fn open_stage_start(config: &TableConfig, stage: &str) -> Instant {
+    let started = Instant::now();
+    eprintln!(
+        "walleye.storage table_open stream={} stage={} phase=start",
+        config.stream, stage
+    );
+    started
+}
+
+fn open_stage_finish(
+    config: &TableConfig,
+    stage: &str,
+    started: Instant,
+    outcome: &str,
+    error: Option<&lance::Error>,
+) {
+    let elapsed_ms = started.elapsed().as_millis();
+    match error {
+        Some(error) => eprintln!(
+            "walleye.storage table_open stream={} stage={} phase=finish elapsed_ms={} outcome={} error_kind={}",
+            config.stream,
+            stage,
+            elapsed_ms,
+            outcome,
+            open_error_kind(error),
+        ),
+        None => eprintln!(
+            "walleye.storage table_open stream={} stage={} phase=finish elapsed_ms={} outcome={}",
+            config.stream, stage, elapsed_ms, outcome
+        ),
+    }
+}
+
+fn open_error_kind(error: &lance::Error) -> &'static str {
+    match error {
+        lance::Error::DatasetNotFound { .. } => "dataset_not_found",
+        lance::Error::Timeout { .. } => "timeout",
+        lance::Error::IO { .. } => "io",
+        lance::Error::External { .. } => "external",
+        lance::Error::InvalidInput { .. } => "invalid_input",
+        _ => "lance",
+    }
+}
+
 impl Table {
     pub async fn open(
         config: TableConfig,
         storage: LanceStorageOptions,
         durability: LanceDurability,
     ) -> lance::Result<Self> {
+        let load_started = open_stage_start(&config, "dataset_load");
         let mut dataset = match storage.open_dataset(&config.uri).await {
-            Ok(d) => d,
+            Ok(d) => {
+                open_stage_finish(&config, "dataset_load", load_started, "ok", None);
+                d
+            }
             Err(lance::Error::DatasetNotFound { .. }) => {
+                open_stage_finish(&config, "dataset_load", load_started, "missing", None);
                 let reader = RecordBatchIterator::new(
                     vec![Ok(RecordBatch::new_empty(config.schema.clone()))],
                     config.schema.clone(),
                 );
-                Dataset::write(reader, config.uri.as_str(), Some(storage.write_params())).await?
+                let create_started = open_stage_start(&config, "dataset_create");
+                match Dataset::write(reader, config.uri.as_str(), Some(storage.write_params()))
+                    .await
+                {
+                    Ok(dataset) => {
+                        open_stage_finish(&config, "dataset_create", create_started, "ok", None);
+                        dataset
+                    }
+                    Err(error) => {
+                        open_stage_finish(
+                            &config,
+                            "dataset_create",
+                            create_started,
+                            "error",
+                            Some(&error),
+                        );
+                        return Err(error);
+                    }
+                }
             }
-            Err(e) => return Err(e),
+            Err(error) => {
+                open_stage_finish(&config, "dataset_load", load_started, "error", Some(&error));
+                return Err(error);
+            }
         };
+        let schema_started = open_stage_start(&config, "schema_validate");
         let actual_schema: Schema = dataset.schema().into();
         if actual_schema.metadata().get(OWNER_DO_ID_KEY) != Some(&config.stream)
             || !same_fields(&actual_schema, &config.schema)
         {
-            return Err(lance::Error::invalid_input(
+            let error = lance::Error::invalid_input(
                 "dataset identity or schema differs from the configured stream",
-            ));
+            );
+            open_stage_finish(
+                &config,
+                "schema_validate",
+                schema_started,
+                "error",
+                Some(&error),
+            );
+            return Err(error);
         }
-        if dataset.mem_wal_index_details().await?.is_none() {
-            dataset.initialize_mem_wal().unsharded().execute().await?;
+        open_stage_finish(&config, "schema_validate", schema_started, "ok", None);
+        let index_started = open_stage_start(&config, "mem_wal_index");
+        let index = match dataset.mem_wal_index_details().await {
+            Ok(index) => {
+                open_stage_finish(&config, "mem_wal_index", index_started, "ok", None);
+                index
+            }
+            Err(error) => {
+                open_stage_finish(
+                    &config,
+                    "mem_wal_index",
+                    index_started,
+                    "error",
+                    Some(&error),
+                );
+                return Err(error);
+            }
+        };
+        if index.is_none() {
+            let initialize_started = open_stage_start(&config, "mem_wal_initialize");
+            match dataset.initialize_mem_wal().unsharded().execute().await {
+                Ok(()) => open_stage_finish(
+                    &config,
+                    "mem_wal_initialize",
+                    initialize_started,
+                    "ok",
+                    None,
+                ),
+                Err(error) => {
+                    open_stage_finish(
+                        &config,
+                        "mem_wal_initialize",
+                        initialize_started,
+                        "error",
+                        Some(&error),
+                    );
+                    return Err(error);
+                }
+            }
         }
         let mut writer_config = ShardWriterConfig::new(config.shard_id)
             .with_durable_write(true)
@@ -132,9 +256,23 @@ impl Table {
             writer_config = writer_config.with_wal_backend(backend.clone());
         }
         writer_config.store_params = storage.object_store_params();
-        let writer = dataset
-            .mem_wal_writer(config.shard_id, writer_config)
-            .await?;
+        let writer_started = open_stage_start(&config, "mem_wal_writer");
+        let writer = match dataset.mem_wal_writer(config.shard_id, writer_config).await {
+            Ok(writer) => {
+                open_stage_finish(&config, "mem_wal_writer", writer_started, "ok", None);
+                writer
+            }
+            Err(error) => {
+                open_stage_finish(
+                    &config,
+                    "mem_wal_writer",
+                    writer_started,
+                    "error",
+                    Some(&error),
+                );
+                return Err(error);
+            }
+        };
         Ok(Self {
             config,
             dataset: Arc::new(dataset),

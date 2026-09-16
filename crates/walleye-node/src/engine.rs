@@ -12,6 +12,7 @@ use std::{
     collections::{BTreeMap, HashMap},
     io::Cursor,
     sync::Arc,
+    time::Instant,
 };
 use tokio::sync::{MappedMutexGuard, Mutex, MutexGuard, RwLock};
 use walleye_bitr::{HttpReplica, QuorumWriter};
@@ -21,6 +22,31 @@ use walleye_lance::{
 };
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
+
+/// Catalog requests are small, but they are still remote object-store
+/// operations. Emit bounded stage markers so a process killed by its startup
+/// watchdog leaves evidence of the operation that was waiting. Do not include
+/// the root URI or error text: either can contain tenant-specific or secret
+/// material in an object-store configuration.
+fn catalog_stage_start(stage: &str, stream: &str) -> Instant {
+    let started = Instant::now();
+    eprintln!(
+        "walleye.storage catalog stream={} stage={} phase=start",
+        stream, stage
+    );
+    started
+}
+
+fn catalog_stage_finish(stage: &str, stream: &str, started: Instant, outcome: &str) {
+    eprintln!(
+        "walleye.storage catalog stream={} stage={} phase=finish elapsed_ms={} outcome={}",
+        stream,
+        stage,
+        started.elapsed().as_millis(),
+        outcome,
+    );
+}
+
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ApiConfig {
@@ -221,7 +247,23 @@ impl Engine {
             return Err("invalid stream name".into());
         }
         let path = self.catalog_path.clone().join(format!("{name}.json"));
-        let data = self.catalog.inner.get(&path).await?.bytes().await?;
+        let get_started = catalog_stage_start("catalog_get", name);
+        let data = match self.catalog.inner.get(&path).await {
+            Ok(data) => match data.bytes().await {
+                Ok(data) => {
+                    catalog_stage_finish("catalog_get", name, get_started, "ok");
+                    data
+                }
+                Err(error) => {
+                    catalog_stage_finish("catalog_get", name, get_started, "error");
+                    return Err(error.into());
+                }
+            },
+            Err(error) => {
+                catalog_stage_finish("catalog_get", name, get_started, "error");
+                return Err(error.into());
+            }
+        };
         let definition: StreamDefinition = serde_json::from_slice(&data)?;
         if definition.name != name {
             return Err("stream definition name does not match its path".into());
@@ -229,12 +271,23 @@ impl Engine {
         self.register(definition).await
     }
     async fn load_catalog(&self) -> Result<(), Error> {
-        let objects: Vec<_> = self
+        let list_started = catalog_stage_start("catalog_list", "*");
+        let objects: Vec<_> = match self
             .catalog
             .inner
             .list(Some(&self.catalog_path))
             .try_collect()
-            .await?;
+            .await
+        {
+            Ok(objects) => {
+                catalog_stage_finish("catalog_list", "*", list_started, "ok");
+                objects
+            }
+            Err(error) => {
+                catalog_stage_finish("catalog_list", "*", list_started, "error");
+                return Err(error.into());
+            }
+        };
         for obj in objects {
             if obj.location.extension() != Some("json") {
                 continue;
@@ -260,6 +313,7 @@ impl Engine {
             .clone()
             .join(format!("{}.json", definition.name));
         let bytes = serde_json::to_vec(&definition)?;
+        let put_started = catalog_stage_start("catalog_put", &definition.name);
         match self
             .catalog
             .inner
@@ -273,15 +327,54 @@ impl Engine {
             )
             .await
         {
-            Ok(_) => {}
+            Ok(_) => catalog_stage_finish("catalog_put", &definition.name, put_started, "created"),
             Err(object_store::Error::AlreadyExists { .. }) => {
-                let existing: StreamDefinition =
-                    serde_json::from_slice(&self.catalog.inner.get(&path).await?.bytes().await?)?;
+                catalog_stage_finish(
+                    "catalog_put",
+                    &definition.name,
+                    put_started,
+                    "already_exists",
+                );
+                let get_started = catalog_stage_start("catalog_get", &definition.name);
+                let existing_bytes = match self.catalog.inner.get(&path).await {
+                    Ok(data) => match data.bytes().await {
+                        Ok(data) => data,
+                        Err(error) => {
+                            catalog_stage_finish(
+                                "catalog_get",
+                                &definition.name,
+                                get_started,
+                                "error",
+                            );
+                            return Err(error.into());
+                        }
+                    },
+                    Err(error) => {
+                        catalog_stage_finish("catalog_get", &definition.name, get_started, "error");
+                        return Err(error.into());
+                    }
+                };
+                let existing: StreamDefinition = match serde_json::from_slice(&existing_bytes) {
+                    Ok(existing) => existing,
+                    Err(error) => {
+                        catalog_stage_finish(
+                            "catalog_get",
+                            &definition.name,
+                            get_started,
+                            "invalid_json",
+                        );
+                        return Err(error.into());
+                    }
+                };
+                catalog_stage_finish("catalog_get", &definition.name, get_started, "ok");
                 if existing != definition {
                     return Err("stream already exists with a different definition".into());
                 }
             }
-            Err(e) => return Err(e.into()),
+            Err(error) => {
+                catalog_stage_finish("catalog_put", &definition.name, put_started, "error");
+                return Err(error.into());
+            }
         }
         let stream = self.register(definition).await?;
         drop(stream.table().await?);
@@ -388,7 +481,7 @@ impl std::io::Write for BoundedOutput {
         Ok(())
     }
 }
-pub fn storage_params() -> ObjectStoreParams {
+fn storage_params_from(mut get: impl FnMut(&str) -> Option<String>) -> ObjectStoreParams {
     let mut options = HashMap::new();
     for (env, key) in [
         ("AWS_ACCESS_KEY_ID", "aws_access_key_id"),
@@ -397,8 +490,12 @@ pub fn storage_params() -> ObjectStoreParams {
         ("AWS_REGION", "aws_region"),
         ("AWS_ENDPOINT", "aws_endpoint"),
         ("AWS_ALLOW_HTTP", "allow_http"),
+        // The cell boot script sets this to avoid reusing stale pooled S3
+        // connections after a suspended tenant runtime. Keep the mapping here
+        // explicit: Lance's static storage accessor otherwise drops it.
+        ("AWS_POOL_MAX_IDLE_PER_HOST", "pool_max_idle_per_host"),
     ] {
-        if let Ok(value) = std::env::var(env) {
+        if let Some(value) = get(env) {
             options.insert(key.to_string(), value);
         }
     }
@@ -408,6 +505,10 @@ pub fn storage_params() -> ObjectStoreParams {
         )),
         ..Default::default()
     }
+}
+
+pub fn storage_params() -> ObjectStoreParams {
+    storage_params_from(|name| std::env::var(name).ok())
 }
 
 #[cfg(test)]
@@ -422,6 +523,35 @@ mod tests {
             {"name":"id", "type":"int64"}, {"name":"value", "type":"int64"}
         ], "primary_key":["id"]}))
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn storage_params_preserve_pool_idle_limit_for_lance() {
+        let params = storage_params_from(|name| {
+            (name == "AWS_POOL_MAX_IDLE_PER_HOST").then(|| "0".to_owned())
+        });
+        let options = params
+            .storage_options_accessor
+            .expect("storage accessor")
+            .get_storage_options()
+            .await
+            .expect("static storage options");
+        assert_eq!(
+            options.0.get("pool_max_idle_per_host"),
+            Some(&"0".to_owned())
+        );
+
+        // Lance's AWS provider parses the storage map into its S3 config map
+        // before constructing object_store::AmazonS3Builder. This assertion
+        // checks the actual provider key, rather than only the accessor map,
+        // so a typo or an unrecognized option cannot silently pass the test.
+        let s3_options = lance_io::object_store::StorageOptions::new(options.0).as_s3_options();
+        assert_eq!(
+            s3_options.get(&object_store::aws::AmazonS3ConfigKey::Client(
+                object_store::ClientConfigKey::PoolMaxIdlePerHost,
+            )),
+            Some(&"0".to_owned())
+        );
     }
     async fn engine(
         dir: &std::path::Path,
