@@ -203,18 +203,44 @@ pub struct Service {
     /// This node has been write-ready at least once. Sticky, so a quorum lost
     /// later does not pull a node that still serves reads out of rotation.
     served: AtomicBool,
+    /// What `/readyz` reports: ready, or why not.
+    readiness: std::sync::Mutex<serde_json::Value>,
 }
 
-/// The local Bitr gateway reports a reachable quorum. `/readyz` there fails
-/// while the daemon is initializing, fenced for maintenance, or short of
-/// `quorum` healthy members.
-async fn quorum_ready(client: &reqwest::Client, gateway: &str) -> bool {
-    client
+/// The local Bitr gateway's write readiness, with its explanation when it is
+/// not ready. `/readyz` there fails while the daemon is initializing, fenced
+/// for maintenance, or short of `quorum` healthy members, and its body names
+/// the members that did not answer.
+async fn quorum_state(client: &reqwest::Client, gateway: &str) -> (bool, serde_json::Value) {
+    match client
         .get(format!("{}/readyz", gateway.trim_end_matches('/')))
         .timeout(std::time::Duration::from_secs(2))
         .send()
         .await
-        .is_ok_and(|r| r.status().is_success())
+    {
+        Ok(response) if response.status().is_success() => {
+            (true, serde_json::json!({"ready": true}))
+        }
+        Ok(response) => {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            let detail = serde_json::from_str::<serde_json::Value>(&body).unwrap_or_else(|_| {
+                serde_json::json!({
+                    "ready": false,
+                    "reason": format!("the local replica gateway answered {status}"),
+                })
+            });
+            (false, detail)
+        }
+        Err(error) => (
+            false,
+            serde_json::json!({
+                "ready": false,
+                "reason": "the local replica gateway is unreachable",
+                "error": error.to_string(),
+            }),
+        ),
+    }
 }
 
 impl Service {
@@ -301,6 +327,11 @@ impl Service {
             // object store, which the engine already opened.
             write_ready: AtomicBool::new(!bitr_gateway),
             served: AtomicBool::new(!bitr_gateway),
+            readiness: std::sync::Mutex::new(if bitr_gateway {
+                serde_json::json!({"ready": false, "reason": "starting"})
+            } else {
+                serde_json::json!({"ready": true})
+            }),
         });
         if let Some(engine) = &service.engine
             && service.config.bitr
@@ -339,24 +370,30 @@ impl Service {
                 // replica quorum before it reports ready. A writer opened
                 // before then fails recovery ("replica quorum unavailable"),
                 // so wait rather than open a table that cannot be durable.
+                // There is no deadline: a node that never reaches a quorum
+                // cannot write, and saying otherwise would only move the
+                // failure to the first request.
                 let client = reqwest::Client::new();
                 let started = std::time::Instant::now();
-                let deadline = started + std::time::Duration::from_secs(300);
+                let mut polls = 0_u32;
                 loop {
-                    if quorum_ready(&client, gateway).await {
+                    let (ready, detail) = quorum_state(&client, gateway).await;
+                    *warming.readiness() = detail.clone();
+                    if ready {
                         eprintln!(
                             "walleye.ready stage=quorum outcome=ready elapsed_ms={}",
                             started.elapsed().as_millis()
                         );
                         break;
                     }
-                    if std::time::Instant::now() > deadline {
+                    // Every 15s while waiting, so a stuck boot is diagnosable.
+                    if polls.is_multiple_of(60) {
                         eprintln!(
-                            "walleye.ready stage=quorum outcome=timeout elapsed_ms={}",
+                            "walleye.ready stage=quorum outcome=waiting elapsed_ms={} detail={detail}",
                             started.elapsed().as_millis()
                         );
-                        break;
                     }
+                    polls += 1;
                     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                 }
             }
@@ -365,6 +402,7 @@ impl Service {
             }
             warming.write_ready.store(true, Ordering::Release);
             warming.served.store(true, Ordering::Release);
+            *warming.readiness() = serde_json::json!({"ready": true});
             // Keep write readiness current: a quorum lost later stops this
             // node from accepting writes it could not make durable, while
             // reads and `/healthz` continue.
@@ -372,9 +410,10 @@ impl Service {
                 let client = reqwest::Client::new();
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                    let ready = quorum_ready(&client, &gateway).await;
+                    let (ready, detail) = quorum_state(&client, &gateway).await;
+                    *warming.readiness() = detail.clone();
                     if warming.write_ready.swap(ready, Ordering::AcqRel) != ready {
-                        eprintln!("walleye.ready stage=quorum write_ready={ready}");
+                        eprintln!("walleye.ready stage=quorum write_ready={ready} detail={detail}");
                     }
                 }
             }
@@ -388,6 +427,11 @@ impl Service {
             Some(config) => kubernetes::follow(config, self.ring.clone()).await,
             None => std::future::pending().await,
         }
+    }
+    fn readiness(&self) -> std::sync::MutexGuard<'_, serde_json::Value> {
+        self.readiness
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
     /// Stops new processor delivery while the API remains open for in-flight commits.
     pub fn quiesce(&self) {
@@ -460,13 +504,14 @@ async fn healthz(State(s): State<Arc<Service>>) -> Response {
     }
 }
 async fn readyz(State(s): State<Arc<Service>>) -> Response {
+    let detail = s.readiness().clone();
     if s.write_ready.load(Ordering::Acquire) {
-        (StatusCode::OK, "ready").into_response()
+        (StatusCode::OK, Json(detail)).into_response()
     } else {
         (
             StatusCode::SERVICE_UNAVAILABLE,
             [("retry-after", "1")],
-            "not write-ready: the replica quorum is unreachable",
+            Json(detail),
         )
             .into_response()
     }

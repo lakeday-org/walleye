@@ -55,7 +55,12 @@ async fn a_single_node_is_ready_without_a_quorum() {
     let service = Service::open(config(d.path())).await.unwrap();
     let app = router(service.clone());
     assert_eq!(get(&app, "/healthz").await, (StatusCode::OK, "ok".into()));
-    assert_eq!(get(&app, "/readyz").await, (StatusCode::OK, "ready".into()));
+    let (status, body) = get(&app, "/readyz").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&body).unwrap(),
+        serde_json::json!({"ready": true})
+    );
     service.close().await;
 }
 

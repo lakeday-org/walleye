@@ -14240,39 +14240,68 @@ async fn gateway_metrics(
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)
 }
 
-async fn gateway_ready(State(state): State<GatewayState>) -> StatusCode {
-    if state.gateway.ensure_initialized().await.is_err() {
-        return StatusCode::SERVICE_UNAVAILABLE;
-    }
-    if state.gateway.refresh_durable_fence().await.is_err()
-        || state.gateway.maintenance_active().await
-    {
-        return StatusCode::SERVICE_UNAVAILABLE;
-    }
-    let Ok(nodes) = state.gateway.nodes_snapshot().await else {
-        return StatusCode::SERVICE_UNAVAILABLE;
-    };
+/// Readiness to accept durable writes: at least `quorum` members answering,
+/// initialized, and not fenced for maintenance. Members are probed first,
+/// because a quorum shortage is both the usual reason a gateway is not ready
+/// and the reason it cannot initialize; a refusal names the members that did
+/// not answer so an operator can see which node is at fault.
+async fn gateway_ready(State(state): State<GatewayState>) -> Response {
     let gateway = Arc::clone(&state.gateway);
     let quorum = gateway.quorum;
-    let healthy = join_all(nodes.iter().map(|node| {
-        let node = node.clone();
-        let gateway = Arc::clone(&gateway);
-        async move {
-            NodeClient::new(node, &gateway.client, &gateway.internal_token)
-                .health()
-                .await
-                .is_ok()
+    let members = gateway.nodes_snapshot().await;
+    let probes = match &members {
+        Ok(nodes) => {
+            join_all(nodes.iter().map(|node| {
+                let node = node.clone();
+                let gateway = Arc::clone(&gateway);
+                async move {
+                    let healthy =
+                        NodeClient::new(node.clone(), &gateway.client, &gateway.internal_token)
+                            .health()
+                            .await
+                            .is_ok();
+                    (node.id, healthy)
+                }
+            }))
+            .await
         }
-    }))
-    .await
-    .into_iter()
-    .filter(|healthy| *healthy)
-    .count();
-    if healthy >= quorum {
-        StatusCode::NO_CONTENT
-    } else {
-        StatusCode::SERVICE_UNAVAILABLE
+        Err(_) => Vec::new(),
+    };
+    let (healthy, unreachable): (Vec<_>, Vec<_>) =
+        probes.into_iter().partition(|(_, healthy)| *healthy);
+    let healthy = healthy.into_iter().map(|(id, _)| id).collect::<Vec<_>>();
+    let unreachable = unreachable
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect::<Vec<_>>();
+    let not_ready = |reason: String| -> Response {
+        let mut body = serde_json::json!({"ready": false, "reason": reason});
+        if members.is_ok() {
+            body["quorum"] = serde_json::json!(quorum);
+            body["healthy"] = serde_json::json!(healthy);
+            body["unreachable"] = serde_json::json!(unreachable);
+        }
+        (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response()
+    };
+    if members.is_err() {
+        return not_ready("the member list could not be read".to_owned());
     }
+    if healthy.len() < quorum {
+        return not_ready(format!(
+            "{} of {quorum} required members are reachable",
+            healthy.len()
+        ));
+    }
+    if state.gateway.ensure_initialized().await.is_err() {
+        return not_ready("the gateway is still initializing".to_owned());
+    }
+    if state.gateway.refresh_durable_fence().await.is_err() {
+        return not_ready("the durable fence could not be refreshed".to_owned());
+    }
+    if state.gateway.maintenance_active().await {
+        return not_ready("maintenance is fencing writes on this gateway".to_owned());
+    }
+    StatusCode::NO_CONTENT.into_response()
 }
 
 #[derive(Serialize)]

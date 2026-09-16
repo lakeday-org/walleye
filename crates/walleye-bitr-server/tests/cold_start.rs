@@ -147,3 +147,63 @@ async fn fresh_members_accept_the_append_after_the_archived_prefix()
     }
     Ok(())
 }
+
+/// A gateway short of its quorum refuses readiness and names the members that
+/// did not answer, so an operator sees which node is at fault.
+#[tokio::test]
+async fn readiness_names_the_unreachable_members() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let live = group(&directory, &["live"]).await?;
+    // Two members at addresses nothing listens on: bind to claim a port, then
+    // drop the listener so a probe is refused rather than left hanging.
+    let mut dead = Vec::new();
+    for name in ["gone-a", "gone-b"] {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        drop(listener);
+        dead.push(ReplicaNode::new(name, format!("http://{address}")));
+    }
+    let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let archive = Arc::new(OpaqueArchive::new(store, "bitr", 2)?);
+    let members = vec![live[0].member.clone(), dead[0].clone(), dead[1].clone()];
+    let gateway = Arc::new(ReplicaGateway::new_direct(
+        members,
+        2,
+        ROOT,
+        INTERNAL_TOKEN,
+        directory.path().join("gateway-control.json"),
+        archive,
+    )?);
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let base = format!("http://{}", listener.local_addr()?);
+    let app = walleye_bitr_server::gateway_router(Arc::clone(&gateway));
+    let task = tokio::spawn(async move { axum::serve(listener, app).await });
+
+    let response = reqwest::Client::new()
+        .get(format!("{base}/readyz"))
+        .send()
+        .await?;
+    assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    let body: serde_json::Value = response.json().await?;
+    assert_eq!(body["ready"], serde_json::json!(false));
+    assert_eq!(body["quorum"], serde_json::json!(2));
+    assert_eq!(body["healthy"], serde_json::json!(["live"]));
+    let mut unreachable = body["unreachable"]
+        .as_array()
+        .expect("unreachable members")
+        .iter()
+        .map(|id| id.as_str().unwrap_or_default().to_owned())
+        .collect::<Vec<_>>();
+    unreachable.sort();
+    assert_eq!(unreachable, ["gone-a", "gone-b"]);
+    assert!(
+        body["reason"].as_str().unwrap_or_default().contains("2"),
+        "{body}"
+    );
+
+    task.abort();
+    for node in live {
+        node.task.abort();
+    }
+    Ok(())
+}
