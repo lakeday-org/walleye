@@ -164,7 +164,13 @@ gathered table is that owner's own snapshot, so it carries unflushed rows,
 and a stream beyond a million rows is refused rather than shipped across the
 cluster.
 
-**Readiness.** `/healthz` reports unavailable until a node can make writes
+**Readiness.** `/readyz` answers whether this node can make writes durable
+right now, and names the members serving the cluster whether or not it is
+ready, so a caller that reaches the cluster through one address can tell a
+whole cluster from a quorum of it. `/readyz?require=all` is the stricter
+question: it reports ready only when every configured member is serving,
+which is what "the cluster is up" means to a client about to write to a table
+the missing member owns. `/healthz` reports unavailable until a node can make writes
 durable: with Bitr that means its replica quorum is reachable and its owned
 streams have opened. Point a load balancer's health check at it and traffic
 never reaches a node that would refuse writes. Once a node has served, it
@@ -173,7 +179,8 @@ without one. `/readyz` is the strict probe: it reports write-readiness right
 now. A write that arrives while the quorum is unreachable answers 503 with
 `Retry-After` rather than failing deep in recovery, and a forward to a peer
 that is still starting is retried for up to fifteen seconds before the caller
-sees an error.
+sees an error. A member that takes longer than that to boot is better gated
+on with `require=all` than waited out by retries.
 
 **Fencing.** A new owner claims the next MemWAL writer epoch through a
 manifest CAS; the previous owner's WAL appends and manifest commits fail from

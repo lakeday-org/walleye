@@ -207,3 +207,76 @@ async fn readiness_names_the_unreachable_members() -> Result<(), Box<dyn std::er
     }
     Ok(())
 }
+
+/// A cluster at quorum but short one member is ready for writes it owns and
+/// not ready for the whole cluster. A caller that reaches the cluster through
+/// a single address needs to tell those apart, so a ready answer names the
+/// members that are serving and `?require=all` refuses until every one does.
+#[tokio::test]
+async fn readiness_distinguishes_a_quorum_from_the_whole_cluster()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let serving = group(&directory, &["node-0", "node-1"]).await?;
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let late = ReplicaNode::new("node-2", format!("http://{}", listener.local_addr()?));
+    drop(listener);
+    let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let archive = Arc::new(OpaqueArchive::new(store, "bitr", 2)?);
+    let gateway = Arc::new(ReplicaGateway::new_direct(
+        vec![
+            serving[0].member.clone(),
+            serving[1].member.clone(),
+            late.clone(),
+        ],
+        2,
+        ROOT,
+        INTERNAL_TOKEN,
+        directory.path().join("gateway-control.json"),
+        archive,
+    )?);
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let base = format!("http://{}", listener.local_addr()?);
+    let app = walleye_bitr_server::gateway_router(Arc::clone(&gateway));
+    let task = tokio::spawn(async move { axum::serve(listener, app).await });
+    let client = reqwest::Client::new();
+
+    // Quorum is met, so the gateway is ready, and it says who is serving.
+    let response = client.get(format!("{base}/readyz")).send().await?;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = response.json().await?;
+    assert_eq!(body["ready"], serde_json::json!(true));
+    let mut healthy = body["healthy"]
+        .as_array()
+        .expect("a ready answer names the members serving it")
+        .iter()
+        .map(|id| id.as_str().unwrap_or_default().to_owned())
+        .collect::<Vec<_>>();
+    healthy.sort();
+    assert_eq!(healthy, ["node-0", "node-1"]);
+    assert_eq!(body["unreachable"], serde_json::json!(["node-2"]));
+
+    // The same cluster is not ready for a caller that needs every member,
+    // which is what "the instance is up" means to someone writing to a table
+    // the missing member owns.
+    let response = client
+        .get(format!("{base}/readyz?require=all"))
+        .send()
+        .await?;
+    assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    let body: serde_json::Value = response.json().await?;
+    assert_eq!(body["ready"], serde_json::json!(false));
+    assert_eq!(body["unreachable"], serde_json::json!(["node-2"]));
+    assert!(
+        body["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("strict readiness requires all"),
+        "{body}"
+    );
+
+    task.abort();
+    for node in serving {
+        node.task.abort();
+    }
+    Ok(())
+}

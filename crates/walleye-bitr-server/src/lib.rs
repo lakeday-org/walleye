@@ -14245,7 +14245,20 @@ async fn gateway_metrics(
 /// because a quorum shortage is both the usual reason a gateway is not ready
 /// and the reason it cannot initialize; a refusal names the members that did
 /// not answer so an operator can see which node is at fault.
-async fn gateway_ready(State(state): State<GatewayState>) -> Response {
+/// `?require=all` makes readiness strict: every configured member must be
+/// serving, not just a quorum. A caller that reaches the cluster through one
+/// address cannot otherwise tell a whole cluster from a quorum of one.
+#[derive(Deserialize)]
+struct ReadyQuery {
+    #[serde(default)]
+    require: Option<String>,
+}
+
+async fn gateway_ready(
+    State(state): State<GatewayState>,
+    Query(query): Query<ReadyQuery>,
+) -> Response {
+    let strict = query.require.as_deref() == Some("all");
     let gateway = Arc::clone(&state.gateway);
     let quorum = gateway.quorum;
     let members = gateway.nodes_snapshot().await;
@@ -14292,6 +14305,13 @@ async fn gateway_ready(State(state): State<GatewayState>) -> Response {
             healthy.len()
         ));
     }
+    if strict && !unreachable.is_empty() {
+        return not_ready(format!(
+            "{} of {} members are serving; strict readiness requires all",
+            healthy.len(),
+            healthy.len() + unreachable.len()
+        ));
+    }
     if state.gateway.ensure_initialized().await.is_err() {
         return not_ready("the gateway is still initializing".to_owned());
     }
@@ -14301,7 +14321,18 @@ async fn gateway_ready(State(state): State<GatewayState>) -> Response {
     if state.gateway.maintenance_active().await {
         return not_ready("maintenance is fencing writes on this gateway".to_owned());
     }
-    StatusCode::NO_CONTENT.into_response()
+    // A ready answer names who is serving, as a refusal names who is not: a
+    // caller with one address can then tell a whole cluster from a quorum.
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ready": true,
+            "quorum": quorum,
+            "healthy": healthy,
+            "unreachable": unreachable,
+        })),
+    )
+        .into_response()
 }
 
 #[derive(Serialize)]

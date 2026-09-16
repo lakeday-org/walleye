@@ -348,3 +348,60 @@ async fn stream_processor_recovers_due_work_and_retries_failed_callbacks() {
     let _ = server.await;
     service.close().await;
 }
+
+/// A definition written by a later version must still open here, or an
+/// upgrade could not be rolled back. Requests stay strict: a field the server
+/// derives, or a misspelled one, is refused rather than silently ignored.
+#[tokio::test]
+async fn the_catalog_tolerates_fields_this_version_does_not_know() {
+    let d = tempfile::tempdir().unwrap();
+    let service = Service::open(config(d.path(), true)).await.unwrap();
+    let app = router(service.clone());
+    let (status, _) = call(
+        &app,
+        "/v1/streams",
+        json!({"name":"events","columns":[{"name":"id","type":"int64"}],"primary_key":["id"]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    service.close().await;
+
+    // A later version adds a field to the stored definition.
+    let path = d.path().join("store/streams/events.json");
+    let mut stored: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    stored["retention_days"] = json!(30);
+    std::fs::write(&path, serde_json::to_vec(&stored).unwrap()).unwrap();
+
+    // This version opens the stream and reads it.
+    let service = Service::open(config(d.path(), true)).await.unwrap();
+    let app = router(service.clone());
+    let (status, body) = call(
+        &app,
+        "/v1/query",
+        json!({"sql":"SELECT count(*) AS n FROM events"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body[0]["n"], 0);
+
+    // A request carrying that field is still refused.
+    let refused = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/streams")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer deployment-secret-token")
+                .body(Body::from(
+                    json!({"name":"other","columns":[{"name":"id","type":"int64"}],
+                           "primary_key":["id"],"retention_days":30})
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    service.close().await;
+}

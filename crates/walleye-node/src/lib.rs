@@ -14,7 +14,8 @@ use axum::{
     routing::{get, post},
 };
 pub use engine::{
-    ApiConfig, Column, HIDDEN_PK, PK_METADATA_KEY, StreamDefinition, TableExists, TableNotFound,
+    ApiConfig, Column, HIDDEN_PK, PK_METADATA_KEY, StreamDefinition, StreamRequest, TableExists,
+    TableNotFound,
 };
 use lance_core::cache::{CacheBackend, InternalCacheKey};
 use serde::Deserialize;
@@ -231,7 +232,12 @@ async fn quorum_state(client: &reqwest::Client, gateway: &str) -> (bool, serde_j
         .await
     {
         Ok(response) if response.status().is_success() => {
-            (true, serde_json::json!({"ready": true}))
+            let body = response.text().await.unwrap_or_default();
+            // The gateway names its members on a ready answer too, so the
+            // detail carries who is serving, not only who is not.
+            let detail = serde_json::from_str::<serde_json::Value>(&body)
+                .unwrap_or_else(|_| serde_json::json!({"ready": true}));
+            (true, detail)
         }
         Ok(response) => {
             let status = response.status().as_u16();
@@ -425,12 +431,17 @@ impl Service {
                     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                 }
             }
-            if let Some(engine) = &warming.engine {
-                engine.warm().await;
-            }
+            // Ready once writes can be durable. Warming opens owned streams
+            // ahead of their first request, which is an optimization: holding
+            // readiness until it finishes would keep a restarted node out of
+            // rotation for as long as it takes to open every table it owns,
+            // and a stream that is not warm yet simply opens on use.
             warming.write_ready.store(true, Ordering::Release);
             warming.served.store(true, Ordering::Release);
             *warming.readiness() = serde_json::json!({"ready": true});
+            if let Some(engine) = &warming.engine {
+                engine.warm().await;
+            }
             // Keep write readiness current: a quorum lost later stops this
             // node from accepting writes it could not make durable, while
             // reads and `/healthz` continue.
@@ -536,9 +547,37 @@ async fn healthz(State(s): State<Arc<Service>>) -> Response {
             .into_response()
     }
 }
-async fn readyz(State(s): State<Arc<Service>>) -> Response {
-    let detail = s.readiness().clone();
-    if s.write_ready.load(Ordering::Acquire) {
+/// Write readiness, and with `?require=all` the stricter question a caller
+/// with one address has to ask: is the whole cluster serving, rather than a
+/// quorum of it. A ready answer names the members that are serving, so the
+/// caller can tell those apart without reaching each node.
+async fn readyz(
+    State(s): State<Arc<Service>>,
+    axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let mut detail = s.readiness().clone();
+    let mut ready = s.write_ready.load(Ordering::Acquire);
+    if query.get("require").map(String::as_str) == Some("all") {
+        let absent = detail
+            .get("unreachable")
+            .and_then(|members| members.as_array())
+            .map(|members| members.len())
+            .unwrap_or(0);
+        if ready && absent > 0 {
+            ready = false;
+            let serving = detail
+                .get("healthy")
+                .and_then(|members| members.as_array())
+                .map(|members| members.len())
+                .unwrap_or(0);
+            detail["ready"] = serde_json::json!(false);
+            detail["reason"] = serde_json::json!(format!(
+                "{serving} of {} members are serving; strict readiness requires all",
+                serving + absent
+            ));
+        }
+    }
+    if ready {
         (StatusCode::OK, Json(detail)).into_response()
     } else {
         (
@@ -667,8 +706,9 @@ pub(crate) fn api<'a>(s: &'a Service, h: &HeaderMap) -> Result<&'a engine::Engin
 async fn define(
     State(s): State<Arc<Service>>,
     h: HeaderMap,
-    Json(def): Json<StreamDefinition>,
+    Json(def): Json<StreamRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let def: StreamDefinition = def.into();
     let name = def.name.clone();
     let engine = writable(&s, &h)?;
     let mut revision = s.revision.lock().await;

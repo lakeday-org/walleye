@@ -104,8 +104,32 @@ pub struct Column {
     #[serde(default)]
     pub nullable: bool,
 }
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+/// A stream definition as a client sends it. Strict on purpose: a misspelled
+/// field in a request is a mistake worth reporting, and a client may not set
+/// the fields the server derives.
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct StreamRequest {
+    pub name: String,
+    pub columns: Vec<Column>,
+    pub primary_key: Vec<String>,
+}
+impl From<StreamRequest> for StreamDefinition {
+    fn from(request: StreamRequest) -> Self {
+        Self {
+            name: request.name,
+            columns: request.columns,
+            primary_key: request.primary_key,
+            schema: None,
+            vector_indexes: Vec::new(),
+        }
+    }
+}
+
+/// A stream definition as the catalog stores it. Deliberately tolerant of
+/// fields it does not know: a definition written by a later version must
+/// still open here, or an upgrade could not be rolled back.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct StreamDefinition {
     pub name: String,
     #[serde(default)]
@@ -840,8 +864,36 @@ impl Engine {
             }
         };
         let owned = names.into_iter().filter(|n| self.owner(n).is_none());
+        // Warming is an optimization: it opens streams before their first
+        // request. It must leave room for the streams a client opens next, so
+        // it plans against what each stream will hold and takes at most half
+        // of what may be held. Planning beforehand, rather than checking as it
+        // goes, is what keeps concurrent opens from overshooting together.
+        // Streams it skips open on use, and idle ones are closed again.
+        let budget = self.cache.resources.leasable() / 2;
+        let mut planned = 0usize;
+        let mut warming = Vec::new();
+        let mut skipped = 0usize;
+        for name in owned {
+            let Ok(stream) = self.definition(&name).await else {
+                continue;
+            };
+            let cost = stream.memory_footprint();
+            if planned.saturating_add(cost) > budget {
+                skipped += 1;
+                continue;
+            }
+            planned += cost;
+            warming.push(name);
+        }
+        if skipped > 0 {
+            eprintln!(
+                "walleye.storage warm outcome=partial warmed={} skipped={skipped} planned_bytes={planned} budget_bytes={budget}",
+                warming.len()
+            );
+        }
         // Each open is a handful of object-storage round trips; overlap them.
-        futures::stream::iter(owned)
+        futures::stream::iter(warming)
             .for_each_concurrent(8, |name| async move {
                 let started = Instant::now();
                 let outcome = async {
