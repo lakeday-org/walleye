@@ -19,7 +19,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
-use arrow_array::RecordBatch;
+use arrow_array::Array;
 use datafusion::common::ScalarValue;
 use futures::TryStreamExt;
 use lance_core::{Error, Result};
@@ -34,6 +34,7 @@ use lance_index::scalar::{
 use uuid::Uuid;
 
 use super::data_source::{FreshTierWatermark, LsmDataSource, LsmGeneration};
+use super::exec::validate_pk_types;
 use super::sstable_cache::{DatasetCache, open_sstable};
 use crate::dataset::Dataset;
 use crate::dataset::mem_wal::index::encode_pk_tuple;
@@ -580,9 +581,16 @@ async fn sidecar_has_files(
 /// so scanning only the PK columns is enough; row positions remain the source's
 /// positions and no user columns are retained in this fallback.
 async fn rebuild_pk_membership(dataset: &Dataset, pk_columns: &[String]) -> Result<GenMembership> {
+    // Scanner projections synthesize missing fragment columns as nulls. That
+    // is valid for ordinary schema evolution, but it cannot represent an LSM
+    // primary key: indexing those nulls would make every real key probe miss
+    // and could let an older generation resurface. Fail closed before reading
+    // rows rather than manufacturing membership for an unsupported source.
+    let source_schema: arrow_schema::Schema = dataset.schema().into();
+    validate_pk_types(&source_schema, pk_columns)?;
+
     let mut scanner = dataset.scan();
     scanner.project(pk_columns)?;
-    let batches: Vec<RecordBatch> = scanner.try_into_stream().await?.try_collect().await?;
 
     let pk = pk_columns
         .iter()
@@ -591,8 +599,19 @@ async fn rebuild_pk_membership(dataset: &Dataset, pk_columns: &[String]) -> Resu
         .collect::<Vec<_>>();
     let mut index_store = IndexStore::new();
     index_store.enable_pk_index(&pk);
+    let mut stream = scanner.try_into_stream().await?;
     let mut row_offset = 0u64;
-    for batch in batches {
+    while let Some(batch) = stream.try_next().await? {
+        if pk_columns
+            .iter()
+            .enumerate()
+            .any(|(field_id, _)| batch.column(field_id).null_count() != 0)
+        {
+            return Err(Error::corrupt_file(
+                dataset.base.clone(),
+                "legacy SSTable primary-key membership contains null values",
+            ));
+        }
         index_store.insert(&batch, row_offset)?;
         row_offset = row_offset
             .checked_add(batch.num_rows() as u64)

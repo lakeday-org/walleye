@@ -1167,7 +1167,7 @@ mod tests {
     use lance_index::scalar::inverted::{DOC_INDEX_COL, DocumentGranularity, InvertedIndexParams};
 
     use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
-    use crate::dataset::{Dataset, WriteParams};
+    use crate::dataset::{Dataset, NewColumnTransform, WriteParams};
 
     #[test]
     fn test_lsm_scanner_builder() {
@@ -2773,6 +2773,98 @@ mod tests {
             .collect::<Vec<_>>();
         values.sort_unstable();
         assert_eq!(values, vec![11, 22]);
+    }
+
+    #[tokio::test]
+    async fn composite_disk_point_filter_rejects_null_pk_membership_source() {
+        // Lance permits schema evolution to add an all-null column without a
+        // physical data file. That is a valid immutable dataset, but it cannot
+        // be used as an LSM source for a primary key: rebuilding membership
+        // from nulls would fail to shadow a matching older row. The fallback
+        // must fail closed instead.
+        use crate::dataset::mem_wal::scanner::data_source::ShardSnapshot;
+
+        let base_schema = Arc::new(Schema::new(vec![
+            Field::new("scope", DataType::Utf8, false),
+            Field::new("entry", DataType::Utf8, false),
+            Field::new("value", DataType::Int32, true),
+        ]));
+        let temp = tempfile::tempdir().unwrap();
+        let base_uri = format!("{}/base", temp.path().display());
+        let base_batch = RecordBatch::try_new(
+            base_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["scan"])),
+                Arc::new(StringArray::from(vec!["one"])),
+                Arc::new(Int32Array::from(vec![1])),
+            ],
+        )
+        .unwrap();
+        let base_reader =
+            RecordBatchIterator::new(vec![Ok(base_batch)].into_iter(), base_schema.clone());
+        let base = Arc::new(
+            Dataset::write(base_reader, &base_uri, Some(WriteParams::default()))
+                .await
+                .unwrap(),
+        );
+
+        let shard = Uuid::new_v4();
+        let sstable_uri = format!("{}/_mem_wal/{}/gen_1", base_uri, shard);
+        let legacy_schema = Arc::new(Schema::new(vec![
+            Field::new("scope", DataType::Utf8, false),
+            Field::new("value", DataType::Int32, true),
+        ]));
+        let legacy_batch = RecordBatch::try_new(
+            legacy_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["scan"])),
+                Arc::new(Int32Array::from(vec![11])),
+            ],
+        )
+        .unwrap();
+        let legacy_reader =
+            RecordBatchIterator::new(vec![Ok(legacy_batch)].into_iter(), legacy_schema);
+        let mut legacy = Dataset::write(legacy_reader, &sstable_uri, Some(WriteParams::default()))
+            .await
+            .unwrap();
+        legacy
+            .add_columns(
+                NewColumnTransform::AllNulls(Arc::new(Schema::new(vec![Field::new(
+                    "entry",
+                    DataType::Utf8,
+                    true,
+                )]))),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Deliberately omit `_pk_index`: this reaches the row-rebuild path.
+        let snapshot = ShardSnapshot::new(shard)
+            .with_current_generation(2)
+            .with_sstable(1, "gen_1".to_owned());
+        let scanner = LsmScanner::new(
+            base,
+            vec![snapshot],
+            vec!["scope".to_owned(), "entry".to_owned()],
+        )
+        .filter_expr(
+            col("scope")
+                .in_list(vec![lit("scan")], false)
+                .and(col("entry").in_list(vec![lit("one"), lit("two")], false)),
+        );
+
+        let error = match scanner.try_into_batch().await {
+            Ok(_) => panic!("null PK membership must not fall back to row scanning"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("null")
+                || error.to_string().contains("Corrupt")
+                || error.to_string().contains("corrupt"),
+            "null PK membership must fail closed: {error}"
+        );
     }
 
     #[tokio::test]
