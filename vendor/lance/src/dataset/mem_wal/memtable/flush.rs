@@ -531,6 +531,26 @@ impl MemTableFlusher {
             ));
         }
 
+        // A size-triggered freeze can outrun the index applier: every put has
+        // queued an apply up to its batch position, but the graph may still
+        // trail the batch store. Snapshotting it early would ship an index
+        // whose node ids stop short of the generation's rows. Wait for the
+        // queued applies to land, as checkpoint does before its flush.
+        if let Some(registry) = memtable.indexes() {
+            let target = memtable.batch_count();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
+            while registry.indexed_count() < target {
+                if std::time::Instant::now() > deadline {
+                    return Err(Error::io(format!(
+                        "index apply did not reach batch {} before flush of generation {}",
+                        target,
+                        memtable.generation()
+                    )));
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        }
+
         let random_hash = generate_random_hash();
         let generation = memtable.generation();
         let gen_folder_name = format!("{}_gen_{}", random_hash, generation);
