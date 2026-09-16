@@ -245,6 +245,12 @@ pub struct ShardWriterConfig {
     /// Session for those opens, injected alongside `store_params`.
     /// Default: `None`.
     pub session: Option<Arc<Session>>,
+
+    /// Memtable index configs declared by the caller, in addition to the
+    /// `maintained_indexes` derived from base-table indexes. Lets a table
+    /// maintain an in-memory HNSW graph (flushed as IVF_HNSW_SQ per
+    /// generation) before any base-table index can be trained.
+    pub extra_index_configs: Vec<crate::dataset::mem_wal::index::MemIndexConfig>,
 }
 
 impl Default for ShardWriterConfig {
@@ -253,6 +259,7 @@ impl Default for ShardWriterConfig {
             shard_id: Uuid::new_v4(),
             shard_spec_id: 0,
             wal_backend: None,
+            extra_index_configs: Vec::new(),
             durable_write: true,
             max_wal_buffer_size: 10 * 1024 * 1024, // 10MB
             max_wal_flush_interval: Some(Duration::from_millis(100)), // 100ms
@@ -396,6 +403,15 @@ impl ShardWriterConfig {
         params: HnswBuildParams,
     ) -> Self {
         self.hnsw_params.insert(index_name.into(), params);
+        self
+    }
+
+    /// Declare a memtable index that does not derive from a base-table index.
+    pub fn with_index_config(
+        mut self,
+        config: crate::dataset::mem_wal::index::MemIndexConfig,
+    ) -> Self {
+        self.extra_index_configs.push(config);
         self
     }
 }
@@ -1572,6 +1588,8 @@ pub struct ShardWriter {
     manifest_store: Arc<ShardManifestStore>,
     stats: SharedWriteStats,
     mode: WriterMode,
+    /// Merges flushed generations; `None` in WAL-only mode.
+    compactor: Option<super::memtable::flush::Compactor>,
     /// The base table's schema as the caller passed it — no `_tombstone`,
     /// nullability untouched. Caller input is held to it (see
     /// [`Self::validate_against_logical_schema`]) and the scan narrows back to
@@ -1731,10 +1749,12 @@ impl ShardWriter {
         let stats = new_shared_stats();
         let task_executor = Arc::new(TaskExecutor::new());
 
+        let mut compactor = None;
         let mode = if config.enable_memtable {
             let (pk_field_ids, pk_columns, storage_schema) = memtable_validation
                 .expect("memtable_validation is Some when enable_memtable is true");
-            Self::open_memtable_mode(
+            let compactor_pk_columns = pk_columns.clone();
+            let (mode, flusher) = Self::open_memtable_mode(
                 &config,
                 &storage_schema,
                 &manifest,
@@ -1754,7 +1774,15 @@ impl ShardWriter {
                 stats.clone(),
                 &task_executor,
             )
-            .await?
+            .await?;
+            compactor = Some(super::memtable::flush::Compactor {
+                flusher,
+                epoch,
+                logical_schema: logical_schema.clone(),
+                pk_columns: compactor_pk_columns,
+                index_configs: index_configs.clone(),
+            });
+            mode
         } else {
             Self::open_wal_only_mode(
                 &config,
@@ -1774,6 +1802,7 @@ impl ShardWriter {
             manifest_store,
             stats,
             mode,
+            compactor,
             logical_schema,
         })
     }
@@ -1798,7 +1827,7 @@ impl ShardWriter {
         manifest_store: Arc<ShardManifestStore>,
         stats: SharedWriteStats,
         task_executor: &Arc<TaskExecutor>,
-    ) -> Result<WriterMode> {
+    ) -> Result<(WriterMode, Arc<MemTableFlusher>)> {
         // PK metadata and index/interval validation were resolved in `open`
         // before the epoch was claimed (a doomed open must not fence the
         // incumbent first).
@@ -1938,7 +1967,7 @@ impl ShardWriter {
         // It rebuilds the same secondary indexes on each SSTable.
         let memtable_handler = MemTableFlushHandler::new(
             state.clone(),
-            flusher,
+            flusher.clone(),
             wal_flusher.clone(),
             epoch,
             index_configs.to_vec(),
@@ -1983,11 +2012,14 @@ impl ShardWriter {
             index_configs.to_vec(),
         ));
 
-        Ok(WriterMode::MemTable {
-            state,
-            writer_state,
-            backpressure,
-        })
+        Ok((
+            WriterMode::MemTable {
+                state,
+                writer_state,
+                backpressure,
+            },
+            flusher,
+        ))
     }
 
     fn open_wal_only_mode(
@@ -2562,6 +2594,12 @@ impl ShardWriter {
     }
 
     /// Get the writer's epoch.
+    /// A handle that merges this shard's flushed generations. It borrows
+    /// nothing from the writer, so callers can compact without holding the
+    /// writer lock; the manifest CAS and epoch fence keep it safe.
+    pub fn compactor(&self) -> Option<super::memtable::flush::Compactor> {
+        self.compactor.clone()
+    }
     pub fn epoch(&self) -> u64 {
         self.epoch
     }

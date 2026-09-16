@@ -12,13 +12,37 @@ use lance::deps::datafusion::{
 use lance::{
     Dataset,
     dataset::mem_wal::{
-        DatasetMemWalExt, ShardWriter, ShardWriterConfig,
+        CompactionResult, Compactor, DatasetMemWalExt, ShardWriter, ShardWriterConfig,
+        index::MemIndexConfig,
         scanner::{FreshTierWatermark, InMemoryMemTables, LsmScanner, ShardSnapshot},
     },
-    index::{DatasetIndexExt, vector::VectorIndexParams},
+    index::DatasetIndexExt,
 };
-use lance_index::IndexType;
 use lance_linalg::distance::DistanceType;
+
+/// A vector index maintained by the table: an in-memory HNSW graph over the
+/// memtable, flushed as IVF_HNSW_SQ on every generation and rebuilt by
+/// compaction. No base-table training is involved, so it works from the first
+/// row.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct VectorIndexSpec {
+    pub name: String,
+    pub column: String,
+    /// `l2`, `cosine`, or `dot`.
+    pub metric: String,
+}
+/// Per-generation view of the LSM for diagnostics and tests.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct LsmStats {
+    pub sstables: Vec<SsTableStats>,
+}
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct SsTableStats {
+    pub generation: u64,
+    pub path: String,
+    pub rows: u64,
+    pub indices: Vec<String>,
+}
 
 /// A LanceDB-style search: filter, projection, paging, and an optional
 /// nearest-neighbor query over one vector column.
@@ -38,24 +62,6 @@ pub struct VectorQuery {
     pub nprobes: usize,
     pub refine_factor: u32,
     pub metric: Option<String>,
-}
-/// Parameters for a vector index on the base table.
-#[derive(Clone, Debug)]
-pub struct VectorIndexRequest {
-    pub column: String,
-    pub name: Option<String>,
-    pub metric: Option<String>,
-    pub replace: bool,
-    /// IVF_FLAT when false, IVF_PQ when true.
-    pub product_quantization: bool,
-    pub num_partitions: Option<usize>,
-    pub num_sub_vectors: Option<usize>,
-}
-#[derive(Clone, Debug)]
-pub struct IndexInfo {
-    pub name: String,
-    pub uuid: String,
-    pub columns: Vec<String>,
 }
 fn parse_metric(metric: Option<&str>) -> lance::Result<DistanceType> {
     match metric {
@@ -80,6 +86,7 @@ pub struct TableConfig {
     pub primary_keys: Vec<String>,
     pub shard_id: Uuid,
     pub stream: String,
+    pub vector_indexes: Vec<VectorIndexSpec>,
 }
 impl TableConfig {
     pub fn new(
@@ -134,7 +141,29 @@ impl TableConfig {
             primary_keys,
             shard_id,
             stream,
+            vector_indexes: Vec::new(),
         })
+    }
+    pub fn with_vector_indexes(mut self, specs: Vec<VectorIndexSpec>) -> lance::Result<Self> {
+        for spec in &specs {
+            let field = self
+                .schema
+                .field_with_name(&spec.column)
+                .map_err(|e| lance::Error::invalid_input(e.to_string()))?;
+            if !matches!(field.data_type(), arrow_schema::DataType::FixedSizeList(inner, _)
+                if inner.data_type() == &arrow_schema::DataType::Float32)
+            {
+                return Err(lance::Error::invalid_input(format!(
+                    "vector index {} needs a FixedSizeList<Float32> column, {} is {}",
+                    spec.name,
+                    spec.column,
+                    field.data_type()
+                )));
+            }
+            parse_metric(Some(&spec.metric))?;
+        }
+        self.vector_indexes = specs;
+        Ok(self)
     }
 }
 /// One owned writer and its read view. The same implementation handles both durability modes.
@@ -311,6 +340,21 @@ impl Table {
             writer_config = writer_config.with_wal_backend(backend.clone());
         }
         writer_config.store_params = storage.object_store_params();
+        for spec in &config.vector_indexes {
+            let field_id = dataset
+                .schema()
+                .field(&spec.column)
+                .map(|f| f.id)
+                .ok_or_else(|| {
+                    lance::Error::invalid_input(format!("vector column {} missing", spec.column))
+                })?;
+            writer_config = writer_config.with_index_config(MemIndexConfig::hnsw(
+                spec.name.clone(),
+                field_id,
+                spec.column.clone(),
+                parse_metric(Some(&spec.metric))?,
+            ));
+        }
         let writer_started = open_stage_start(&config, "mem_wal_writer");
         let writer = match dataset.mem_wal_writer(config.shard_id, writer_config).await {
             Ok(writer) => {
@@ -473,84 +517,50 @@ impl Table {
     pub fn config(&self) -> &TableConfig {
         &self.config
     }
-    /// Create (or replace) a vector index on the base table. Rows in the
-    /// memtables and SSTables are searched exactly and merged with the index
-    /// results, so the index never has to be rebuilt after ingest.
-    pub async fn create_vector_index(
-        &mut self,
-        request: &VectorIndexRequest,
-    ) -> lance::Result<String> {
-        let field = self
-            .config
-            .schema
-            .field_with_name(&request.column)
-            .map_err(|e| lance::Error::invalid_input(e.to_string()))?;
-        let dim = match field.data_type() {
-            arrow_schema::DataType::FixedSizeList(inner, dim)
-                if inner.data_type() == &arrow_schema::DataType::Float32 =>
-            {
-                *dim as usize
-            }
-            other => {
-                return Err(lance::Error::invalid_input(format!(
-                    "vector index requires a FixedSizeList<Float32> column, got {other}"
-                )));
-            }
-        };
-        if self.dataset.count_rows(None).await? == 0 {
-            return Err(lance::Error::not_supported(
-                "vector indexes need rows in the base table, and this build has no LSM \
-                 compaction yet; searches run exactly over every tier without an index",
-            ));
-        }
-        let metric = parse_metric(request.metric.as_deref())?;
-        let partitions = request.num_partitions.unwrap_or(1).max(1);
-        let params = if request.product_quantization {
-            let sub_vectors = request
-                .num_sub_vectors
-                .unwrap_or_else(|| (dim / 8).max(1))
-                .max(1);
-            VectorIndexParams::ivf_pq(partitions, 8, sub_vectors, metric, 50)
-        } else {
-            VectorIndexParams::ivf_flat(partitions, metric)
-        };
-        let name = request
-            .name
-            .clone()
-            .unwrap_or_else(|| format!("{}_idx", request.column));
-        let mut dataset = (*self.dataset).clone();
-        dataset
-            .create_index(
-                &[request.column.as_str()],
-                IndexType::Vector,
-                Some(name.clone()),
-                &params,
-                request.replace,
-            )
-            .await?;
-        self.dataset = Arc::new(dataset);
-        Ok(name)
+    /// A handle for merging flushed generations that outlives the caller's
+    /// lock on this table.
+    pub fn compactor(&self) -> Option<Compactor> {
+        self.writer.compactor()
     }
-    pub async fn list_indices(&self) -> lance::Result<Vec<IndexInfo>> {
-        let schema = self.dataset.schema();
-        Ok(self
-            .dataset
-            .load_indices()
-            .await?
-            .iter()
-            // The MemWAL manifest is registered as a system index; clients
-            // only see indexes on their own columns.
-            .filter(|index| !index.name.starts_with("__lance") && !index.fields.is_empty())
-            .map(|index| IndexInfo {
-                name: index.name.clone(),
-                uuid: index.uuid.to_string(),
-                columns: index
-                    .fields
-                    .iter()
-                    .filter_map(|id| schema.field_by_id(*id).map(|f| f.name.clone()))
-                    .collect(),
-            })
-            .collect())
+    /// Merge flushed generations into one indexed generation when at least
+    /// `min_sstables` exist. The replaced generation directories are left in
+    /// place; the caller deletes them once no snapshot can reference them.
+    pub async fn compact(&self, min_sstables: usize) -> lance::Result<Option<CompactionResult>> {
+        match self.writer.compactor() {
+            Some(compactor) => compactor.compact(min_sstables).await,
+            None => Ok(None),
+        }
+    }
+    /// Generations currently in the manifest, with row counts and index names.
+    pub async fn lsm_stats(&self) -> lance::Result<LsmStats> {
+        let Some(manifest) = self.writer.manifest().await? else {
+            return Ok(LsmStats {
+                sstables: Vec::new(),
+            });
+        };
+        let mut sstables = Vec::with_capacity(manifest.sstables.len());
+        for sstable in &manifest.sstables {
+            let uri = format!(
+                "{}/_mem_wal/{}/{}",
+                self.config.uri.trim_end_matches('/'),
+                self.writer.shard_id(),
+                sstable.path
+            );
+            let dataset = self.storage.open_dataset(&uri).await?;
+            let indices = dataset
+                .load_indices()
+                .await?
+                .iter()
+                .map(|i| i.name.clone())
+                .collect();
+            sstables.push(SsTableStats {
+                generation: sstable.generation,
+                path: sstable.path.clone(),
+                rows: dataset.count_rows(None).await? as u64,
+                indices,
+            });
+        }
+        Ok(LsmStats { sstables })
     }
     /// Flush to Lance SSTables and advance the manifest replay watermark.
     pub async fn checkpoint(&mut self) -> lance::Result<()> {

@@ -45,13 +45,19 @@ assert len(df) == 4 and list(df.columns) == ["id", "city", "vector"], df
 reopened = db.open_table(name)
 assert reopened.count_rows() == 4
 
+# Every vector column is indexed from the first row (HNSW on the memtable,
+# IVF_HNSW_SQ on each flushed generation). create_index changes the metric
+# and rewrites the flushed generations before returning.
+indexes = tbl.list_indices()
+assert [i.columns for i in indexes] == [["vector"]], indexes
+tbl.create_index("vector", config=lancedb.index.IvfPq(distance_type="cosine"))
+assert [r["id"] for r in tbl.search([1.0, 0.05]).limit(1).to_list()] == [2]
 try:
-    tbl.create_index(metric="l2", vector_column_name="vector")
-    print("index created (base table had rows)")
-except Exception as e:  # expected until LSM compaction lands
-    assert "compaction" in str(e), e
-    print("index creation refused as documented")
+    tbl.search([1.0, 0.05]).distance_type("l2").limit(1).to_list()
+    raise AssertionError("l2 query against a cosine index should be rejected")
+except Exception as e:
+    assert "indexed with metric cosine" in str(e), e
 
 db.drop_table(name)
 assert name not in db.list_tables().tables
-print("OK: create, add (idempotent retry), count, filter, project, vector search, pandas, open, drop")
+print("OK: create, add (idempotent retry), count, filter, project, vector search, pandas, open, index, drop")

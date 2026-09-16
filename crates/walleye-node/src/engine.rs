@@ -20,9 +20,15 @@ use std::{
 use tokio::sync::{MappedMutexGuard, Mutex, MutexGuard, RwLock};
 use walleye_bitr::{HttpReplica, QuorumWriter};
 use walleye_lance::{
-    BitrWalBackend, CachedStorage, IndexInfo, JsonSchema, LanceDurability, LanceStorageOptions,
-    SearchRequest, SnapshotSource, Table, TableConfig, TableSnapshot, VectorIndexRequest,
+    BitrWalBackend, CachedStorage, CompactionResult, JsonSchema, LanceDurability,
+    LanceStorageOptions, LsmStats, SearchRequest, SnapshotSource, Table, TableConfig,
+    TableSnapshot, VectorIndexSpec,
 };
+
+/// Merge flushed generations once this many exist.
+pub const COMPACT_MIN_SSTABLES: usize = 8;
+/// Minimum spacing between automatic compaction attempts per table.
+const COMPACT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
 
@@ -102,6 +108,9 @@ pub struct StreamDefinition {
     /// LanceDB API. Includes the hidden primary key when one was added.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema: Option<serde_json::Value>,
+    /// Vector indexes maintained on the memtable and every generation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub vector_indexes: Vec<VectorIndexSpec>,
 }
 fn valid_name(name: &str) -> bool {
     !name.is_empty()
@@ -139,13 +148,36 @@ impl StreamDefinition {
             primary_key.push(HIDDEN_PK.into());
         }
         let schema = Schema::new(fields);
+        // Every vector column gets an HNSW index from the first row; the
+        // metric can be changed later through create_index.
+        let vector_indexes = schema
+            .fields()
+            .iter()
+            .filter(|f| {
+                matches!(f.data_type(), DataType::FixedSizeList(inner, _)
+                    if inner.data_type() == &DataType::Float32)
+            })
+            .map(|f| VectorIndexSpec {
+                name: format!("{}_idx", f.name()),
+                column: f.name().clone(),
+                metric: "l2".into(),
+            })
+            .collect();
         let json = JsonSchema::try_from(&schema)?;
         Ok(Self {
             name: name.into(),
             columns: Vec::new(),
             primary_key,
             schema: Some(serde_json::to_value(json)?),
+            vector_indexes,
         })
+    }
+    /// Same table shape: everything except the index configuration.
+    fn same_shape(&self, other: &Self) -> bool {
+        self.name == other.name
+            && self.columns == other.columns
+            && self.primary_key == other.primary_key
+            && self.schema == other.schema
     }
     fn hidden_pk(&self) -> bool {
         self.primary_key.len() == 1 && self.primary_key[0] == HIDDEN_PK
@@ -178,7 +210,8 @@ impl StreamDefinition {
                 format!("{}/data/{}", root.trim_end_matches('/'), self.name),
                 Arc::new(schema),
                 self.primary_key.clone(),
-            )?);
+            )?
+            .with_vector_indexes(self.vector_indexes.clone())?);
         }
         let mut seen = std::collections::HashSet::new();
         let fields = self
@@ -227,6 +260,9 @@ struct Stream {
     table: Mutex<Option<Table>>,
     /// Monotonic write version reported to LanceDB clients.
     version: AtomicU64,
+    /// One automatic compaction in flight at a time, spaced by COMPACT_INTERVAL.
+    compacting: std::sync::atomic::AtomicBool,
+    last_compaction: Mutex<Option<Instant>>,
 }
 impl Stream {
     async fn table(&self) -> Result<MappedMutexGuard<'_, Table>, Error> {
@@ -349,6 +385,8 @@ impl Engine {
                 storage: self.cache.storage.clone(),
                 table: Mutex::new(None),
                 version: AtomicU64::new(1),
+                compacting: std::sync::atomic::AtomicBool::new(false),
+                last_compaction: Mutex::new(None),
             })
         });
         Ok(stream.clone())
@@ -513,7 +551,7 @@ impl Engine {
                     }
                 };
                 catalog_stage_finish("catalog_get", &definition.name, get_started, "ok");
-                if existing != definition {
+                if !existing.same_shape(&definition) {
                     return Err(format!(
                         "table {} already exists with a different definition",
                         definition.name
@@ -523,6 +561,10 @@ impl Engine {
                 if !exist_ok {
                     return Err(Box::new(TableExists(definition.name.clone())));
                 }
+                // The stored definition carries any index changes made since creation.
+                let stream = self.register(existing).await?;
+                drop(stream.table().await?);
+                return Ok(());
             }
             Err(error) => {
                 catalog_stage_finish("catalog_put", &definition.name, put_started, "error");
@@ -604,7 +646,48 @@ impl Engine {
             return Ok(stream.version.load(Ordering::Acquire));
         }
         stream.table().await?.append(prepared).await?;
+        self.maybe_compact(&stream).await;
         Ok(stream.version.fetch_add(1, Ordering::AcqRel) + 1)
+    }
+    /// Spawn one background merge per table when enough generations exist.
+    async fn maybe_compact(&self, stream: &Arc<Stream>) {
+        {
+            let last = stream.last_compaction.lock().await;
+            if last.is_some_and(|t| t.elapsed() < COMPACT_INTERVAL) {
+                return;
+            }
+        }
+        if stream.compacting.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let stream = stream.clone();
+        let query_timeout = self.cache.storage.query_timeout();
+        tokio::spawn(async move {
+            let outcome = compact_stream(&stream, COMPACT_MIN_SSTABLES, query_timeout).await;
+            *stream.last_compaction.lock().await = Some(Instant::now());
+            stream.compacting.store(false, Ordering::Release);
+            if let Err(error) = outcome {
+                eprintln!(
+                    "walleye.storage compaction stream={} outcome=error error={}",
+                    stream.definition.name, error
+                );
+            }
+        });
+    }
+    /// Merge flushed generations now. Returns what was merged, if anything.
+    pub async fn compact(&self, name: &str) -> Result<Option<CompactionResult>, Error> {
+        let stream = self.stream(name).await?;
+        compact_stream(&stream, 2, self.cache.storage.query_timeout()).await
+    }
+    /// Flush the memtable into a new generation.
+    pub async fn flush(&self, name: &str) -> Result<(), Error> {
+        let stream = self.stream(name).await?;
+        stream.table().await?.checkpoint().await?;
+        Ok(())
+    }
+    pub async fn lsm_stats(&self, name: &str) -> Result<LsmStats, Error> {
+        let stream = self.stream(name).await?;
+        Ok(stream.table().await?.lsm_stats().await?)
     }
     pub async fn table_names(&self) -> Result<Vec<String>, Error> {
         self.refresh_catalog().await?;
@@ -663,18 +746,57 @@ impl Engine {
         }
         Ok(())
     }
-    pub async fn create_vector_index(
+    /// Set the vector index for a column: the spec is stored in the catalog and
+    /// the table is reopened so the memtable graph and every later generation
+    /// use it. Existing generations pick it up at their next compaction.
+    pub async fn configure_vector_index(
         &self,
         name: &str,
-        request: &VectorIndexRequest,
-    ) -> Result<String, Error> {
+        spec: VectorIndexSpec,
+    ) -> Result<(), Error> {
+        let closed = self.closed.read().await;
+        if *closed {
+            return Err("engine is closed".into());
+        }
         let stream = self.stream(name).await?;
-        let mut table = stream.table().await?;
-        Ok(table.create_vector_index(request).await?)
+        let mut definition = stream.definition.clone();
+        definition
+            .vector_indexes
+            .retain(|v| v.column != spec.column);
+        definition.vector_indexes.push(spec);
+        definition
+            .vector_indexes
+            .sort_by(|a, b| a.column.cmp(&b.column));
+        // Validate against the schema before touching the catalog.
+        definition.table_config(&self.config.root_uri)?;
+        if definition.vector_indexes == stream.definition.vector_indexes {
+            return Ok(());
+        }
+        let path = self.catalog_path.clone().join(format!("{name}.json"));
+        let bytes = serde_json::to_vec(&definition)?;
+        let put_started = catalog_stage_start("catalog_put", name);
+        match self.catalog.inner.put(&path, bytes.into()).await {
+            Ok(_) => catalog_stage_finish("catalog_put", name, put_started, "updated"),
+            Err(error) => {
+                catalog_stage_finish("catalog_put", name, put_started, "error");
+                return Err(error.into());
+            }
+        }
+        if let Some(mut table) = stream.table.lock().await.take() {
+            let _ = table.checkpoint().await;
+            table.close().await?;
+        }
+        self.streams.lock().await.remove(name);
+        let stream = self.register(definition).await?;
+        drop(stream.table().await?);
+        // Rewrite every flushed generation with the new index before
+        // returning, so no query sees an index built with the old metric.
+        compact_stream(&stream, 1, self.cache.storage.query_timeout()).await?;
+        Ok(())
     }
-    pub async fn list_indices(&self, name: &str) -> Result<Vec<IndexInfo>, Error> {
+    pub async fn vector_indexes(&self, name: &str) -> Result<Vec<VectorIndexSpec>, Error> {
         let stream = self.stream(name).await?;
-        Ok(stream.table().await?.list_indices().await?)
+        Ok(stream.definition.vector_indexes.clone())
     }
     async fn query_loaded(&self, sql: &str) -> Result<Vec<u8>, Error> {
         let tables: Vec<_> = self
@@ -725,6 +847,41 @@ impl Engine {
         }))
         .await;
     }
+}
+/// Merge generations without holding the table lock, then delete the replaced
+/// directories once every snapshot taken before the swap has timed out.
+async fn compact_stream(
+    stream: &Arc<Stream>,
+    min_sstables: usize,
+    query_timeout: std::time::Duration,
+) -> Result<Option<CompactionResult>, Error> {
+    let compactor = stream.table().await?.compactor();
+    let Some(compactor) = compactor else {
+        return Ok(None);
+    };
+    let started = Instant::now();
+    let Some(result) = compactor.compact(min_sstables).await? else {
+        return Ok(None);
+    };
+    eprintln!(
+        "walleye.storage compaction stream={} merged={} rows={} elapsed_ms={}",
+        stream.definition.name,
+        result.merged.len(),
+        result.rows,
+        started.elapsed().as_millis()
+    );
+    let merged = result.merged.clone();
+    let name = stream.definition.name.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(query_timeout * 2).await;
+        if let Err(error) = compactor.delete_generations(&merged).await {
+            eprintln!(
+                "walleye.storage compaction stream={} stage=delete outcome=error error={}",
+                name, error
+            );
+        }
+    });
+    Ok(Some(result))
 }
 /// Reorder and validate a client batch against the table schema, adding the
 /// hidden content-hash key when the table has one.

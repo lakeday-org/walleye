@@ -14,7 +14,7 @@ use axum::{
 };
 use serde::Deserialize;
 use std::{io::Cursor, sync::Arc};
-use walleye_lance::{JsonSchema, SearchRequest, VectorIndexRequest, VectorQuery};
+use walleye_lance::{JsonSchema, SearchRequest, VectorIndexSpec, VectorQuery};
 
 const ARROW_FILE: &str = "application/vnd.apache.arrow.file";
 
@@ -34,6 +34,9 @@ pub fn routes() -> Router<Arc<Service>> {
         .route("/v1/table/{name}/count_rows/", post(count_rows))
         .route("/v1/table/{name}/create_index/", post(create_index))
         .route("/v1/table/{name}/index/list/", post(list_indices))
+        .route("/v1/table/{name}/compact_lsm/", post(compact_lsm))
+        .route("/v1/table/{name}/flush_lsm/", post(flush_lsm))
+        .route("/v1/table/{name}/get_lsm_stats/", post(lsm_stats))
         .layer(DefaultBodyLimit::max(512 * 1024 * 1024))
 }
 
@@ -285,6 +288,30 @@ async fn query(
             .map_err(|e| error(e.as_ref()))?;
         let column = vector_column(&schema, body.get("vector_column").and_then(|v| v.as_str()))?;
         let k = request.limit.unwrap_or(10);
+        // The metric belongs to the index. A query may restate it but not
+        // change it: an index built for one metric answers nothing for another.
+        let specs = engine
+            .vector_indexes(&name)
+            .await
+            .map_err(|e| error(e.as_ref()))?;
+        let indexed = specs
+            .iter()
+            .find(|s| s.column == column)
+            .map(|s| s.metric.clone());
+        let requested = body
+            .get("distance_type")
+            .and_then(|v| v.as_str())
+            .map(|m| m.to_lowercase());
+        let metric = match (indexed, requested) {
+            (Some(index), Some(query)) if index != query => {
+                return Err(bad(format!(
+                    "column {column} is indexed with metric {index}; create_index with \
+                     metric_type={query} to change it"
+                )));
+            }
+            (Some(index), _) => Some(index),
+            (None, query) => query,
+        };
         request.vector = Some(VectorQuery {
             column,
             vector,
@@ -298,10 +325,7 @@ async fn query(
                 .get("refine_factor")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0) as u32,
-            metric: body
-                .get("distance_type")
-                .and_then(|v| v.as_str())
-                .map(str::to_string),
+            metric,
         });
         // The nearest-neighbor plan applies k; a separate limit would double-apply.
         request.limit = None;
@@ -355,10 +379,9 @@ struct CreateIndex {
     index_type: Option<String>,
     metric_type: Option<String>,
     name: Option<String>,
-    replace: Option<bool>,
-    num_partitions: Option<usize>,
-    num_sub_vectors: Option<usize>,
 }
+/// Every vector index type maps to the one layout Walleye maintains: an HNSW
+/// graph on the memtable, IVF_HNSW_SQ on each generation.
 async fn create_index(
     State(s): State<Arc<Service>>,
     Path(name): Path<String>,
@@ -370,27 +393,27 @@ async fn create_index(
         .index_type
         .unwrap_or_else(|| "IVF_PQ".into())
         .to_uppercase();
-    let product_quantization = match kind.as_str() {
-        "IVF_FLAT" => false,
-        "IVF_PQ" => true,
+    match kind.as_str() {
         "FTS" => return Err(bad("full-text indexes are not supported yet")),
+        k if k.starts_with("IVF") || k.starts_with("HNSW") => {}
         other => {
             return Err(bad(format!(
-                "index type {other} is not supported; use IVF_FLAT or IVF_PQ"
+                "index type {other} is not supported; vector columns use IVF_HNSW_SQ"
             )));
         }
-    };
-    let request = VectorIndexRequest {
+    }
+    let spec = VectorIndexSpec {
+        name: body.name.unwrap_or_else(|| format!("{}_idx", body.column)),
         column: body.column,
-        name: body.name,
-        metric: body.metric_type,
-        replace: body.replace.unwrap_or(true),
-        product_quantization,
-        num_partitions: body.num_partitions,
-        num_sub_vectors: body.num_sub_vectors,
+        metric: body
+            .metric_type
+            .unwrap_or_else(|| "l2".into())
+            .to_lowercase(),
     };
+    let mut revision = s.revision.lock().await;
+    *revision = format!("\"{}\"", uuid::Uuid::new_v4());
     engine
-        .create_vector_index(&name, &request)
+        .configure_vector_index(&name, spec)
         .await
         .map_err(|e| error(e.as_ref()))?;
     Ok(Json(serde_json::json!({})).into_response())
@@ -403,11 +426,47 @@ async fn list_indices(
 ) -> Reply {
     let engine = engine(&s, &h)?;
     let indexes: Vec<_> = engine
-        .list_indices(&name)
+        .vector_indexes(&name)
         .await
         .map_err(|e| error(e.as_ref()))?
         .into_iter()
-        .map(|i| serde_json::json!({"index_name": i.name, "index_uuid": i.uuid, "columns": i.columns}))
+        .map(|i| {
+            serde_json::json!({
+                "index_name": i.name,
+                "columns": [i.column],
+                "index_type": "IVF_HNSW_SQ",
+                "distance_type": i.metric,
+            })
+        })
         .collect();
     Ok(Json(serde_json::json!({"indexes": indexes})).into_response())
+}
+
+async fn compact_lsm(
+    State(s): State<Arc<Service>>,
+    Path(name): Path<String>,
+    h: HeaderMap,
+) -> Reply {
+    let engine = engine(&s, &h)?;
+    let result = engine.compact(&name).await.map_err(|e| error(e.as_ref()))?;
+    Ok(Json(match result {
+        Some(r) => serde_json::json!({"merged": r.merged.len(), "rows": r.rows, "generation": r.output.generation}),
+        None => serde_json::json!({"merged": 0}),
+    })
+    .into_response())
+}
+
+async fn flush_lsm(State(s): State<Arc<Service>>, Path(name): Path<String>, h: HeaderMap) -> Reply {
+    let engine = engine(&s, &h)?;
+    engine.flush(&name).await.map_err(|e| error(e.as_ref()))?;
+    Ok(Json(serde_json::json!({})).into_response())
+}
+
+async fn lsm_stats(State(s): State<Arc<Service>>, Path(name): Path<String>, h: HeaderMap) -> Reply {
+    let engine = engine(&s, &h)?;
+    let stats = engine
+        .lsm_stats(&name)
+        .await
+        .map_err(|e| error(e.as_ref()))?;
+    Ok(Json(serde_json::to_value(stats).map_err(|e| bad(e.to_string()))?).into_response())
 }

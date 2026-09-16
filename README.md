@@ -75,12 +75,24 @@ through. `integration/compose.yaml` runs a full local stack against MinIO, and
 
 The server speaks the LanceDB remote protocol, so the SDK's `connect`,
 `create_table`, `open_table`, `list_tables`, `drop_table`, `add`,
-`count_rows`, and `search` with `where`, `select`, `limit`, `offset`, and
-vector queries all work unchanged. Vector search is exact across every tier.
+`count_rows`, `create_index`, `list_indices`, and `search` with `where`,
+`select`, `limit`, `offset`, and vector queries all work unchanged.
 
-Not yet: `create_index` (vector indexes need base-table rows, and this build
-has no LSM compaction), full-text search, `update`, `delete`, `merge_insert`,
-and namespaces. Each returns a 400 with a plain reason.
+**Vector indexes.** Every vector column is indexed from the first row: an HNSW
+graph over the memtable, flushed as an IVF_HNSW_SQ index on each generation,
+and rebuilt when generations are compacted. There is no separate training
+step. `create_index` sets the metric (`l2`, `cosine`, `dot`) and rewrites the
+flushed generations before it returns, so queries never see a stale index.
+Queries use the index's metric; asking for a different one is an error.
+
+**Compaction.** Flushed generations are merged in the background once eight
+exist, keeping the newest row per key and rebuilding the indexes, so query
+fan-out stays bounded. `POST /v1/table/{name}/compact_lsm/` runs one now,
+`flush_lsm/` forces a flush, and `get_lsm_stats/` lists generations with row
+counts and index names.
+
+Not yet: full-text search, `update`, `delete`, `merge_insert`, and namespaces.
+Each returns a 400 with a plain reason.
 
 **Primary keys.** Mark a field with the Lance metadata
 `lance-schema:unenforced-primary-key = "true"` on your Arrow schema to use it as

@@ -242,24 +242,138 @@ async fn lancedb_protocol_round_trip() {
     );
     assert_eq!(ids(&rows(&bytes)), [3]);
 
-    // Vector indexes need base-table rows, which this build cannot produce yet:
-    // the request is refused with a clear reason and search stays exact.
-    let (status, body) = post_json(
-        &app,
-        "/v1/table/clicks/create_index/",
-        json!({"column": "vector", "index_type": "IVF_FLAT", "metric_type": "l2"}),
-    )
-    .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-    assert!(body.as_str().unwrap().contains("compaction"), "{body}");
+    // Every vector column carries an HNSW index from creation. Flushing
+    // between inserts leaves one generation per flush, each with its own
+    // IVF_HNSW_SQ index built from the memtable graph.
     let (_, listed) = post_json(&app, "/v1/table/clicks/index/list/", json!({})).await;
-    assert_eq!(listed["indexes"], json!([]));
+    assert_eq!(listed["indexes"][0]["columns"], json!(["vector"]));
+    assert_eq!(listed["indexes"][0]["distance_type"], json!("l2"));
+    let (status, _) = post_json(&app, "/v1/table/clicks/flush_lsm/", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    for id in 10..13 {
+        let step = (id - 10) as f32 * 0.1;
+        let (status, _) = send(
+            &app,
+            "POST",
+            "/v1/table/clicks/insert/",
+            arrow,
+            ipc(&[batch(&[(id, "denver", [0.5 + step, 0.5 - step])])]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = post_json(&app, "/v1/table/clicks/flush_lsm/", json!({})).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    let (status, stats) = post_json(&app, "/v1/table/clicks/get_lsm_stats/", json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{stats}");
+    let sstables = stats["sstables"].as_array().unwrap();
+    assert_eq!(sstables.len(), 4, "{stats}");
+    for sstable in sstables {
+        assert_eq!(sstable["indices"], json!(["vector_idx"]), "{stats}");
+    }
+    let (_, count) = post_json(&app, "/v1/table/clicks/count_rows/", json!({})).await;
+    assert_eq!(count, json!(6));
+
+    // Compaction folds the generations into one that keeps every row, the
+    // newest-per-key semantics, and a rebuilt vector index.
+    let (status, compacted) = post_json(&app, "/v1/table/clicks/compact_lsm/", json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{compacted}");
+    assert_eq!(compacted["merged"], json!(4), "{compacted}");
+    assert_eq!(compacted["rows"], json!(6), "{compacted}");
+    let (_, stats) = post_json(&app, "/v1/table/clicks/get_lsm_stats/", json!({})).await;
+    let sstables = stats["sstables"].as_array().unwrap();
+    assert_eq!(sstables.len(), 1, "{stats}");
+    assert_eq!(sstables[0]["rows"], json!(6), "{stats}");
+    assert_eq!(sstables[0]["indices"], json!(["vector_idx"]), "{stats}");
+    let (_, count) = post_json(&app, "/v1/table/clicks/count_rows/", json!({})).await;
+    assert_eq!(count, json!(6));
     let (status, bytes) = send(
         &app,
         "POST",
         "/v1/table/clicks/query/",
         "application/json",
-        json!({"k": 1, "vector": [1.0, 0.1], "prefilter": true, "version": null})
+        json!({"k": 2, "vector": [0.0, 0.9], "prefilter": true, "version": null})
+            .to_string()
+            .into_bytes(),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    assert_eq!(ids(&rows(&bytes)), [1, 10]);
+    let (status, bytes) = send(&app, "POST", "/v1/table/clicks/query/", "application/json",
+        json!({"k": 3, "vector": [0.5, 0.5], "filter": "city = 'denver'", "prefilter": true, "version": null}).to_string().into_bytes()).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let mut denver = ids(&rows(&bytes));
+    denver.sort();
+    assert_eq!(denver, [10, 11, 12]);
+    // Rows written after compaction land in a fresh memtable and merge in.
+    let (status, _) = send(
+        &app,
+        "POST",
+        "/v1/table/clicks/insert/",
+        arrow,
+        ipc(&[batch(&[(20, "tacoma", [0.0, 0.95])])]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, bytes) = send(
+        &app,
+        "POST",
+        "/v1/table/clicks/query/",
+        "application/json",
+        json!({"k": 1, "vector": [0.0, 0.94], "prefilter": true, "version": null})
+            .to_string()
+            .into_bytes(),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    assert_eq!(ids(&rows(&bytes)), [20]);
+
+    // create_index switches the metric; the table reopens with the new spec.
+    let (status, body) = post_json(
+        &app,
+        "/v1/table/clicks/create_index/",
+        json!({"column": "vector", "index_type": "IVF_HNSW_SQ", "metric_type": "cosine"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, listed) = post_json(&app, "/v1/table/clicks/index/list/", json!({})).await;
+    assert_eq!(listed["indexes"][0]["distance_type"], json!("cosine"));
+    let (_, stats) = post_json(&app, "/v1/table/clicks/get_lsm_stats/", json!({})).await;
+    assert_eq!(
+        stats["sstables"].as_array().unwrap().len(),
+        1,
+        "metric change rewrites generations: {stats}"
+    );
+    // The query metric defaults to the index's; restating a different one is an error.
+    let (status, bytes) = send(&app, "POST", "/v1/table/clicks/query/", "application/json",
+        json!({"k": 1, "vector": [1.0, 0.05], "distance_type": "l2", "prefilter": true, "version": null}).to_string().into_bytes()).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let (status, bytes) = send(
+        &app,
+        "POST",
+        "/v1/table/clicks/query/",
+        "application/json",
+        json!({"k": 1, "vector": [1.0, 0.05], "prefilter": true, "version": null})
             .to_string()
             .into_bytes(),
     )
@@ -271,6 +385,17 @@ async fn lancedb_protocol_round_trip() {
         String::from_utf8_lossy(&bytes)
     );
     assert_eq!(ids(&rows(&bytes)), [2]);
+    let (status, bytes) = send(&app, "POST", "/v1/table/clicks/query/", "application/json",
+        json!({"k": 1, "vector": [1.0, 0.05], "distance_type": "cosine", "prefilter": true, "version": null}).to_string().into_bytes()).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    assert_eq!(ids(&rows(&bytes)), [2]);
+    let (_, count) = post_json(&app, "/v1/table/clicks/count_rows/", json!({})).await;
+    assert_eq!(count, json!(7));
 
     // List, unknown table is 404, drop, then gone.
     let (status, bytes) = send(&app, "GET", "/v1/table/", "application/json", Vec::new()).await;

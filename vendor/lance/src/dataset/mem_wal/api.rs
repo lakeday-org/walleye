@@ -643,8 +643,9 @@ impl DatasetMemWalExt for Dataset {
         // Get maintained_indexes from the MemWalIndex details
         let maintained_indexes = &mem_wal_index.details.maintained_indexes;
 
-        let index_configs =
+        let mut index_configs =
             build_index_configs(self, maintained_indexes, &config.hnsw_params).await?;
+        index_configs.extend(config.extra_index_configs.iter().cloned());
 
         // Set shard_id in config
         config.shard_id = shard_id;

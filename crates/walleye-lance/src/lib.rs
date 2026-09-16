@@ -18,10 +18,12 @@ pub use ipc::{
 };
 pub use lance::Error as LanceError;
 pub use lance::arrow::json::JsonSchema;
+pub use lance::dataset::mem_wal::{CompactionResult, Compactor};
 pub use sql::{SnapshotSource, TableSnapshot, query};
 pub use storage_options::LanceStorageOptions;
 pub use table::{
-    IndexInfo, ScanResult, SearchRequest, Table, TableConfig, VectorIndexRequest, VectorQuery,
+    LsmStats, ScanResult, SearchRequest, SsTableStats, Table, TableConfig, VectorIndexSpec,
+    VectorQuery,
 };
 pub type Error = WalBackendError;
 pub type Result<T> = std::result::Result<T, WalBackendError>;

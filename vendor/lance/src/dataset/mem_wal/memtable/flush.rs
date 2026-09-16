@@ -66,6 +66,63 @@ fn compute_dedup_deletions(batches: &[RecordBatch], pk_indices: &[usize]) -> Roa
     deleted
 }
 
+/// Result of merging a shard's flushed generations into one.
+#[derive(Debug, Clone)]
+pub struct CompactionResult {
+    /// Generations that were merged and removed from the manifest. Their
+    /// directories still exist until [`Compactor::delete_generations`] runs,
+    /// so in-flight snapshots that reference them keep working.
+    pub merged: Vec<SsTable>,
+    pub output: SsTable,
+    pub rows: usize,
+}
+
+/// Merges SSTable generations without holding the shard writer. Cloned out
+/// of [`super::super::write::ShardWriter::compactor`].
+#[derive(Clone)]
+pub struct Compactor {
+    pub(crate) flusher: Arc<MemTableFlusher>,
+    pub(crate) epoch: u64,
+    pub(crate) logical_schema: Arc<arrow_schema::Schema>,
+    pub(crate) pk_columns: Vec<String>,
+    pub(crate) index_configs: Vec<MemIndexConfig>,
+}
+
+impl Compactor {
+    /// Merge every flushed generation into one when at least `min_sstables`
+    /// exist. `1` rewrites a single generation, which is how a changed index
+    /// configuration reaches already-flushed rows. Returns `None` when there
+    /// is nothing to do.
+    pub async fn compact(&self, min_sstables: usize) -> Result<Option<CompactionResult>> {
+        self.flusher
+            .compact(
+                self.epoch,
+                &self.logical_schema,
+                &self.pk_columns,
+                &self.index_configs,
+                min_sstables,
+            )
+            .await
+    }
+
+    /// Remove the directories of generations that a compaction replaced. Call
+    /// only after every reader that could hold a pre-compaction snapshot has
+    /// finished.
+    pub async fn delete_generations(&self, sstables: &[SsTable]) -> Result<()> {
+        self.flusher.delete_generations(sstables).await
+    }
+
+    pub async fn sstable_count(&self) -> Result<usize> {
+        Ok(self
+            .flusher
+            .manifest_store
+            .read_latest()
+            .await?
+            .map(|m| m.sstables.len())
+            .unwrap_or(0))
+    }
+}
+
 pub struct MemTableFlusher {
     object_store: Arc<ObjectStore>,
     base_path: Path,
@@ -1134,6 +1191,265 @@ impl MemTableFlusher {
     }
 
     /// Update the shard manifest with the new SSTable.
+    /// Merge all flushed generations into one generation carrying the
+    /// newest row per primary key, a fresh PK sidecar and bloom filter, and
+    /// the shard's secondary indexes rebuilt over the merged rows. The output
+    /// takes the highest merged generation number so newer memtables still
+    /// shadow it. The manifest swap is one CAS under the writer's epoch.
+    pub(crate) async fn compact(
+        &self,
+        epoch: u64,
+        logical_schema: &Arc<arrow_schema::Schema>,
+        pk_columns: &[String],
+        index_configs: &[MemIndexConfig],
+        min_sstables: usize,
+    ) -> Result<Option<CompactionResult>> {
+        use crate::dataset::WriteParams;
+        use crate::dataset::mem_wal::TOMBSTONE;
+        use crate::dataset::mem_wal::scanner::{LsmScanner, ShardSnapshot};
+        use crate::index::DatasetIndexExt;
+        use crate::index::vector::VectorIndexParams;
+        use arrow_array::{BooleanArray, RecordBatchIterator};
+        use futures::TryStreamExt;
+        use lance_core::utils::bloomfilter::sbbf::Sbbf;
+        use lance_index::vector::{ivf::IvfBuildParams, sq::builder::SQBuildParams};
+        use std::collections::HashSet;
+
+        self.manifest_store.check_fenced(epoch).await?;
+        let Some(manifest) = self.manifest_store.read_latest().await? else {
+            return Ok(None);
+        };
+        if manifest.sstables.is_empty() || manifest.sstables.len() < min_sstables.max(1) {
+            return Ok(None);
+        }
+        let mut merged = manifest.sstables.clone();
+        merged.sort_by_key(|s| s.generation);
+        let generation = merged.last().map(|s| s.generation).unwrap_or(0);
+
+        // Newest-per-key rows across the merged generations only.
+        let snapshot = merged.iter().fold(
+            ShardSnapshot::new(self.shard_id)
+                .with_spec_id(manifest.shard_spec_id)
+                .with_current_generation(manifest.current_generation),
+            |s, t| s.with_sstable(t.generation, t.path.clone()),
+        );
+        let columns: Vec<String> = logical_schema
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+        let mut scanner = LsmScanner::without_base_table(
+            logical_schema.clone(),
+            self.base_uri.clone(),
+            vec![snapshot],
+            pk_columns.to_vec(),
+        )
+        .project(&columns)?;
+        if let Some(params) = &self.store_params {
+            scanner = scanner.with_store_params(derived_store_params(params));
+        }
+        if let Some(session) = &self.session {
+            scanner = scanner.with_session(session.clone());
+        }
+        let batches: Vec<RecordBatch> = scanner
+            .try_into_stream()
+            .await?
+            .try_collect()
+            .await
+            .map_err(|e| Error::io(format!("compaction scan failed: {e}")))?;
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+
+        // Storage layout matches a flushed generation: tombstone column,
+        // relaxed nullability. Take it from the newest merged generation.
+        let template_uri = format!(
+            "{}/_mem_wal/{}/{}",
+            self.base_uri.trim_end_matches('/'),
+            self.shard_id,
+            merged.last().map(|s| s.path.as_str()).unwrap_or_default()
+        );
+        let storage_schema: Arc<arrow_schema::Schema> =
+            Arc::new(self.open_generation(&template_uri).await?.schema().into());
+        let mut out = Vec::with_capacity(batches.len());
+        for batch in &batches {
+            let mut cols = Vec::with_capacity(storage_schema.fields().len());
+            for field in storage_schema.fields() {
+                if field.name() == TOMBSTONE {
+                    cols.push(Arc::new(BooleanArray::from(vec![false; batch.num_rows()]))
+                        as Arc<dyn arrow_array::Array>);
+                } else {
+                    let idx = batch.schema().index_of(field.name()).map_err(|_| {
+                        Error::io(format!(
+                            "compaction output is missing column {}",
+                            field.name()
+                        ))
+                    })?;
+                    cols.push(batch.column(idx).clone());
+                }
+            }
+            out.push(RecordBatch::try_new(storage_schema.clone(), cols)?);
+        }
+        if out.is_empty() {
+            out.push(RecordBatch::new_empty(storage_schema.clone()));
+        }
+
+        let random_hash = generate_random_hash();
+        let gen_folder_name = format!("{}_gen_{}", random_hash, generation);
+        let gen_path = sstable_path(&self.base_path, &self.shard_id, &random_hash, generation);
+        info!(
+            "Compacting {} generations of shard {} into {} ({} rows)",
+            merged.len(),
+            self.shard_id,
+            gen_path,
+            rows
+        );
+        let uri = self.path_to_uri(&gen_path);
+        let reader = RecordBatchIterator::new(
+            out.clone().into_iter().map(Ok),
+            storage_schema.clone(),
+        );
+        let write_params = WriteParams {
+            max_rows_per_file: usize::MAX,
+            data_storage_version: Some(self.base_storage_version().await?.to_selector()),
+            store_params: self.store_params.as_ref().map(derived_store_params),
+            session: self.session.clone(),
+            ..Default::default()
+        };
+        Dataset::write(reader, &uri, Some(write_params)).await?;
+        let mut dataset = self.open_generation(&uri).await?;
+
+        if rows > 0 {
+            for config in index_configs {
+                match config {
+                    MemIndexConfig::Hnsw(cfg) => {
+                        let params = VectorIndexParams::with_ivf_hnsw_sq_params(
+                            cfg.distance_type,
+                            IvfBuildParams::new(1),
+                            cfg.build_params.clone(),
+                            SQBuildParams::default(),
+                        );
+                        dataset
+                            .create_index(
+                                &[cfg.column.as_str()],
+                                IndexType::Vector,
+                                Some(cfg.name.clone()),
+                                &params,
+                                true,
+                            )
+                            .await?;
+                    }
+                    MemIndexConfig::BTree(cfg) => {
+                        dataset
+                            .create_index(
+                                &[cfg.column.as_str()],
+                                IndexType::BTree,
+                                Some(cfg.name.clone()),
+                                &ScalarIndexParams::default(),
+                                true,
+                            )
+                            .await?;
+                    }
+                    // Full-text indexes are only built from the memtable today.
+                    MemIndexConfig::Fts(_) => {}
+                }
+            }
+
+            if !pk_columns.is_empty() {
+                let lance_schema = dataset.schema();
+                let pk_fields = pk_columns
+                    .iter()
+                    .map(|c| {
+                        lance_schema
+                            .field(c)
+                            .map(|f| (c.clone(), f.id))
+                            .ok_or_else(|| Error::io(format!("primary key {c} missing")))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let mut registry = super::super::index::IndexStore::new();
+                registry.enable_pk_index(&pk_fields);
+                let mut offset = 0u64;
+                for batch in &out {
+                    registry.insert(batch, offset)?;
+                    offset += batch.num_rows() as u64;
+                }
+                self.create_pk_index(&gen_path, Some(&registry)).await?;
+
+                let pk_indices = pk_columns
+                    .iter()
+                    .map(|c| storage_schema.index_of(c))
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                let mut bloom = Sbbf::with_ndv_fpp((rows as u64).max(8192), 0.00057)
+                    .map_err(|e| Error::io(format!("bloom filter: {e:?}")))?;
+                for batch in &out {
+                    for row in 0..batch.num_rows() {
+                        bloom.insert_hash(compute_pk_hash(batch, &pk_indices, row));
+                    }
+                }
+                self.write_bloom_filter(&gen_path.clone().join("bloom_filter.bin"), &bloom)
+                    .await?;
+            }
+        }
+
+        self.warm_generation(&uri).await;
+
+        let merged_paths: HashSet<String> = merged.iter().map(|s| s.path.clone()).collect();
+        let output = SsTable {
+            generation,
+            path: gen_folder_name,
+        };
+        let new_manifest = self
+            .manifest_store
+            .commit_update(epoch, |current| {
+                let mut sstables: Vec<SsTable> = current
+                    .sstables
+                    .iter()
+                    .filter(|s| !merged_paths.contains(&s.path))
+                    .cloned()
+                    .collect();
+                sstables.push(output.clone());
+                sstables.sort_by_key(|s| s.generation);
+                ShardManifest {
+                    version: current.version + 1,
+                    sstables,
+                    ..current.clone()
+                }
+            })
+            .await?;
+        info!(
+            "Compacted shard {} into generation {} (manifest version {})",
+            self.shard_id, generation, new_manifest.version
+        );
+        Ok(Some(CompactionResult {
+            merged,
+            output,
+            rows,
+        }))
+    }
+
+    pub(crate) async fn delete_generations(&self, sstables: &[SsTable]) -> Result<()> {
+        use futures::TryStreamExt;
+        for sstable in sstables {
+            let prefix = crate::dataset::mem_wal::util::shard_base_path(
+                &self.base_path,
+                &self.shard_id,
+            )
+            .join(sstable.path.as_str());
+            let objects: Vec<_> = self
+                .object_store
+                .inner
+                .list(Some(&prefix))
+                .try_collect()
+                .await
+                .map_err(|e| Error::io(format!("list {prefix}: {e}")))?;
+            for object in objects {
+                match self.object_store.inner.delete(&object.location).await {
+                    Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
+                    Err(e) => warn!("could not delete {}: {e}", object.location),
+                }
+            }
+        }
+        Ok(())
+    }
+
     async fn update_manifest(
         &self,
         epoch: u64,
