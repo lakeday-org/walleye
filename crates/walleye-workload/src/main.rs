@@ -14,7 +14,9 @@ use sha2::{Digest, Sha256};
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use walleye_bitr::{HttpReplica, QuorumWriter};
 use walleye_cache::PeerConfig;
-use walleye_lance::{BitrWalBackend, CachedStorage, LanceDurability, Table, TableConfig};
+use walleye_lance::{
+    BitrWalBackend, CachedStorage, LanceDurability, Table, TableConfig, next_writer_epoch,
+};
 use walleye_ring::{Membership, Node};
 
 type Error = Box<dyn std::error::Error>;
@@ -184,24 +186,39 @@ async fn main() -> Result<(), Error> {
         vec!["id".into()],
     )?;
     let stream_id = config.stream.clone();
-    let backend = if mode == "cluster" {
+    let writer = if mode == "cluster" {
         let root = base64::engine::general_purpose::STANDARD
             .decode(required("LAKEDAY_DATAPLANE_ROOT_KEY")?)?;
-        Some(Arc::new(BitrWalBackend::new(
-            Arc::new(QuorumWriter::new(
-                Arc::new(HttpReplica::new(
-                    required("WALLEYE_BITR_URL")?,
-                    token(&root, tenant),
-                )),
-                [7; 32],
+        Some(Arc::new(QuorumWriter::new(
+            Arc::new(HttpReplica::new(
+                required("WALLEYE_BITR_URL")?,
+                token(&root, tenant),
             )),
-            &config.stream,
-            config.shard_id,
-            1,
-        )?))
+            [7; 32],
+        )))
     } else {
         None
     };
+    // Every open claims the next MemWAL writer epoch, so the Bitr identity is
+    // minted per open at that epoch. Reusing one backend across reopens would
+    // append under a fenced epoch.
+    let mint =
+        async |writer: &Option<Arc<QuorumWriter>>| -> Result<Option<Arc<BitrWalBackend>>, Error> {
+            match writer {
+                Some(writer) => {
+                    let epoch =
+                        next_writer_epoch(&cache.storage, &config.uri, config.shard_id).await?;
+                    Ok(Some(Arc::new(BitrWalBackend::new(
+                        writer.clone(),
+                        &config.stream,
+                        config.shard_id,
+                        epoch,
+                    )?)))
+                }
+                None => Ok(None),
+            }
+        };
+    let backend = mint(&writer).await?;
     let durability = backend
         .clone()
         .map(LanceDurability::Bitr)
@@ -262,12 +279,12 @@ async fn main() -> Result<(), Error> {
     )?;
     table.close().await?;
     // Reopen after checkpoint to force reads of real S3 Lance files through Foyer.
-    let durability = if let Some(b) = &backend {
-        LanceDurability::Bitr(b.clone())
-    } else {
-        LanceDurability::ObjectStore
-    };
-    let mut table = Table::open(config, cache.storage.clone(), durability).await?;
+    let reopened_backend = mint(&writer).await?;
+    let durability = reopened_backend
+        .clone()
+        .map(LanceDurability::Bitr)
+        .unwrap_or(LanceDurability::ObjectStore);
+    let mut table = Table::open(config.clone(), cache.storage.clone(), durability).await?;
     assert_rows(
         &table
             .scan(None, expected + 1)
@@ -275,7 +292,6 @@ async fn main() -> Result<(), Error> {
             .map_err(|e| format!("scan at workload line {}: {e}", line!()))?,
         expected,
     )?;
-    let before = cache.peers.as_ref().map(|s| s.snapshot());
     for _ in 0..3 {
         assert_rows(
             &table
@@ -285,15 +301,63 @@ async fn main() -> Result<(), Error> {
             expected,
         )?;
     }
-    let after = cache.peers.as_ref().map(|s| s.snapshot());
-    if let (Some(b), Some(a)) = (&before, &after) {
+    let published = cache.peers.as_ref().map(|s| s.snapshot());
+    if let Some(published) = &published {
+        // Reads publish blocks into the owning peers' caches.
         assert!(
-            a["peer_hits"].as_u64().unwrap() > b["peer_hits"].as_u64().unwrap(),
-            "warm query must hit actual peer Foyer entries"
+            published["peer_stores"].as_u64().unwrap_or(0) > 0,
+            "reads must publish blocks to the owning peers: {published}"
         );
-        assert!(a["peer_stores"].as_u64().unwrap() > 0);
     }
     table.close().await?;
+    let mut peer_served = None;
+    if let Some(peer) = peer.clone() {
+        // A warm handle keeps its opened generations, so repeated scans no
+        // longer reach the object store at all; peer serving is verified with
+        // a reader that holds nothing locally. Its blocks must come from the
+        // peers the reads above published to, not from S3.
+        let cold = CachedStorage::open(
+            format!("{dir}/{prefix}/{mode}-cold"),
+            tenant,
+            32 * 1024 * 1024,
+            128 * 1024 * 1024,
+            params.clone(),
+            Some(peer),
+        )
+        .await?;
+        let durability = match &writer {
+            Some(writer) => {
+                let epoch = next_writer_epoch(&cold.storage, &config.uri, config.shard_id).await?;
+                LanceDurability::Bitr(Arc::new(BitrWalBackend::new(
+                    writer.clone(),
+                    &config.stream,
+                    config.shard_id,
+                    epoch,
+                )?))
+            }
+            None => LanceDurability::ObjectStore,
+        };
+        let mut cold_table = Table::open(config.clone(), cold.storage.clone(), durability).await?;
+        assert_rows(
+            &cold_table
+                .scan(None, expected + 1)
+                .await
+                .map_err(|e| format!("cold scan at workload line {}: {e}", line!()))?,
+            expected,
+        )?;
+        let served = cold
+            .peers
+            .as_ref()
+            .map(|s| s.snapshot())
+            .ok_or("the cold reader has no peer statistics")?;
+        assert!(
+            served["peer_hits"].as_u64().unwrap_or(0) > 0,
+            "a reader with an empty cache must serve blocks from its peers: {served}"
+        );
+        peer_served = Some(served);
+        cold_table.close().await?;
+        cold.backend.close().await?;
+    }
     // Test live cache reclamation using the same resource manager as query execution.
     let runtime = cache.resources.runtime()?;
     let reservation = MemoryConsumer::new("acceptance-query").register(&runtime.memory_pool);
@@ -399,7 +463,7 @@ async fn main() -> Result<(), Error> {
     cache.backend.flush().await;
     let memory_used = cache.backend.memory_usage();
     cache.backend.close().await?;
-    let report = serde_json::json!({"mode":mode,"rows":expected,"s3_cas":true,"hot_read":true,"checkpoint_read":true,"checkpoint_releases_wal_buffers":mode=="cluster","reopen_read":true,"memory_reclamation":true,"disk_reclamation":true,"authentication":mode=="cluster","peer_before":before,"peer_after":after,"nodes":node_stats,"commit":knowledge,"archive_segments":archive_segments,"archived_positions":archived_positions,"lance_objects":objects.len(),"local_cache_memory":memory_used});
+    let report = serde_json::json!({"mode":mode,"rows":expected,"s3_cas":true,"hot_read":true,"checkpoint_read":true,"checkpoint_releases_wal_buffers":mode=="cluster","reopen_read":true,"memory_reclamation":true,"disk_reclamation":true,"authentication":mode=="cluster","peer_published":published,"peer_served":peer_served,"nodes":node_stats,"commit":knowledge,"archive_segments":archive_segments,"archived_positions":archived_positions,"lance_objects":objects.len(),"local_cache_memory":memory_used});
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
 }

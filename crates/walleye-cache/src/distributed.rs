@@ -35,11 +35,14 @@ pub struct PeerStats {
     pub peer_misses: AtomicU64,
     pub peer_errors: AtomicU64,
     pub peer_stores: AtomicU64,
+    /// Inserts that were never offered to a peer: no codec to serialize with,
+    /// or larger than one peer envelope.
+    pub peer_skipped: AtomicU64,
     pub loads: AtomicU64,
 }
 impl PeerStats {
     pub fn snapshot(&self) -> serde_json::Value {
-        serde_json::json!({"local_hits":self.local_hits.load(Ordering::Relaxed),"peer_hits":self.peer_hits.load(Ordering::Relaxed),"peer_misses":self.peer_misses.load(Ordering::Relaxed),"peer_errors":self.peer_errors.load(Ordering::Relaxed),"peer_stores":self.peer_stores.load(Ordering::Relaxed),"loads":self.loads.load(Ordering::Relaxed)})
+        serde_json::json!({"local_hits":self.local_hits.load(Ordering::Relaxed),"peer_hits":self.peer_hits.load(Ordering::Relaxed),"peer_misses":self.peer_misses.load(Ordering::Relaxed),"peer_errors":self.peer_errors.load(Ordering::Relaxed),"peer_stores":self.peer_stores.load(Ordering::Relaxed),"peer_skipped":self.peer_skipped.load(Ordering::Relaxed),"loads":self.loads.load(Ordering::Relaxed)})
     }
 }
 /// A Lance backend whose serializable entries are offered to their ring owner.
@@ -165,11 +168,29 @@ impl CacheBackend for DistributedCache {
                         self.stats.peer_stores.fetch_add(1, Ordering::Relaxed);
                         return;
                     }
-                    _ => {
-                        self.stats.peer_errors.fetch_add(1, Ordering::Relaxed);
+                    other => {
+                        // A silent peer error is why a broken distributed
+                        // cache looks like a slow one; say what happened.
+                        if self.stats.peer_errors.fetch_add(1, Ordering::Relaxed) < 3 {
+                            match other {
+                                Ok(response) => eprintln!(
+                                    "walleye.peer op=store owner={} outcome=refused status={}",
+                                    owner.id,
+                                    response.status()
+                                ),
+                                Err(error) => eprintln!(
+                                    "walleye.peer op=store owner={} outcome=error error={error}",
+                                    owner.id
+                                ),
+                            }
+                        }
                     }
                 }
+            } else {
+                self.stats.peer_skipped.fetch_add(1, Ordering::Relaxed);
             }
+        } else {
+            self.stats.peer_skipped.fetch_add(1, Ordering::Relaxed);
         }
         self.local.insert(key, entry, size, codec).await;
     }

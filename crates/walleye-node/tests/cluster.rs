@@ -219,14 +219,38 @@ async fn every_member_serves_every_stream_with_one_owner() {
         assert_eq!(r.status(), 200);
         assert_eq!(r.json::<serde_json::Value>().await.unwrap()[0]["n"], 30);
     }
+    // SQL spanning members runs on the node that received it, which gathers
+    // the rows it does not own from their owners. Every member gives the
+    // same answer.
+    for member in &members {
+        let r = client
+            .post(format!("{}/v1/query", member.base))
+            .header("authorization", format!("Bearer {TOKEN}"))
+            .json(&serde_json::json!({
+                "sql": format!(
+                    "SELECT (SELECT count(*) FROM {a}) + (SELECT count(*) FROM {b}) AS n"
+                )
+            }))
+            .send()
+            .await
+            .unwrap();
+        let status = r.status();
+        let body = r.json::<serde_json::Value>().await.unwrap();
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body[0]["n"], 60, "via {}: {body}", member.id);
+    }
+    // A join across members sees every row of both tables.
     let r = client
         .post(format!("{}/v1/query", members[0].base))
         .header("authorization", format!("Bearer {TOKEN}"))
-        .json(&serde_json::json!({"sql": format!("SELECT count(*) FROM {a}, {b}")}))
+        .json(&serde_json::json!({
+            "sql": format!("SELECT count(*) AS n FROM {a} JOIN {b} ON {a}.id = {b}.id")
+        }))
         .send()
         .await
         .unwrap();
-    assert_eq!(r.status(), 400);
+    assert_eq!(r.status(), 200);
+    assert_eq!(r.json::<serde_json::Value>().await.unwrap()[0]["n"], 30);
 
     // A forward that carries a stale membership view is fenced, and a
     // forwarded request that lands on a non-owner is refused instead of

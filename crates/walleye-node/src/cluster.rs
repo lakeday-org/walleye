@@ -99,6 +99,33 @@ impl Cluster {
         }
         Ok(())
     }
+    /// Fetch every row of `stream` from the member that owns it, as an Arrow
+    /// IPC file, for a query that spans owners.
+    pub async fn fetch_snapshot(&self, owner: &Node, stream: &str) -> Result<bytes::Bytes, String> {
+        let url = format!(
+            "{}/internal/snapshot/{stream}",
+            owner.endpoint.trim_end_matches('/')
+        );
+        let response = self
+            .client
+            .get(url)
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(|error| format!("owner {} is unreachable: {error}", owner.id))?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(format!(
+                "owner {} refused a snapshot of {stream} with {status}: {body}",
+                owner.id
+            ));
+        }
+        response
+            .bytes()
+            .await
+            .map_err(|error| format!("owner {} truncated {stream}: {error}", owner.id))
+    }
     /// Relay one request to `owner` and return its response verbatim.
     pub async fn forward(
         &self,
@@ -254,15 +281,13 @@ pub async fn route_to_owner(
                         .sort_by(|a, b| a.as_ref().map(|n| &n.id).cmp(&b.as_ref().map(|n| &n.id)));
                     owners.dedup_by(|a, b| a.as_ref().map(|n| &n.id) == b.as_ref().map(|n| &n.id));
                     match owners.as_slice() {
+                        // Every referenced table is owned here, or the query
+                        // names none: run it locally.
                         [] | [None] => None,
                         [Some(owner)] => Some(format!("\u{0}{}", owner.id)),
-                        _ => {
-                            return (
-                                StatusCode::BAD_REQUEST,
-                                "SQL spans tables owned by different members; query them separately",
-                            )
-                                .into_response();
-                        }
+                        // Tables spread across members: this node runs the
+                        // query and gathers the rows it does not own.
+                        _ => None,
                     }
                 }
                 Some(Err(error)) => {

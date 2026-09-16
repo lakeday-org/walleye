@@ -72,15 +72,39 @@ pub async fn query(
     tables: &[(String, Arc<dyn SnapshotSource>)],
     sql: &str,
 ) -> lance::Result<ScanResult> {
+    query_with_gathered(storage, tables, &[], sql).await
+}
+
+/// As [`query`], plus tables whose rows were gathered from the member that
+/// owns them. A gathered table is a point-in-time copy taken by its owner, so
+/// it carries that owner's unflushed rows; it is registered in memory for the
+/// life of this query only.
+pub async fn query_with_gathered(
+    storage: &LanceStorageOptions,
+    tables: &[(String, Arc<dyn SnapshotSource>)],
+    gathered: &[(String, SchemaRef, Vec<arrow_array::RecordBatch>)],
+    sql: &str,
+) -> lance::Result<ScanResult> {
+    use lance::deps::datafusion::datasource::MemTable;
     tokio::time::timeout(storage.query_timeout(), async {
         let ctx = context(storage)?;
         for (name, table) in tables {
+            if gathered.iter().any(|(gathered, _, _)| gathered == name) {
+                continue;
+            }
             ctx.register_table(
                 name.as_str(),
                 Arc::new(StreamProvider {
                     source: table.clone(),
                     snapshot: tokio::sync::OnceCell::new(),
                 }),
+            )
+            .map_err(err)?;
+        }
+        for (name, schema, batches) in gathered {
+            ctx.register_table(
+                name.as_str(),
+                Arc::new(MemTable::try_new(schema.clone(), vec![batches.clone()]).map_err(err)?),
             )
             .map_err(err)?;
         }

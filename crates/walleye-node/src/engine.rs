@@ -29,6 +29,11 @@ use walleye_ring::Node;
 
 /// Merge flushed generations once this many exist.
 pub const COMPACT_MIN_SSTABLES: usize = 8;
+/// The largest stream one member will hand to another for a query that spans
+/// owners. Beyond it the query must run where the data lives.
+pub const GATHER_ROW_LIMIT: usize = 1_000_000;
+/// A table's rows taken from its owner, with the schema they arrived under.
+type GatheredTable = (String, Arc<Schema>, Vec<RecordBatch>);
 /// Minimum spacing between automatic compaction attempts per table.
 const COMPACT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -912,7 +917,69 @@ impl Engine {
         let stream = self.stream(name).await?;
         Ok(stream.definition.vector_indexes.clone())
     }
-    async fn query_loaded(&self, sql: &str) -> Result<Vec<u8>, Error> {
+    /// Rows of every referenced stream this node does not own, taken from the
+    /// member that does. Each gathered table is leased against the memory
+    /// budget for the life of the query.
+    async fn gather_remote(
+        &self,
+        sql: &str,
+    ) -> Result<(Vec<GatheredTable>, Vec<walleye_cache::MemoryLease>), Error> {
+        let Some(cluster) = &self.cluster else {
+            return Ok((Vec::new(), Vec::new()));
+        };
+        let mut gathered = Vec::new();
+        let mut leases = Vec::new();
+        for name in walleye_lance::sql_table_names(sql)? {
+            let Some(owner) = cluster.owner(&name) else {
+                continue;
+            };
+            if !self.streams.lock().await.contains_key(&name) {
+                continue;
+            }
+            let bytes = cluster.fetch_snapshot(&owner, &name).await?;
+            leases.push(self.cache.resources.reserve_memory(
+                &format!("gathered table {name}"),
+                bytes.len().saturating_mul(2),
+            )?);
+            let reader =
+                arrow_ipc::reader::FileReader::try_new(std::io::Cursor::new(bytes.as_ref()), None)?;
+            let schema = reader.schema();
+            let batches = reader.collect::<Result<Vec<_>, _>>()?;
+            gathered.push((name, schema, batches));
+        }
+        Ok((gathered, leases))
+    }
+    /// Every row of a stream this node owns, for a peer running SQL that spans
+    /// owners. Refused when the stream is larger than one query may gather.
+    pub async fn snapshot_batches(
+        &self,
+        name: &str,
+    ) -> Result<(Arc<Schema>, Vec<RecordBatch>), Error> {
+        let stream = self.stream(name).await?;
+        let snapshot = SnapshotSource::snapshot(stream.as_ref()).await?;
+        let result = snapshot
+            .search(
+                &self.cache.storage,
+                &SearchRequest {
+                    limit: Some(GATHER_ROW_LIMIT + 1),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        let rows: usize = result.iter().map(RecordBatch::num_rows).sum();
+        if rows > GATHER_ROW_LIMIT {
+            return Err(format!(
+                "stream {name} has more than {GATHER_ROW_LIMIT} rows; query it on its owner \
+                 rather than joining it across members"
+            )
+            .into());
+        }
+        Ok((
+            stream.config.schema.clone(),
+            result.iter().cloned().collect(),
+        ))
+    }
+    async fn query_loaded(&self, sql: &str, gathered: &[GatheredTable]) -> Result<Vec<u8>, Error> {
         let tables: Vec<_> = self
             .streams
             .lock()
@@ -920,7 +987,8 @@ impl Engine {
             .iter()
             .map(|(name, s)| (name.clone(), s.clone() as Arc<dyn SnapshotSource>))
             .collect();
-        let result = walleye_lance::query(&self.cache.storage, &tables, sql).await?;
+        let result =
+            walleye_lance::query_with_gathered(&self.cache.storage, &tables, gathered, sql).await?;
         let mut writer = arrow_json::ArrayWriter::new(BoundedOutput(Vec::new()));
         writer.write_batches(&result.iter().collect::<Vec<_>>())?;
         writer.finish()?;
@@ -936,7 +1004,8 @@ impl Engine {
             return Err("engine is closed".into());
         }
         self.load_catalog().await?;
-        match self.query_loaded(sql).await {
+        let (gathered, _leases) = self.gather_remote(sql).await?;
+        match self.query_loaded(sql, &gathered).await {
             Ok(result) => Ok(result),
             Err(first) if likely_unknown_relation(&first) => {
                 // A sibling node may have admitted a stream after this
@@ -944,7 +1013,8 @@ impl Engine {
                 // relation error; malformed SQL and execution failures keep
                 // their original error without paying for another LIST.
                 self.refresh_catalog().await?;
-                self.query_loaded(sql).await.or(Err(first))
+                let (gathered, _leases) = self.gather_remote(sql).await?;
+                self.query_loaded(sql, &gathered).await.or(Err(first))
             }
             Err(error) => Err(error),
         }

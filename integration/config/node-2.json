@@ -2,7 +2,7 @@
   "node_id": "node-2",
   "listen": "0.0.0.0:8080",
   "directory": "/data/cache",
-  "memory_bytes": 134217728,
+  "memory_bytes": 1073741824,
   "disk_bytes": 536870912,
   "bitr": true,
   "members": [

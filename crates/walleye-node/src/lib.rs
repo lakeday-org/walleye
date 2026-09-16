@@ -168,22 +168,28 @@ impl Budget {
         }
     }
 }
-fn directory_bytes(dir: &str) -> usize {
-    fn walk(path: &std::path::Path, total: &mut usize) {
+/// Bytes under `dir`, excluding anything inside `skip` (the cache's own
+/// directory, which the governor accounts for separately).
+fn directory_bytes(dir: &str, skip: &std::path::Path) -> usize {
+    fn walk(path: &std::path::Path, skip: &std::path::Path, total: &mut usize) {
+        if path == skip {
+            return;
+        }
         let Ok(entries) = std::fs::read_dir(path) else {
             return;
         };
         for entry in entries.flatten() {
             let Ok(meta) = entry.metadata() else { continue };
             if meta.is_dir() {
-                walk(&entry.path(), total);
+                walk(&entry.path(), skip, total);
             } else {
                 *total += meta.len() as usize;
             }
         }
     }
     let mut total = 0;
-    walk(std::path::Path::new(dir), &mut total);
+    let skip = skip.canonicalize().unwrap_or_else(|_| skip.to_path_buf());
+    walk(std::path::Path::new(dir), &skip, &mut total);
     total
 }
 pub struct Service {
@@ -343,12 +349,17 @@ impl Service {
                 .ok()
                 .filter(|v| !v.trim().is_empty())
                 .unwrap_or_else(|| "/data".into());
+            // The cache usually lives on the same volume; counting it as
+            // "elsewhere" would charge it twice and starve its own ceiling.
+            let cache_dir = service.config.directory.clone();
             tokio::spawn(async move {
                 loop {
                     let dir = data_dir.clone();
-                    let used = tokio::task::spawn_blocking(move || directory_bytes(&dir))
-                        .await
-                        .unwrap_or(0);
+                    let cache_dir = cache_dir.clone();
+                    let used =
+                        tokio::task::spawn_blocking(move || directory_bytes(&dir, &cache_dir))
+                            .await
+                            .unwrap_or(0);
                     if let Err(error) = resources.set_disk_usage("bitr", used).await {
                         eprintln!("walleye.budget stage=disk_sample outcome=error error={error}");
                     }
@@ -451,6 +462,7 @@ pub fn router(service: Arc<Service>) -> Router {
         .route("/readyz", get(readyz))
         .route("/internal/cache/{key}", get(read).put(write))
         .route("/internal/cache/stats", get(stats))
+        .route("/internal/snapshot/{name}", get(snapshot))
         .route("/internal/cache/flush", post(flush))
         .route("/v1/streams", post(define))
         .route("/v1/streams/{name}/events", post(ingest))
@@ -554,6 +566,27 @@ async fn write(
     }
     s.stores.fetch_add(1, Ordering::Relaxed);
     Ok(StatusCode::NO_CONTENT)
+}
+/// Hand a peer every row of a stream this node owns, as an Arrow IPC file, so
+/// it can run SQL that spans owners. The snapshot is taken here, so it
+/// includes rows this node has not flushed.
+async fn snapshot(
+    State(s): State<Arc<Service>>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let engine = api(&s, &headers)?;
+    let (schema, batches) = engine.snapshot_batches(&name).await.map_err(failure)?;
+    let mut out = Vec::new();
+    {
+        let mut writer =
+            arrow_ipc::writer::FileWriter::try_new(&mut out, &schema).map_err(failure)?;
+        for batch in &batches {
+            writer.write(batch).map_err(failure)?;
+        }
+        writer.finish().map_err(failure)?;
+    }
+    Ok(([("content-type", "application/vnd.apache.arrow.file")], out).into_response())
 }
 async fn stats(
     State(s): State<Arc<Service>>,

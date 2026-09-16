@@ -22,6 +22,10 @@ pub struct QueryResources {
     memory_bytes: usize,
     disk_bytes: usize,
     cache_memory_ceiling: usize,
+    /// Memory the cache keeps whatever else is reserved. A cache squeezed to
+    /// nothing stops serving and stops accepting entries from peers, so
+    /// reservations are capped to leave this much rather than starve it.
+    cache_memory_floor: usize,
     cache_disk_ceiling: usize,
     spill_dir: PathBuf,
     state: Mutex<State>,
@@ -98,8 +102,16 @@ impl QueryResources {
             std::fs::remove_dir_all(&spill_dir)?;
         }
         std::fs::create_dir_all(&spill_dir)?;
+        // A working set the cache keeps against long-lived leases: a
+        // sixteenth of its ceiling, never more than a quarter of the budget.
+        // Queries may still borrow everything, because they give it back;
+        // a lease that held the cache at zero would not.
+        let cache_memory_floor = (backend.memory_capacity() / 16)
+            .min(64 * 1024 * 1024)
+            .min(memory_bytes / 4);
         Ok(Arc::new_cyclic(|this| Self {
             cache_memory_ceiling: backend.memory_capacity(),
+            cache_memory_floor,
             cache_disk_ceiling: backend.persistent_capacity(),
             backend,
             pool: FairSpillPool::new(memory_bytes),
@@ -119,6 +131,21 @@ impl QueryResources {
     /// same amount while the lease lives and grows back when it drops. Fails
     /// closed with `ResourcesExhausted` when the budget cannot cover it.
     pub fn reserve_memory(self: &Arc<Self>, name: &str, bytes: usize) -> Result<MemoryLease> {
+        // Admission first: a lease that would leave the cache under its
+        // working floor is refused rather than granted, because a cache at
+        // zero serves nothing and accepts nothing from its peers.
+        let held = self.leased.load(std::sync::atomic::Ordering::Acquire);
+        if held.saturating_add(bytes) > self.leasable() {
+            return Err(DataFusionError::ResourcesExhausted(format!(
+                "{name} needs {} MiB but only {} MiB of the {} MiB memory budget can be held \
+                 ({} MiB is the cache's working floor, {} MiB is already held)",
+                bytes / (1024 * 1024),
+                self.leasable().saturating_sub(held) / (1024 * 1024),
+                self.memory_bytes / (1024 * 1024),
+                self.cache_memory_floor / (1024 * 1024),
+                held / (1024 * 1024),
+            )));
+        }
         let pool: Arc<dyn MemoryPool> = self.clone();
         let reservation = MemoryConsumer::new(name).register(&pool);
         self.leased
@@ -127,10 +154,12 @@ impl QueryResources {
             self.leased
                 .fetch_sub(bytes, std::sync::atomic::Ordering::AcqRel);
             return Err(DataFusionError::ResourcesExhausted(format!(
-                "{name} needs {} MiB but only {} MiB of the {} MiB memory budget is free",
+                "{name} needs {} MiB but only {} MiB of the {} MiB memory budget is free \
+                 ({} MiB of it is the cache's working floor)",
                 bytes / (1024 * 1024),
                 self.memory_available() / (1024 * 1024),
-                self.memory_bytes / (1024 * 1024)
+                self.memory_bytes / (1024 * 1024),
+                self.cache_memory_floor / (1024 * 1024),
             )));
         }
         Ok(MemoryLease {
@@ -142,6 +171,11 @@ impl QueryResources {
     /// Memory budget for everything that is not the fixed runtime floor.
     pub fn memory_budget(&self) -> usize {
         self.memory_bytes
+    }
+    /// The part of the budget long-lived leases may hold: the budget less
+    /// the cache's working floor. Queries are not bound by it.
+    pub fn leasable(&self) -> usize {
+        self.memory_bytes.saturating_sub(self.cache_memory_floor)
     }
     /// Memory not currently held by queries or leases.
     pub fn memory_available(&self) -> usize {
@@ -219,7 +253,7 @@ impl QueryResources {
         let target = available.min(self.cache_memory_ceiling);
         if self.backend.memory_capacity() > target {
             // Round down so small operator reservations do not repeatedly spawn eviction workers.
-            let quantum = (8 * 1024 * 1024).min(self.cache_memory_ceiling);
+            let quantum = (8 * 1024 * 1024).min(self.cache_memory_ceiling).max(1);
             self.backend
                 .resize_memory(target / quantum * quantum)
                 .map_err(resource_error)?;
@@ -247,12 +281,13 @@ impl QueryResources {
             return;
         }
         let quantum = (8 * 1024 * 1024).min(self.cache_memory_ceiling).max(1);
-        let target = self
+        let target = (self
             .memory_bytes
             .saturating_sub(leased)
             .min(self.cache_memory_ceiling)
             / quantum
-            * quantum;
+            * quantum)
+            .max(self.cache_memory_floor.min(self.cache_memory_ceiling));
         if self.backend.memory_capacity() != target
             && let Err(error) = self.backend.resize_memory(target)
         {
