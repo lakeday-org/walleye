@@ -2,12 +2,16 @@
 use std::{future::IntoFuture, sync::Arc};
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let path =
-        std::env::var("WALLEYE_CONFIG").unwrap_or_else(|_| "/etc/walleye/config.json".into());
     let config = if std::env::var_os("WALLEYE_DISCOVERY_SERVICE").is_some() {
         walleye_node::kubernetes::config_from_env()?
-    } else {
+    } else if let Some(path) = std::env::var("WALLEYE_CONFIG").ok().or_else(|| {
+        std::fs::exists("/etc/walleye/config.json")
+            .ok()?
+            .then(|| "/etc/walleye/config.json".into())
+    }) {
         serde_json::from_slice(&std::fs::read(path)?)?
+    } else {
+        walleye_node::Config::from_env()?
     };
     let service = walleye_node::Service::open(config).await?;
     let listener = tokio::net::TcpListener::bind(&service.config.listen).await?;

@@ -41,6 +41,86 @@ pub struct Config {
     #[serde(default)]
     pub processor: Option<ProcessorConfig>,
 }
+impl Config {
+    /// Build a single node, or a static cluster member, from environment variables.
+    ///
+    /// Required: `WALLEYE_BUCKET` (bucket name, optionally `bucket/prefix`) or
+    /// `WALLEYE_ROOT_URI` (a full `s3://` or `file://` URI).
+    ///
+    /// Optional: `WALLEYE_PORT` (8080), `WALLEYE_TOKEN` (generated and printed
+    /// when absent), `WALLEYE_DIR` (`./walleye-cache`), `WALLEYE_RAM_GB` (1),
+    /// `WALLEYE_NVME_GB` (8), `WALLEYE_BITR_URL` (enables Bitr cluster mode),
+    /// `WALLEYE_MEMBERS` (`id=http://host:8080,...`) with `WALLEYE_NODE_ID`
+    /// naming this member.
+    pub fn from_env() -> Result<Self, Box<dyn std::error::Error>> {
+        Self::from_env_with(|name| std::env::var(name).ok())
+    }
+    pub fn from_env_with(
+        mut get: impl FnMut(&str) -> Option<String>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let root_uri = match (get("WALLEYE_ROOT_URI"), get("WALLEYE_BUCKET")) {
+            (Some(uri), _) => uri,
+            (None, Some(bucket)) => format!("s3://{}", bucket.trim_matches('/')),
+            (None, None) => return Err("set WALLEYE_BUCKET or WALLEYE_ROOT_URI".into()),
+        };
+        let port: u16 = get("WALLEYE_PORT").as_deref().unwrap_or("8080").parse()?;
+        let gb = |name: &str, default: f64, get: &mut dyn FnMut(&str) -> Option<String>| {
+            get(name)
+                .map(|v| v.parse::<f64>())
+                .transpose()
+                .map(|v| (v.unwrap_or(default) * 1024.0 * 1024.0 * 1024.0) as usize)
+        };
+        let memory_bytes = gb("WALLEYE_RAM_GB", 1.0, &mut get)?;
+        let disk_bytes = gb("WALLEYE_NVME_GB", 8.0, &mut get)?;
+        let token = match get("WALLEYE_TOKEN") {
+            Some(token) => token,
+            None => {
+                let token = uuid::Uuid::new_v4().simple().to_string();
+                eprintln!("WALLEYE_TOKEN not set; generated token: {token}");
+                token
+            }
+        };
+        let (node_id, members) = match get("WALLEYE_MEMBERS") {
+            Some(list) => {
+                let node_id = get("WALLEYE_NODE_ID")
+                    .ok_or("WALLEYE_NODE_ID is required with WALLEYE_MEMBERS")?;
+                let members = list
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(|entry| {
+                        let (id, endpoint) = entry
+                            .split_once('=')
+                            .ok_or("WALLEYE_MEMBERS entries are id=http://host:port")?;
+                        Ok(Node::new(id, endpoint, 1.0)?)
+                    })
+                    .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+                (node_id, members)
+            }
+            None => {
+                let node_id = get("WALLEYE_NODE_ID").unwrap_or_else(|| "single".into());
+                let node = Node::new(&node_id, format!("http://localhost:{port}"), 1.0)?;
+                (node_id, vec![node])
+            }
+        };
+        let bitr_url = get("WALLEYE_BITR_URL");
+        Ok(Config {
+            node_id,
+            listen: format!("0.0.0.0:{port}"),
+            directory: PathBuf::from(
+                get("WALLEYE_DIR").unwrap_or_else(|| "./walleye-cache".into()),
+            ),
+            memory_bytes,
+            disk_bytes,
+            token,
+            bitr: bitr_url.is_some(),
+            members,
+            api: Some(ApiConfig { root_uri, bitr_url }),
+            kubernetes: None,
+            processor: None,
+        })
+    }
+}
 pub struct Service {
     pub config: Config,
     pub cache: Arc<LanceFoyerCacheBackend>,
@@ -299,4 +379,84 @@ async fn query(
         bytes,
     )
         .into_response())
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::Config;
+    use std::collections::HashMap;
+
+    fn env(pairs: &[(&str, &str)]) -> impl FnMut(&str) -> Option<String> {
+        let map: HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |name| map.get(name).cloned()
+    }
+
+    #[test]
+    fn bucket_alone_is_enough() {
+        let c = Config::from_env_with(env(&[("WALLEYE_BUCKET", "walleye")])).unwrap();
+        assert_eq!(c.listen, "0.0.0.0:8080");
+        assert_eq!(c.node_id, "single");
+        assert_eq!(c.members.len(), 1);
+        assert_eq!(c.members[0].endpoint, "http://localhost:8080");
+        assert_eq!(c.memory_bytes, 1 << 30);
+        assert_eq!(c.disk_bytes, 8 << 30);
+        assert!(!c.bitr);
+        assert!(c.token.len() >= 16);
+        let api = c.api.unwrap();
+        assert_eq!(api.root_uri, "s3://walleye");
+        assert!(api.bitr_url.is_none());
+    }
+
+    #[test]
+    fn overrides_and_cluster() {
+        let c = Config::from_env_with(env(&[
+            ("WALLEYE_BUCKET", "walleye/prod/"),
+            ("WALLEYE_PORT", "9000"),
+            ("WALLEYE_RAM_GB", "0.5"),
+            ("WALLEYE_NVME_GB", "20"),
+            ("WALLEYE_TOKEN", "sixteen-char-token!"),
+            ("WALLEYE_DIR", "/data/cache"),
+            ("WALLEYE_BITR_URL", "http://127.0.0.1:30080"),
+            ("WALLEYE_NODE_ID", "b"),
+            (
+                "WALLEYE_MEMBERS",
+                "a=http://a:8080, b=http://b:8080,c=http://c:8080",
+            ),
+        ]))
+        .unwrap();
+        assert_eq!(c.listen, "0.0.0.0:9000");
+        assert_eq!(c.memory_bytes, 512 << 20);
+        assert_eq!(c.disk_bytes, 20 << 30);
+        assert_eq!(c.token, "sixteen-char-token!");
+        assert_eq!(c.directory.to_str().unwrap(), "/data/cache");
+        assert!(c.bitr);
+        assert_eq!(c.node_id, "b");
+        assert_eq!(c.members.len(), 3);
+        let api = c.api.unwrap();
+        assert_eq!(api.root_uri, "s3://walleye/prod");
+        assert_eq!(api.bitr_url.as_deref(), Some("http://127.0.0.1:30080"));
+    }
+
+    #[test]
+    fn missing_bucket_and_bad_members_fail() {
+        assert!(Config::from_env_with(env(&[])).is_err());
+        assert!(
+            Config::from_env_with(env(&[
+                ("WALLEYE_BUCKET", "walleye"),
+                ("WALLEYE_MEMBERS", "a=http://a:8080"),
+            ]))
+            .is_err()
+        );
+        assert!(
+            Config::from_env_with(env(&[
+                ("WALLEYE_BUCKET", "walleye"),
+                ("WALLEYE_NODE_ID", "a"),
+                ("WALLEYE_MEMBERS", "http://a:8080"),
+            ]))
+            .is_err()
+        );
+    }
 }
