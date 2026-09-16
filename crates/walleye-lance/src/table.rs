@@ -574,6 +574,25 @@ impl Table {
         }
         Ok(result)
     }
+    /// Open every flushed generation into the dataset cache and load its
+    /// indexes into the session caches, so the first query pays nothing that
+    /// a later one would not. Purely a cache optimization.
+    pub async fn warm(&self) -> lance::Result<usize> {
+        let Some(manifest) = self.writer.manifest().await? else {
+            return Ok(0);
+        };
+        let snapshot = manifest.sstables.iter().fold(
+            ShardSnapshot::new(self.writer.shard_id())
+                .with_spec_id(manifest.shard_spec_id)
+                .with_current_generation(manifest.current_generation),
+            |s, t| s.with_sstable(t.generation, t.path.clone()),
+        );
+        let cache: Arc<dyn DatasetCache> = self.sstables.clone();
+        self.dataset
+            .prewarm_mem_wal(&[snapshot], Some(&cache))
+            .await?;
+        Ok(manifest.sstables.len())
+    }
     /// Generations currently in the manifest, with row counts and index names.
     pub async fn lsm_stats(&self) -> lance::Result<LsmStats> {
         let Some(manifest) = self.writer.manifest().await? else {

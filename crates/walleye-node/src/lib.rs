@@ -189,7 +189,7 @@ impl Service {
         } else {
             None
         };
-        Ok(Arc::new(Self {
+        let service = Arc::new(Self {
             config,
             cache,
             ring,
@@ -200,7 +200,16 @@ impl Service {
             revision: tokio::sync::Mutex::new(format!("\"{}\"", uuid::Uuid::new_v4())),
             changed: tokio::sync::Notify::new(),
             quiescing: AtomicBool::new(false),
-        }))
+        });
+        // Serve immediately; owned streams open and warm in the background so
+        // the first request does not pay for it.
+        let warming = service.clone();
+        tokio::spawn(async move {
+            if let Some(engine) = &warming.engine {
+                engine.warm().await;
+            }
+        });
+        Ok(service)
     }
     /// Follow Kubernetes cache endpoints. Failure preserves the last good ring;
     /// missing peers fall back to the query process's normal origin loading.

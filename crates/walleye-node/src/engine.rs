@@ -4,7 +4,7 @@ use crate::cluster::{Cluster, NotOwner};
 use arrow_array::{Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use base64::Engine as _;
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
 use object_store::ObjectStoreExt;
 use object_store::{PutMode, PutOptions, path::Path};
@@ -718,6 +718,41 @@ impl Engine {
     pub async fn lsm_stats(&self, name: &str) -> Result<LsmStats, Error> {
         let stream = self.stream(name).await?;
         Ok(stream.table().await?.lsm_stats().await?)
+    }
+    /// Open every stream this node owns and warm its generations, so the
+    /// first request after startup does not pay the writer open, WAL replay,
+    /// and index loads. Errors are logged per stream and never fatal.
+    pub async fn warm(&self) {
+        let names = match self.table_names().await {
+            Ok(names) => names,
+            Err(error) => {
+                eprintln!("walleye.storage warm stage=catalog outcome=error error={error}");
+                return;
+            }
+        };
+        let owned = names.into_iter().filter(|n| self.owner(n).is_none());
+        // Each open is a handful of object-storage round trips; overlap them.
+        futures::stream::iter(owned)
+            .for_each_concurrent(8, |name| async move {
+                let started = Instant::now();
+                let outcome = async {
+                    let stream = self.stream(&name).await?;
+                    let generations = stream.table().await?.warm().await?;
+                    Ok::<usize, Error>(generations)
+                }
+                .await;
+                match outcome {
+                    Ok(generations) => eprintln!(
+                        "walleye.storage warm stream={name} generations={generations} elapsed_ms={}",
+                        started.elapsed().as_millis()
+                    ),
+                    Err(error) => eprintln!(
+                        "walleye.storage warm stream={name} outcome=error elapsed_ms={} error={error}",
+                        started.elapsed().as_millis()
+                    ),
+                }
+            })
+            .await;
     }
     pub async fn table_names(&self) -> Result<Vec<String>, Error> {
         self.refresh_catalog().await?;
