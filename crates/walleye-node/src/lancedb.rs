@@ -45,6 +45,24 @@ pub fn routes() -> Router<Arc<Service>> {
 type Reply = Result<Response, Response>;
 
 /// The SDK matches on status and, for create, on "already exists" in the body.
+/// As [`error`], but for a write: a writer fenced by its own WAL persistence
+/// failure leaves the outcome unknown rather than failed, and a client told
+/// "failed" would retry a write that may already have been stored.
+fn write_error(e: &(dyn std::error::Error + Send + Sync + 'static)) -> Response {
+    if walleye_lance::writer_fence_reason(e) == Some(walleye_lance::FenceReason::PersistenceFailure)
+    {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [("retry-after", "1")],
+            format!(
+                "the outcome of this write is unknown: {e}. Read the rows back before retrying; \
+                 a retry of the same rows is safe when they carry a primary key."
+            ),
+        )
+            .into_response();
+    }
+    error(e)
+}
 fn error(e: &(dyn std::error::Error + 'static)) -> Response {
     let status = if e.downcast_ref::<engine::TableNotFound>().is_some() {
         StatusCode::NOT_FOUND
@@ -169,7 +187,7 @@ async fn create(
     let version = engine
         .append(&name, batches)
         .await
-        .map_err(|e| error(e.as_ref()))?;
+        .map_err(|e| write_error(e.as_ref()))?;
     Ok(Json(serde_json::json!({"version": version})).into_response())
 }
 
@@ -214,7 +232,7 @@ async fn insert(
     let version = engine
         .append(&name, batches)
         .await
-        .map_err(|e| error(e.as_ref()))?;
+        .map_err(|e| write_error(e.as_ref()))?;
     s.changed.notify_one();
     Ok(Json(serde_json::json!({"version": version})).into_response())
 }

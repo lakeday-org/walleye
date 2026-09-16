@@ -405,3 +405,82 @@ async fn the_catalog_tolerates_fields_this_version_does_not_know() {
     assert_eq!(refused.status(), StatusCode::UNPROCESSABLE_ENTITY);
     service.close().await;
 }
+
+/// A fenced writer is a dead handle, not a dead stream. Before this was
+/// handled, a writer fenced once left its table answering the fence error to
+/// every read and write until the process restarted, while readiness reported
+/// the cluster healthy. The next use must open a fresh writer instead.
+#[tokio::test]
+async fn a_fenced_writer_is_replaced_on_the_next_use() {
+    use arrow_schema::{DataType, Field, Schema};
+    use std::sync::Arc;
+    use walleye_lance::{LanceDurability, LanceStorageOptions, Table, TableConfig};
+
+    let d = tempfile::tempdir().unwrap();
+    let service = Service::open(config(d.path(), true)).await.unwrap();
+    let app = router(service.clone());
+    let definition = json!({"name":"events","columns":[
+        {"name":"id","type":"int64"},{"name":"value","type":"int64"}],"primary_key":["id"]});
+    assert_eq!(
+        call(&app, "/v1/streams", definition).await.0,
+        StatusCode::OK
+    );
+    let (status, _) = call(
+        &app,
+        "/v1/streams/events/events",
+        json!({"rows":[{"id":1,"value":10}]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Another writer claims the shard, which fences the one the engine holds.
+    // On a cluster this is what a takeover looks like; a WAL persistence
+    // failure fences a writer the same way, from the writer's own side.
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("value", DataType::Int64, false),
+    ]));
+    let interloper = TableConfig::new(
+        "events",
+        format!("file://{}/store/data/events", d.path().display()),
+        schema,
+        vec!["id".into()],
+    )
+    .unwrap();
+    let claimed = Table::open(
+        interloper,
+        LanceStorageOptions::default(),
+        LanceDurability::ObjectStore,
+    )
+    .await
+    .expect("a second writer claims the next epoch");
+
+    // The stream keeps serving: the next write opens a fresh writer.
+    let (status, body) = call(
+        &app,
+        "/v1/streams/events/events",
+        json!({"rows":[{"id":2,"value":20}]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, rows) = call(
+        &app,
+        "/v1/query",
+        json!({"sql":"SELECT count(*) AS n FROM events"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{rows}");
+    assert_eq!(rows[0]["n"], 2, "both rows survive the fence: {rows}");
+
+    // And reads keep working too.
+    let (status, rows) = call(
+        &app,
+        "/v1/query",
+        json!({"sql":"SELECT sum(value) AS total FROM events"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(rows[0]["total"], 30);
+    drop(claimed);
+    service.close().await;
+}

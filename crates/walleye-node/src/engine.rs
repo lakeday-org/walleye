@@ -323,6 +323,30 @@ impl Stream {
             .sum();
         MEMTABLE_BYTES + vectors
     }
+    /// Drop a writer Lance has fenced, so the next use opens a fresh one that
+    /// claims the next epoch and replays the WAL. A fenced writer is a dead
+    /// handle, not a dead stream, and keeping it would leave the stream
+    /// unreadable and unwritable until the process restarted. Returns whether
+    /// it discarded one.
+    async fn discard_fenced_writer(&self, reason: walleye_lance::FenceReason) -> bool {
+        let taken = self.table.lock().await.take();
+        let Some(table) = taken else {
+            return false;
+        };
+        // A fenced writer cannot flush; never let closing it hold a request.
+        let closing = tokio::time::timeout(std::time::Duration::from_secs(10), table.close());
+        if closing.await.is_err() {
+            eprintln!(
+                "walleye.storage writer_fenced stream={} reason={reason} close=timeout",
+                self.definition.name
+            );
+        }
+        eprintln!(
+            "walleye.storage writer_fenced stream={} reason={reason} outcome=discarded",
+            self.definition.name
+        );
+        true
+    }
     async fn table(&self) -> Result<MappedMutexGuard<'_, Table>, Error> {
         *self.last_used.lock().await = Instant::now();
         let mut table = self.table.lock().await;
@@ -381,11 +405,36 @@ impl SnapshotSource for Stream {
         Arc::new(Schema::new(self.config.schema.fields().clone()))
     }
     async fn snapshot(&self) -> Result<TableSnapshot, walleye_lance::LanceError> {
-        let table = self
-            .table()
-            .await
-            .map_err(|e| walleye_lance::LanceError::io(e.to_string()))?;
-        table.snapshot().await
+        for attempt in 0..2 {
+            let outcome = async {
+                let table = self.table().await.map_err(|e| {
+                    match walleye_lance::writer_fence_reason(&*e) {
+                        // Keep the typed fence: a reader must be able to tell
+                        // a dead handle from a dead stream too.
+                        Some(walleye_lance::FenceReason::PeerClaimedEpoch) => {
+                            walleye_lance::LanceError::fenced_by_peer(e.to_string())
+                        }
+                        Some(walleye_lance::FenceReason::PersistenceFailure) => {
+                            walleye_lance::LanceError::writer_poisoned(e.to_string())
+                        }
+                        None => walleye_lance::LanceError::io(e.to_string()),
+                    }
+                })?;
+                table.snapshot().await
+            }
+            .await;
+            let error = match outcome {
+                Ok(snapshot) => return Ok(snapshot),
+                Err(error) => error,
+            };
+            match error.fence_reason() {
+                Some(reason) if attempt == 0 && self.discard_fenced_writer(reason).await => {
+                    continue;
+                }
+                _ => return Err(error),
+            }
+        }
+        unreachable!("the loop returns on both outcomes")
     }
 }
 pub struct Engine {
@@ -739,7 +788,7 @@ impl Engine {
             .with_batch_size(1024)
             .build(Cursor::new(ndjson))?
             .collect::<Result<Vec<RecordBatch>, _>>()?;
-        stream.table().await?.append(batches).await?;
+        self.append_prepared(&stream, batches).await?;
         stream.version.fetch_add(1, Ordering::AcqRel);
         Ok(count)
     }
@@ -761,9 +810,39 @@ impl Engine {
         if prepared.is_empty() {
             return Ok(stream.version.load(Ordering::Acquire));
         }
-        stream.table().await?.append(prepared).await?;
+        self.append_prepared(&stream, prepared).await?;
         self.maybe_compact(&stream).await;
         Ok(stream.version.fetch_add(1, Ordering::AcqRel) + 1)
+    }
+    /// Append, reopening once if the writer turns out to be fenced. Lance
+    /// fences a writer whose WAL append failed or whose epoch a peer took;
+    /// the handle is dead, the shard is not, and a fresh writer replays the
+    /// WAL. Rows the fenced attempt did persist come back in that replay and
+    /// collapse against these on the primary key.
+    async fn append_prepared(
+        &self,
+        stream: &Arc<Stream>,
+        batches: Vec<RecordBatch>,
+    ) -> Result<(), Error> {
+        for attempt in 0..2 {
+            let outcome = async {
+                stream.table().await?.append(batches.clone()).await?;
+                Ok::<(), Error>(())
+            }
+            .await;
+            let error = match outcome {
+                Ok(()) => return Ok(()),
+                Err(error) => error,
+            };
+            let reason = walleye_lance::writer_fence_reason(&*error);
+            match reason {
+                Some(reason) if attempt == 0 && stream.discard_fenced_writer(reason).await => {
+                    continue;
+                }
+                _ => return Err(error),
+            }
+        }
+        unreachable!("the loop returns on both outcomes")
     }
     /// Spawn one background merge per table when enough generations exist.
     async fn maybe_compact(&self, stream: &Arc<Stream>) {

@@ -682,6 +682,27 @@ fn failure(e: impl std::fmt::Display) -> ApiError {
         Json(serde_json::json!({"error":e.to_string()})),
     )
 }
+/// A failure whose outcome is genuinely unknown is not a bad request. A
+/// writer fenced by its own WAL persistence failure may or may not have
+/// stored the rows: the durable log is ahead of what this process can
+/// account for, and only a read settles it. Saying "failed" would send a
+/// client to retry a write that already happened.
+fn write_failure(error: &Error) -> ApiError {
+    match walleye_lance::writer_fence_reason(&**error) {
+        Some(walleye_lance::FenceReason::PersistenceFailure) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": format!(
+                    "the outcome of this write is unknown: {error}. Read the rows back before \
+                     retrying; a retry of the same rows is safe when they carry a primary key."
+                ),
+                "outcome": "unknown",
+            })),
+        ),
+        _ => failure(error),
+    }
+}
+type Error = Box<dyn std::error::Error + Send + Sync>;
 /// The engine, for a request that must make a durable write. A node whose
 /// quorum is unreachable declines with 503 and a `Retry-After` instead of
 /// opening a writer that would fail recovery; the caller (or the forwarding
@@ -746,7 +767,10 @@ async fn ingest(
     }
     // Invalidate snapshots before attempting ingestion, including a partial failure.
     *revision = format!("\"{}\"", uuid::Uuid::new_v4());
-    let count = engine.ingest(&name, input.rows).await.map_err(failure)?;
+    let count = engine
+        .ingest(&name, input.rows)
+        .await
+        .map_err(|error| write_failure(&error))?;
     s.changed.notify_one();
     Ok((
         [("etag", revision.as_str())],

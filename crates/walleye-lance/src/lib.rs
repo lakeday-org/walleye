@@ -17,6 +17,19 @@ pub use ipc::{
     encode_fence_sentinel, encode_ipc_batches, with_owner,
 };
 pub use lance::Error as LanceError;
+pub use lance_core::error::FenceReason;
+
+/// The reason a writer was fenced, when `error` is one. A fenced writer can
+/// never be used again, but the shard it wrote is intact: a fresh writer
+/// claims the next epoch and replays the WAL. Callers use this to tell a dead
+/// handle apart from a dead stream.
+pub fn writer_fence_reason(
+    error: &(dyn std::error::Error + Send + Sync + 'static),
+) -> Option<FenceReason> {
+    error
+        .downcast_ref::<lance::Error>()
+        .and_then(lance::Error::fence_reason)
+}
 pub use lance::arrow::json::JsonSchema;
 pub use lance::dataset::mem_wal::{CompactionResult, Compactor};
 pub use sql::{SnapshotSource, TableSnapshot, query, query_with_gathered, sql_table_names};
