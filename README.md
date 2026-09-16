@@ -1,103 +1,107 @@
 # Walleye
 
-Wal over S3 (LanceDB) define a stream, ingest rows, query it with
-SQL. 
+WAL over S3 (LanceDB). Define a stream, ingest rows, query it with SQL.
 
 Each stream owns its own memshard, writer lock, WAL sequence, and S3 manifest.
 Different streams ingest concurrently in both S3 CAS and Bitr modes.
 
-## API
+## Quickstart
+
+Build the node, point it at an S3 prefix, start it.
 
 ```sh
-# 1. Define a stream (one Lance memshard).
-curl http://localhost:18085/v1/streams \
-  -H 'Authorization: Bearer <TOKEN>' \
+cargo build --release -p walleye-node
+```
+
+Write a config. `token` must be at least 16 characters. `directory` is the local
+cache path, and `api.root_uri` is where everything durable lives.
+
+```sh
+mkdir -p /tmp/walleye
+cat > /tmp/walleye/config.json <<'JSON'
+{
+  "node_id": "single",
+  "listen": "0.0.0.0:8080",
+  "directory": "/tmp/walleye/cache",
+  "memory_bytes": 134217728,
+  "disk_bytes": 536870912,
+  "bitr": false,
+  "members": [{"id": "single", "endpoint": "http://localhost:8080", "weight": 1.0}],
+  "token": "change-me-to-a-long-secret",
+  "api": {"root_uri": "s3://my-bucket/walleye"}
+}
+JSON
+```
+
+Give it S3 credentials and run it. The standard `AWS_*` variables are read
+directly. Add `AWS_ENDPOINT` and `AWS_ALLOW_HTTP=true` for MinIO or other
+S3-compatible stores.
+
+```sh
+export AWS_ACCESS_KEY_ID=...
+export AWS_SECRET_ACCESS_KEY=...
+export AWS_REGION=us-east-1
+WALLEYE_CONFIG=/tmp/walleye/config.json ./target/release/walleye-node
+```
+
+Then define a stream, ingest, and query.
+
+```sh
+TOKEN=change-me-to-a-long-secret
+
+# 1. Define a stream.
+curl http://localhost:8080/v1/streams \
+  -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"name":"clicks","columns":[{"name":"id","type":"int64"},{"name":"city","type":"string"},{"name":"value","type":"float64"}],"primary_key":["id"]}'
 
 # 2. Ingest.
-curl  http://localhost:18085/v1/streams/clicks/events \
-  -H 'Authorization: Bearer <TOKEN>' \
+curl http://localhost:8080/v1/streams/clicks/events \
+  -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"rows":[{"id":1,"city":"Seattle","value":2.5},{"id":2,"city":"Seattle","value":4.0}]}'
 
 # 3. Query.
-curl  http://localhost:18085/v1/query \
-  -H 'Authorization: Bearer acceptance-walleye-token' \
+curl http://localhost:8080/v1/query \
+  -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"sql":"SELECT city, count(*) AS n, sum(value) AS total FROM clicks GROUP BY city"}'
 # [{"city":"Seattle","n":2,"total":6.5}]
 ```
 
-## Single node: S3 CAS
+Prefer Docker? `docker build -t walleye .` produces an image whose default
+command is `walleye-node`. Mount your config at `/etc/walleye/config.json` and
+pass the `AWS_*` variables through. `integration/compose.yaml` runs a full
+local stack against MinIO.
 
-Set `api.root_uri` to an S3 prefix and omit `api.bitr_url`; set `bitr: false`.
-The node owns its memshards and cache. Lance claims writer epochs and publishes
-WAL entries and manifests through conditional object-store operations.
+## Architecture
+
+**Single node: S3 CAS.** Omit `api.bitr_url` and set `bitr: false`. Every write
+commits straight to S3 with conditional puts. No coordination service, no local
+durability, one process.
 
 ```mermaid
 flowchart LR
-    A[Client: define / ingest / SQL] --> API[Walleye HTTP API]
-    API --> C[Stream definitions: create if absent]
-    C --> S[(S3 bucket)]
-    API --> W1[Stream A: memshard + writer]
-    API --> W2[Stream B: memshard + writer]
-    W1 & W2 -->|Independent WAL and manifest CAS| S
-    W1 & W2 -->|Flush Lance generations| S
-    API --> Q[Read-only SQL]
-    W1 & W2 -->|Hot and frozen memtables| L[Unified Lance snapshot]
-    Q --> L
-    L --> F[Foyer: metadata, indexes, data blocks]
-    F -->|Exact-version miss| S
-    R[Shared query and cache resource budget] --> Q
-    R -->|Reclaim RAM and spill disk| F
+    A[Stream] --> B[Walleye CAS] --> C[(S3)]
 ```
 
-## Cluster: Bitr log writeback
-
-One designated ingress owns live memshards and executes SQL. Kubernetes manages
-three Bitr pods and a separate set of cache pods. Bitr acknowledges after two
-replicas durably accept an encrypted log entry, then archives it to S3. Lance
-separately flushes generations and advances its replay watermark using S3 CAS.
+**Cluster: Bitr.** Set `api.bitr_url` to the Bitr gateway and `bitr: true`.
+Writes are acknowledged once two of three replicas have them on NVMe, then
+archived to S3. See `deploy/kubernetes` for the manifests.
 
 ```mermaid
-flowchart TB
-    A[Client: define / ingest / SQL] --> API[Kubernetes API Service]
-    API --> I[Cache pod 0: ingress + SQL]
-    I --> M[Lance memshards: independent writer per stream]
-    M -->|Concurrent encrypted WAL appends| G[Bitr gateway Service]
-    subgraph WAL[Bitr StatefulSet: three replicas]
-      B1[(Replica 0 + persistent WAL disk)]
-      B2[(Replica 1 + persistent WAL disk)]
-      B3[(Replica 2 + persistent WAL disk)]
-    end
-    G -->|Ack requires 2 of 3| B1
-    G --> B2
-    G --> B3
-    B1 & B2 & B3 -->|Archive committed segments| S[(S3)]
-    M -->|Lance generations + per-stream manifest CAS| S
-    I --> R[Cache routing]
-    K[Kubernetes EndpointSlices] -->|Ready pod addresses| R
-    subgraph CACHE[Cache StatefulSet: independently scalable]
-      F0[Foyer on ingress pod 0]
-      F1[Foyer on cache pod 1]
-      F2[Foyer on cache pod 2 and later pods]
-    end
-    R --> F0
-    R --> F1
-    R --> F2
-    I -->|Cache miss: versioned origin read| S
+flowchart LR
+    A[Stream] --> B[Walleye Cluster<br/>NVMe Bitr] --> C[(S3)]
 ```
 
-## Modules and resource ownership
+## Crates
 
 | Crate | Responsibility |
 | --- | --- |
-| `walleye-bitr` | Encrypted records, quorum client, commit certificates, recovery |
-| `walleye-bitr-server` | Replica logs, coordinator, archival, placement, fencing |
+| `walleye-node` | Stream HTTP API, durable definitions, authentication, peer service |
 | `walleye-lance` | WAL adapter, memshards, stable snapshots, read-only SQL |
 | `walleye-cache` | Lance cache backend over Foyer, object blocks, peer envelopes, query resources |
+| `walleye-bitr` | Encrypted records, quorum client, commit certificates, recovery |
+| `walleye-bitr-server` | Replica logs, coordinator, archival, placement, fencing |
 | `walleye-ring` | Weighted rendezvous ownership and bounded previous-owner handoff |
-| `walleye-node` | Stream HTTP API, durable definitions, authentication, peer service |
 | `walleye-workload` | Executable S3 and Docker acceptance workload |
-
