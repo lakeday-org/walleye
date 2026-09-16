@@ -161,6 +161,21 @@ pub async fn compute_source_block_lists(
     store_params: Option<&ObjectStoreParams>,
     sstable_cache: Option<&Arc<dyn DatasetCache>>,
 ) -> Result<SourceBlockLists> {
+    compute_source_block_lists_at(sources, session, store_params, sstable_cache, None).await
+}
+
+/// [`compute_source_block_lists`] with optional fresh-tier watermarks.  A
+/// captured scan must use the same visibility boundary for the block-list as
+/// for its source rows: otherwise a post-capture overwrite can be found in the
+/// live index, block the captured row, and then disappear when the newer row is
+/// outside the captured active prefix.
+pub async fn compute_source_block_lists_at(
+    sources: &[LsmDataSource],
+    session: Option<&Arc<Session>>,
+    store_params: Option<&ObjectStoreParams>,
+    sstable_cache: Option<&Arc<dyn DatasetCache>>,
+    watermarks: Option<&HashMap<Uuid, FreshTierWatermark>>,
+) -> Result<SourceBlockLists> {
     // Membership per non-base source, grouped by shard (generations are
     // per-shard, so supersession is within-shard only).
     let mut by_shard: ShardGenSets = HashMap::new();
@@ -178,21 +193,55 @@ pub async fn compute_source_block_lists(
                 generation,
                 ..
             } => {
-                let membership = in_memory_membership(batch_store, index_store);
-                by_shard
-                    .entry(*shard_id)
-                    .or_default()
-                    .push((*generation, membership));
+                let membership = match watermarks.and_then(|m| m.get(shard_id)) {
+                    None => Some(in_memory_membership(batch_store, index_store)),
+                    Some(watermark) => {
+                        let generation = generation.as_u64();
+                        if generation > watermark.active_generation {
+                            // This arm was created after the snapshot.
+                            None
+                        } else if generation == watermark.active_generation {
+                            Some(bounded_in_memory_membership(
+                                batch_store,
+                                index_store,
+                                watermark.active_batch_count,
+                            ))
+                        } else {
+                            // Frozen generations below the active watermark are
+                            // immutable for the captured view.
+                            Some(in_memory_membership(batch_store, index_store))
+                        }
+                    }
+                };
+                if let Some(membership) = membership {
+                    by_shard
+                        .entry(*shard_id)
+                        .or_default()
+                        .push((*generation, membership));
+                }
             }
             LsmDataSource::SsTable {
                 path,
                 shard_id,
                 generation,
                 ..
-            } => sstable_loads.push(async move {
-                let index = open_pk_index(path, session, store_params, sstable_cache).await?;
-                Ok::<_, Error>((*shard_id, *generation, GenMembership::OnDisk(index)))
-            }),
+            } => {
+                // A flushed generation at or above the captured active
+                // generation was committed after that view's watermark.  Its
+                // rows are either represented by the bounded in-memory arm or
+                // must be omitted entirely; including it would reintroduce a
+                // post-capture overwrite into the block-list.
+                let post_capture = watermarks
+                    .and_then(|m| m.get(shard_id))
+                    .is_some_and(|watermark| generation.as_u64() >= watermark.active_generation);
+                if !post_capture {
+                    sstable_loads.push(async move {
+                        let index =
+                            open_pk_index(path, session, store_params, sstable_cache).await?;
+                        Ok::<_, Error>((*shard_id, *generation, GenMembership::OnDisk(index)))
+                    });
+                }
+            }
         }
     }
     for (shard_id, generation, membership) in futures::future::try_join_all(sstable_loads).await? {

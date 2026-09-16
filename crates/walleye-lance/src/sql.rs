@@ -10,7 +10,7 @@ use lance::deps::datafusion::{
         memory_pool::{FairSpillPool, MemoryConsumer},
         runtime_env::RuntimeEnvBuilder,
     },
-    logical_expr::{Expr, TableType},
+    logical_expr::{Expr, TableProviderFilterPushDown, TableType},
     physical_expr::expressions::Column,
     physical_plan::{ExecutionPlan, execute_stream, projection::ProjectionExec},
     prelude::SessionConfig,
@@ -38,6 +38,24 @@ fn err(e: impl std::fmt::Display) -> lance::Error {
 pub trait SnapshotSource: Send + Sync {
     fn schema(&self) -> SchemaRef;
     async fn snapshot(&self) -> lance::Result<TableSnapshot>;
+}
+
+/// A point-in-time stream view which can build more than one physical plan.
+///
+/// A SQL query may scan the same table more than once (for example, a
+/// self-join), and each scan may carry a different pushed-down predicate.  The
+/// implementation captures the table's manifest and in-memory memtables once,
+/// then builds each filtered plan from that captured state.  This keeps the
+/// read consistent without forcing every query through an unfiltered full LSM
+/// scan.
+#[async_trait::async_trait]
+pub(crate) trait SnapshotPlanSource: Send + Sync {
+    fn schema(&self) -> SchemaRef;
+    async fn plan(
+        &self,
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> DfResult<Arc<dyn ExecutionPlan>>;
 }
 
 /// Queries can reference only the supplied stream snapshots. DDL, DML, and external
@@ -96,12 +114,18 @@ async fn collect(ctx: &SessionContext, plan: Arc<dyn ExecutionPlan>) -> lance::R
         _memory: reservation,
     })
 }
-/// A captured stream view owns its plan and can outlive the writer lock.
-#[derive(Clone, Debug)]
-pub struct TableSnapshot(Arc<dyn ExecutionPlan>);
+/// A captured stream view owns its point-in-time source and can outlive the
+/// writer lock.
+#[derive(Clone)]
+pub struct TableSnapshot(Arc<dyn SnapshotPlanSource>);
 impl TableSnapshot {
-    pub(crate) fn new(plan: Arc<dyn ExecutionPlan>) -> Self {
-        Self(Arc::new(SnapshotExec(plan)))
+    pub(crate) fn from_source(source: Arc<dyn SnapshotPlanSource>) -> Self {
+        Self(source)
+    }
+}
+impl std::fmt::Debug for TableSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TableSnapshot").finish_non_exhaustive()
     }
 }
 struct StreamProvider {
@@ -139,6 +163,20 @@ impl TableProvider for StreamProvider {
             .await?;
         snapshot.scan(state, projection, filters, limit).await
     }
+
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> DfResult<Vec<TableProviderFilterPushDown>> {
+        // The captured LSM scanner evaluates the pushed predicates before its
+        // limit and preserves newest-per-primary-key semantics.  Returning
+        // Exact makes DataFusion hand the predicates to `scan` instead of
+        // inserting a FilterExec above an already materialized full snapshot.
+        Ok(filters
+            .iter()
+            .map(|_| TableProviderFilterPushDown::Exact)
+            .collect())
+    }
 }
 #[async_trait::async_trait]
 impl TableProvider for TableSnapshot {
@@ -152,10 +190,11 @@ impl TableProvider for TableSnapshot {
         &self,
         _state: &dyn Session,
         projection: Option<&Vec<usize>>,
-        _filters: &[Expr],
-        _limit: Option<usize>,
+        filters: &[Expr],
+        limit: Option<usize>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
-        if let Some(indices) = projection {
+        let plan = self.0.plan(filters, limit).await?;
+        let plan = if let Some(indices) = projection {
             let expressions: Vec<(
                 Arc<dyn lance::deps::datafusion::physical_expr::PhysicalExpr>,
                 String,
@@ -168,18 +207,27 @@ impl TableProvider for TableSnapshot {
                     )
                 })
                 .collect();
-            Ok(Arc::new(ProjectionExec::try_new(
-                expressions,
-                self.0.clone(),
-            )?))
+            Arc::new(ProjectionExec::try_new(expressions, plan)?) as Arc<dyn ExecutionPlan>
         } else {
-            Ok(self.0.clone())
-        }
+            plan
+        };
+        Ok(Arc::new(SnapshotExec(plan)))
+    }
+
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> DfResult<Vec<TableProviderFilterPushDown>> {
+        Ok(filters
+            .iter()
+            .map(|_| TableProviderFilterPushDown::Exact)
+            .collect())
     }
 }
 
-/// Lance owns the internal LSM plan. Present it as a leaf so the SQL optimizer
-/// cannot rewrite its merge semantics or depend on internal generation statistics.
+/// Lance owns the internal LSM plan. Present it as a leaf after the source has
+/// already applied the pushed filters so DataFusion cannot merge statistics
+/// from internal generations or rewrite their newest-per-key semantics.
 #[derive(Debug)]
 struct SnapshotExec(Arc<dyn ExecutionPlan>);
 impl lance::deps::datafusion::physical_plan::DisplayAs for SnapshotExec {
