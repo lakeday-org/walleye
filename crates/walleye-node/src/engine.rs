@@ -274,6 +274,20 @@ impl Stream {
         if table.is_none() {
             let durability = match &self.bitr {
                 Some(writer) => {
+                    if walleye_lance::prepare_bitr_takeover(
+                        &self.storage,
+                        &self.config.uri,
+                        self.config.shard_id,
+                        &self.config.stream,
+                        writer,
+                    )
+                    .await?
+                    {
+                        eprintln!(
+                            "walleye.storage takeover stream={} outcome=reset_wal_positions",
+                            self.definition.name
+                        );
+                    }
                     let epoch = walleye_lance::next_writer_epoch(
                         &self.storage,
                         &self.config.uri,
@@ -778,10 +792,7 @@ impl Engine {
         let stream = self.stream(name).await?;
         let snapshot = SnapshotSource::snapshot(stream.as_ref()).await?;
         let result = snapshot.search(&self.cache.storage, request).await?;
-        Ok(result
-            .iter()
-            .map(strip_hidden_pk)
-            .collect::<Result<Vec<_>, _>>()?)
+        result.iter().map(strip_hidden_pk).collect()
     }
     pub async fn count(&self, name: &str, filter: Option<&str>) -> Result<u64, Error> {
         let stream = self.stream(name).await?;

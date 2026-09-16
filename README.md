@@ -54,6 +54,7 @@ and prints it on startup. Everything else has a default:
 | --- | --- | --- |
 | `WALLEYE_BUCKET` | required | Bucket, or `bucket/prefix` |
 | `WALLEYE_PORT` | `8080` | HTTP listen port |
+| `WALLEYE_BIND` | `[::]` | Listen address; dual-stack by default, falls back to IPv4 |
 | `WALLEYE_TOKEN` | generated | API key, at least 16 chars |
 | `WALLEYE_RAM_GB` | `1` | In-memory cache size |
 | `WALLEYE_NVME_GB` | `8` | On-disk cache size |

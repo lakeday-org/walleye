@@ -51,7 +51,8 @@ impl Config {
     /// Required: `WALLEYE_BUCKET` (bucket name, optionally `bucket/prefix`) or
     /// `WALLEYE_ROOT_URI` (a full `s3://` or `file://` URI).
     ///
-    /// Optional: `WALLEYE_PORT` (8080), `WALLEYE_TOKEN` (generated and printed
+    /// Optional: `WALLEYE_PORT` (8080), `WALLEYE_BIND` (`[::]`, dual-stack),
+    /// `WALLEYE_TOKEN` (generated and printed
     /// when absent), `WALLEYE_DIR` (`./walleye-cache`), `WALLEYE_RAM_GB` (1),
     /// `WALLEYE_NVME_GB` (8), `WALLEYE_BITR_URL` (enables Bitr cluster mode),
     /// `WALLEYE_MEMBERS` (`id=http://host:8080,...`) with `WALLEYE_NODE_ID`
@@ -110,7 +111,12 @@ impl Config {
         let bitr_url = get("WALLEYE_BITR_URL");
         Ok(Config {
             node_id,
-            listen: format!("0.0.0.0:{port}"),
+            // Dual-stack by default: IPv6-only private networks (Fly 6PN) reach
+            // `[::]`, and IPv4 clients map in. `WALLEYE_BIND` overrides the address.
+            listen: format!(
+                "{}:{port}",
+                get("WALLEYE_BIND").unwrap_or_else(|| "[::]".into())
+            ),
             directory: PathBuf::from(
                 get("WALLEYE_DIR").unwrap_or_else(|| "./walleye-cache".into()),
             ),
@@ -430,7 +436,7 @@ mod config_tests {
     #[test]
     fn bucket_alone_is_enough() {
         let c = Config::from_env_with(env(&[("WALLEYE_BUCKET", "walleye")])).unwrap();
-        assert_eq!(c.listen, "0.0.0.0:8080");
+        assert_eq!(c.listen, "[::]:8080");
         assert_eq!(c.node_id, "single");
         assert_eq!(c.members.len(), 1);
         assert_eq!(c.members[0].endpoint, "http://localhost:8080");
@@ -460,7 +466,7 @@ mod config_tests {
             ),
         ]))
         .unwrap();
-        assert_eq!(c.listen, "0.0.0.0:9000");
+        assert_eq!(c.listen, "[::]:9000");
         assert_eq!(c.memory_bytes, 512 << 20);
         assert_eq!(c.disk_bytes, 20 << 30);
         assert_eq!(c.token, "sixteen-char-token!");

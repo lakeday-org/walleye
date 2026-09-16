@@ -5,6 +5,7 @@
 //! (and, in Bitr mode, the Bitr writer epoch derived from it) fences a stale
 //! owner after a membership change; the membership fingerprint header catches
 //! a forward that raced such a change before it reaches the WAL.
+#![allow(clippy::result_large_err)]
 use axum::{
     body::Bytes,
     http::{HeaderMap, Method, StatusCode},

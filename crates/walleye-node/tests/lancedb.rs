@@ -2,7 +2,7 @@
 //! search, count, list, describe, index, and drop, with retried inserts
 //! collapsing on the hidden content-hash key.
 use arrow_array::{
-    ArrayRef, FixedSizeListArray, Float32Array, Int64Array, RecordBatch, StringArray,
+    ArrayRef, FixedSizeListArray, Int64Array, RecordBatch, StringArray,
     builder::{FixedSizeListBuilder, Float32Builder},
 };
 use arrow_schema::{DataType, Field, Schema};
@@ -138,7 +138,7 @@ async fn lancedb_protocol_round_trip() {
         "POST",
         "/v1/table/clicks/create/?mode=create",
         arrow,
-        ipc(&[first.clone()]),
+        ipc(std::slice::from_ref(&first)),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -183,7 +183,7 @@ async fn lancedb_protocol_round_trip() {
             "POST",
             "/v1/table/clicks/insert/",
             arrow,
-            ipc(&[more.clone()]),
+            ipc(std::slice::from_ref(&more)),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));

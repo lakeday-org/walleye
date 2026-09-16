@@ -3,6 +3,7 @@
 use crate::{LanceDurability, LanceStorageOptions, OWNER_DO_ID_KEY, with_owner};
 use arrow_array::{RecordBatch, RecordBatchIterator};
 use arrow_schema::Schema;
+use futures::TryStreamExt;
 use lance::deps::datafusion::execution::memory_pool::MemoryReservation;
 use lance::deps::datafusion::{
     common::{DataFusionError, Result as DfResult},
@@ -771,6 +772,82 @@ fn same_fields(left: &Schema, right: &Schema) -> bool {
             .iter()
             .zip(right.fields())
             .all(|(a, b)| a.name() == b.name() && a.data_type() == b.data_type())
+}
+
+/// Prepare a stream that was last written by a single node for a Bitr
+/// cluster taking ownership. Bitr LSNs must start at 1 for a stream it has
+/// never seen, while the MemWAL manifest continues from the object-store WAL
+/// tail. When Bitr holds no history for the stream and that tail was fully
+/// checkpointed, the manifest's WAL positions are reset so the first Bitr
+/// append lands at LSN 1. Returns whether a reset happened.
+///
+/// A tail with entries after the last checkpoint is refused: only the
+/// object-store WAL holds them, and a Bitr-backed writer could not replay
+/// them. Reopen in single-node mode, checkpoint, then move.
+pub async fn prepare_bitr_takeover(
+    storage: &LanceStorageOptions,
+    uri: &str,
+    shard_id: Uuid,
+    stream: &str,
+    writer: &walleye_bitr::QuorumWriter,
+) -> lance::Result<bool> {
+    use lance::dataset::mem_wal::ShardManifestStore;
+    use lance_index::mem_wal::ShardManifest;
+    let dataset = match storage.open_dataset(uri).await {
+        Ok(dataset) => dataset,
+        Err(lance::Error::DatasetNotFound { .. }) => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let object_store = dataset.object_store(None).await?;
+    let base_path = dataset.branch_location().path;
+    let store = ShardManifestStore::new(object_store, &base_path, shard_id, 64);
+    let Some(manifest) = store.read_latest().await? else {
+        return Ok(false);
+    };
+    // The manifest only learns positions at flush time, so the object-store
+    // WAL directory is the authority on what a single-node writer left behind.
+    let wal_dir = lance::dataset::mem_wal::util::shard_wal_path(&base_path, &shard_id);
+    let object_store = dataset.object_store(None).await?;
+    let mut newest_wal_entry = 0u64;
+    let mut entries = object_store.inner.list(Some(&wal_dir));
+    while let Some(object) = entries.try_next().await? {
+        if let Some(position) = object
+            .location
+            .filename()
+            .and_then(lance::dataset::mem_wal::util::parse_bit_reversed_filename)
+        {
+            newest_wal_entry = newest_wal_entry.max(position);
+        }
+    }
+    if newest_wal_entry == 0 && manifest.wal_entry_position_last_seen == 0 {
+        return Ok(false);
+    }
+    let history = writer
+        .recover(stream, 0)
+        .await
+        .map_err(|e| lance::Error::io(format!("Bitr recovery for {stream}: {e}")))?;
+    if !history.is_empty() {
+        return Ok(false);
+    }
+    if newest_wal_entry > manifest.replay_after_wal_entry_position {
+        return Err(lance::Error::invalid_input(format!(
+            "stream {stream} has WAL entries after its last checkpoint (positions {}..={}) that \
+             only the object-store WAL holds; reopen it in single-node mode and checkpoint \
+             before moving it to Bitr",
+            manifest.replay_after_wal_entry_position + 1,
+            newest_wal_entry
+        )));
+    }
+    let (epoch, _) = store.claim_epoch(manifest.shard_spec_id).await?;
+    store
+        .commit_update(epoch, |current| ShardManifest {
+            version: current.version + 1,
+            replay_after_wal_entry_position: 0,
+            wal_entry_position_last_seen: 0,
+            ..current.clone()
+        })
+        .await?;
+    Ok(true)
 }
 
 /// The epoch the next `Table::open` will claim for this shard: one past the

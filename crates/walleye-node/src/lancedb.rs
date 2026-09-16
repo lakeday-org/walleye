@@ -1,6 +1,8 @@
 //! LanceDB remote protocol (`/v1/table/...`) so the stock `lancedb` SDKs work
 //! against Walleye with `host_override`. Data travels as Arrow IPC; everything
 //! else is JSON. Unsupported operations return 400 with a plain message.
+// axum responses are the natural error type for handlers; boxing them buys nothing.
+#![allow(clippy::result_large_err)]
 use crate::{Service, api, engine};
 use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Schema};

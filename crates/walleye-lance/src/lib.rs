@@ -23,7 +23,7 @@ pub use sql::{SnapshotSource, TableSnapshot, query, sql_table_names};
 pub use storage_options::LanceStorageOptions;
 pub use table::{
     LsmStats, ScanResult, SearchRequest, SsTableStats, Table, TableConfig, VectorIndexSpec,
-    VectorQuery, next_writer_epoch,
+    VectorQuery, next_writer_epoch, prepare_bitr_takeover,
 };
 pub type Error = WalBackendError;
 pub type Result<T> = std::result::Result<T, WalBackendError>;
