@@ -211,6 +211,30 @@ impl Service {
         // the first request does not pay for it.
         let warming = service.clone();
         tokio::spawn(async move {
+            // In Bitr mode the embedded daemon seeds archived stream prefixes
+            // before its gateway answers health. Opening tables before that
+            // would fence at the archived tail and fail, so wait for it.
+            if let Some(gateway) = warming
+                .config
+                .api
+                .as_ref()
+                .and_then(|api| api.bitr_url.clone())
+            {
+                let client = reqwest::Client::new();
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+                loop {
+                    let healthy = client
+                        .get(format!("{}/healthz", gateway.trim_end_matches('/')))
+                        .timeout(std::time::Duration::from_secs(2))
+                        .send()
+                        .await
+                        .is_ok_and(|r| r.status().is_success());
+                    if healthy || std::time::Instant::now() > deadline {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                }
+            }
             if let Some(engine) = &warming.engine {
                 engine.warm().await;
             }
