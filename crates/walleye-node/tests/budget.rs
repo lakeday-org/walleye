@@ -200,6 +200,49 @@ async fn every_allocation_borrows_from_the_one_budget_and_fails_closed() {
         expected
     );
 
+    // Refusal is transient, not terminal: closing a table nobody is using
+    // returns its memory, and the next open succeeds. This is what makes the
+    // client's retry meaningful rather than a restart.
+    let (status, body) = send(
+        &app,
+        "POST",
+        "/v1/table/v2/create/?mode=create",
+        arrow,
+        vector_ipc(10, 128),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let both = stats(&app).await;
+    assert_eq!(
+        both["budget"]["memory_reserved"].as_u64().unwrap() as usize,
+        expected * 2,
+        "{both}"
+    );
+    let closed = service
+        .engine()
+        .expect("engine")
+        .close_idle(std::time::Duration::ZERO)
+        .await;
+    assert_eq!(closed, 2, "both tables were idle");
+    let reclaimed = stats(&app).await;
+    assert_eq!(reclaimed["budget"]["memory_reserved"], 0, "{reclaimed}");
+    assert_eq!(
+        reclaimed["memory_capacity"].as_u64().unwrap() as usize,
+        budget,
+        "the cache gets the whole budget back"
+    );
+    // The data is untouched: a closed table reopens on use.
+    let (status, body) = send(
+        &app,
+        "POST",
+        "/v1/table/v/count_rows/",
+        "application/json",
+        b"{}".to_vec(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "120000");
+
     // A table the remaining budget cannot hold is refused at open.
     let d2 = tempfile::tempdir().unwrap();
     let small = Service::open(config(d2.path(), 160 * MIB)).await.unwrap();

@@ -273,6 +273,9 @@ struct Stream {
     table: Mutex<Option<Table>>,
     /// Monotonic write version reported to LanceDB clients.
     version: AtomicU64,
+    /// When this stream's table was last used, for closing idle tables and
+    /// returning their memory to the budget.
+    last_used: Mutex<Instant>,
     /// One automatic compaction in flight at a time, spaced by COMPACT_INTERVAL.
     compacting: std::sync::atomic::AtomicBool,
     last_compaction: Mutex<Option<Instant>>,
@@ -297,6 +300,7 @@ impl Stream {
         MEMTABLE_BYTES + vectors
     }
     async fn table(&self) -> Result<MappedMutexGuard<'_, Table>, Error> {
+        *self.last_used.lock().await = Instant::now();
         let mut table = self.table.lock().await;
         if table.is_none() {
             let durability = match &self.bitr {
@@ -440,6 +444,7 @@ impl Engine {
                 storage: self.cache.storage.clone(),
                 table: Mutex::new(None),
                 version: AtomicU64::new(1),
+                last_used: Mutex::new(Instant::now()),
                 compacting: std::sync::atomic::AtomicBool::new(false),
                 resources: self.cache.resources.clone(),
                 lease: Mutex::new(None),
@@ -760,6 +765,53 @@ impl Engine {
                 );
             }
         });
+    }
+    /// Close tables left untouched for `idle`, returning their memory to the
+    /// budget so another table can open. A table is reopened on its next use,
+    /// so this costs a reopen, never data: the memtable is checkpointed
+    /// first. Returns the number closed.
+    pub async fn close_idle(&self, idle: std::time::Duration) -> usize {
+        let streams: Vec<_> = self.streams.lock().await.values().cloned().collect();
+        let mut closed = 0;
+        for stream in streams {
+            // Never wait: a stream in use is by definition not idle.
+            let Ok(mut table) = stream.table.try_lock() else {
+                continue;
+            };
+            if table.is_none() {
+                continue;
+            }
+            let Ok(last_used) = stream.last_used.try_lock() else {
+                continue;
+            };
+            if last_used.elapsed() < idle {
+                continue;
+            }
+            let held = stream
+                .lease
+                .try_lock()
+                .ok()
+                .and_then(|lease| lease.as_ref().map(|lease| lease.bytes()))
+                .unwrap_or(0);
+            if let Some(mut open) = table.take() {
+                if let Err(error) = open.checkpoint().await {
+                    eprintln!(
+                        "walleye.storage idle_close stream={} stage=checkpoint outcome=error error={error}",
+                        stream.definition.name
+                    );
+                }
+                let _ = open.close().await;
+            }
+            if let Ok(mut lease) = stream.lease.try_lock() {
+                *lease = None;
+            }
+            closed += 1;
+            eprintln!(
+                "walleye.storage idle_close stream={} released_bytes={held}",
+                stream.definition.name
+            );
+        }
+        closed
     }
     /// Merge flushed generations now. Returns what was merged, if anything.
     pub async fn compact(&self, name: &str) -> Result<Option<CompactionResult>, Error> {

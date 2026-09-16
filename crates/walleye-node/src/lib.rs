@@ -131,6 +131,12 @@ impl Config {
         })
     }
 }
+/// A table untouched for this long is closed, returning its memory to the
+/// budget. It reopens on its next use, so the cost is a reopen and the
+/// benefit is that a table refused for want of memory can be opened once an
+/// idle one has gone.
+pub const IDLE_TABLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// Fixed reservations the engine keeps out of the budgets. Set the budgets to
 /// the machine's memory and the volume's size; nothing else is held back.
 pub struct Budget {
@@ -367,6 +373,17 @@ impl Service {
                 }
             });
         }
+        // Return the memory of tables nobody is using, so a node whose
+        // budget is full can still open a new table.
+        let sweeping = service.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                if let Some(engine) = &sweeping.engine {
+                    engine.close_idle(IDLE_TABLE_TIMEOUT).await;
+                }
+            }
+        });
         // Serve immediately; owned streams open and warm in the background so
         // the first request does not pay for it.
         let warming = service.clone();
@@ -438,6 +455,10 @@ impl Service {
             Some(config) => kubernetes::follow(config, self.ring.clone()).await,
             None => std::future::pending().await,
         }
+    }
+    /// The stream engine, when this node serves the API.
+    pub fn engine(&self) -> Option<&engine::Engine> {
+        self.engine.as_ref()
     }
     fn readiness(&self) -> std::sync::MutexGuard<'_, serde_json::Value> {
         self.readiness
