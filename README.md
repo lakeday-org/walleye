@@ -75,7 +75,21 @@ budget cannot cover is refused with a clear error rather than exceeded: an
 oversize insert gets a 413, a table that does not fit fails to open, and a
 Bitr append past the disk budget is rejected until the archive drains the
 log. The floors are 256 MiB of memory for the runtime, 128 MiB more when
-Bitr is enabled, and 512 MiB of disk for the filesystem.
+Bitr is enabled, and 512 MiB of disk for the filesystem. The cache also keeps
+a working set against long-lived holds, a sixteenth of its ceiling and at
+most 64 MiB, so a table can never leave it at zero; queries are not bound by
+that floor, because they give their memory back.
+
+**Sizing by table count.** An open table holds 48 MiB for its memtable and
+unflushed bound, plus `rows x (dimensions x 4 + 128)` bytes for each vector
+column's in-memory graph, where `rows` is the memtable's row capacity of
+100,000. A 768-dimension table is about 353 MiB; a table with no vector
+column is 48 MiB. So a node's practical bound is how many tables it keeps
+open at once, and a node only opens the streams it owns. A table untouched
+for five minutes is checkpointed, closed, and its memory returned, so an open
+refused for want of memory succeeds on a later retry; dropping a table frees
+its memory at once. Nothing else frees it: a workload that touches every
+table every minute keeps them all open.
 
 `WALLEYE_ROOT_URI` accepts a full `s3://` or `file://` URI in place of
 `WALLEYE_BUCKET`. `WALLEYE_CONFIG` points at a JSON file for deployments that
@@ -143,9 +157,12 @@ flowchart LR
 owned by one member, chosen by rendezvous hashing the stream name over the
 membership ring, and only the owner holds its MemWAL writer. A request that
 reaches a non-owner is forwarded to the owner, so clients need no knowledge
-of the topology and never see a 503. Reads go through the owner too, so they
-always include the memtable. SQL that spans tables with different owners is
-refused with a 400 rather than answered from a partial view.
+of the topology. Reads go through the owner too, so they always include the
+memtable. SQL spanning tables with different owners runs on the node that
+receives it, which gathers the rows it does not own from their owners; a
+gathered table is that owner's own snapshot, so it carries unflushed rows,
+and a stream beyond a million rows is refused rather than shipped across the
+cluster.
 
 **Readiness.** `/healthz` reports unavailable until a node can make writes
 durable: with Bitr that means its replica quorum is reachable and its owned
