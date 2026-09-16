@@ -14,7 +14,10 @@ use lance::{
     dataset::mem_wal::{
         CompactionResult, Compactor, DatasetMemWalExt, ShardWriter, ShardWriterConfig,
         index::MemIndexConfig,
-        scanner::{FreshTierWatermark, InMemoryMemTables, LsmScanner, ShardSnapshot},
+        scanner::{
+            DatasetCache, FreshTierWatermark, InMemoryMemTables, LsmScanner, ShardSnapshot,
+            SsTableCache,
+        },
     },
     index::DatasetIndexExt,
 };
@@ -175,6 +178,10 @@ pub struct Table {
     writer: ShardWriter,
     storage: LanceStorageOptions,
     durability: LanceDurability,
+    /// Opened generation datasets, keyed by path. Generations are immutable,
+    /// so reusing the open handle saves the manifest resolution and index
+    /// load that every query would otherwise repeat against object storage.
+    sstables: Arc<SsTableCache>,
 }
 
 /// Emit bounded, stage-level open diagnostics without exposing a dataset URI,
@@ -395,6 +402,7 @@ impl Table {
             writer,
             storage,
             durability,
+            sstables: Arc::new(SsTableCache::new(256)),
         })
     }
     /// Acknowledge only after the configured WAL authority accepts the Arrow IPC entry.
@@ -529,6 +537,7 @@ impl Table {
             fresh_tier_watermarks,
             primary_keys: self.config.primary_keys.clone(),
             schema: self.config.schema.clone(),
+            sstables: self.sstables.clone(),
         })
     }
     pub fn config(&self) -> &TableConfig {
@@ -547,10 +556,23 @@ impl Table {
     /// `min_sstables` exist. The replaced generation directories are left in
     /// place; the caller deletes them once no snapshot can reference them.
     pub async fn compact(&self, min_sstables: usize) -> lance::Result<Option<CompactionResult>> {
-        match self.writer.compactor() {
-            Some(compactor) => compactor.compact(min_sstables).await,
-            None => Ok(None),
+        let result = match self.writer.compactor() {
+            Some(compactor) => compactor.compact(min_sstables).await?,
+            None => None,
+        };
+        if result.is_some()
+            && let Some(manifest) = self.writer.manifest().await?
+        {
+            let base = self.config.uri.trim_end_matches('/');
+            let shard = self.writer.shard_id();
+            let live = manifest
+                .sstables
+                .iter()
+                .map(|s| format!("{base}/_mem_wal/{shard}/{}", s.path))
+                .collect();
+            self.sstables.retain_paths(&live);
         }
+        Ok(result)
     }
     /// Generations currently in the manifest, with row counts and index names.
     pub async fn lsm_stats(&self) -> lance::Result<LsmStats> {
@@ -608,6 +630,7 @@ struct CapturedSnapshot {
     fresh_tier_watermarks: HashMap<Uuid, FreshTierWatermark>,
     primary_keys: Vec<String>,
     schema: Arc<Schema>,
+    sstables: Arc<SsTableCache>,
 }
 
 impl CapturedSnapshot {
@@ -617,6 +640,7 @@ impl CapturedSnapshot {
             vec![self.shard.clone()],
             self.primary_keys.clone(),
         )
+        .with_sstable_cache(self.sstables.clone() as Arc<dyn DatasetCache>)
         .with_in_memory_memtables(self.shard_id, self.memtables.clone())
         .with_in_memory_visible_counts(
             self.shard_id,

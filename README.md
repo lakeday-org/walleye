@@ -61,6 +61,7 @@ and prints it on startup. Everything else has a default:
 | `WALLEYE_MEMBERS` | none | Cluster members as `id=http://host:8080,...` |
 | `WALLEYE_NODE_ID` | `single` | This node's id; required with `WALLEYE_MEMBERS` |
 | `WALLEYE_BITR_URL` | none | Bitr gateway; setting it enables cluster mode |
+| `WALLEYE_TRACE_ORIGIN` | unset | Log every request that reaches object storage |
 
 `WALLEYE_ROOT_URI` accepts a full `s3://` or `file://` URI in place of
 `WALLEYE_BUCKET`. `WALLEYE_CONFIG` points at a JSON file for deployments that

@@ -1590,6 +1590,8 @@ pub struct ShardWriter {
     mode: WriterMode,
     /// Merges flushed generations; `None` in WAL-only mode.
     compactor: Option<super::memtable::flush::Compactor>,
+    /// Last manifest this writer committed (seeded by the epoch claim).
+    manifest_cache: Arc<RwLock<Option<ShardManifest>>>,
     /// The base table's schema as the caller passed it — no `_tombstone`,
     /// nullability untouched. Caller input is held to it (see
     /// [`Self::validate_against_logical_schema`]) and the scan narrows back to
@@ -1683,6 +1685,7 @@ impl ShardWriter {
         // Claim the shard (epoch-based fencing) — done once, then shared
         // with the WalAppender via `with_claimed_epoch`.
         let (epoch, manifest) = manifest_store.claim_epoch(config.shard_spec_id).await?;
+        let manifest_cache = Arc::new(RwLock::new(Some(manifest.clone())));
 
         info!(
             "Opened ShardWriter for shard {} (epoch {}, generation {}, enable_memtable {})",
@@ -1755,6 +1758,7 @@ impl ShardWriter {
                 .expect("memtable_validation is Some when enable_memtable is true");
             let compactor_pk_columns = pk_columns.clone();
             let (mode, flusher) = Self::open_memtable_mode(
+                manifest_cache.clone(),
                 &config,
                 &storage_schema,
                 &manifest,
@@ -1803,12 +1807,14 @@ impl ShardWriter {
             stats,
             mode,
             compactor,
+            manifest_cache,
             logical_schema,
         })
     }
 
     #[allow(clippy::too_many_arguments)]
     async fn open_memtable_mode(
+        manifest_cache: Arc<RwLock<Option<ShardManifest>>>,
         config: &ShardWriterConfig,
         schema: &Arc<ArrowSchema>,
         manifest: &ShardManifest,
@@ -1871,7 +1877,8 @@ impl ShardWriter {
             )
             .with_wal_backend(wal_backend.clone())
             .with_warmer(config.warmer.clone())
-            .with_storage_context(config.store_params.clone(), config.session.clone()),
+            .with_storage_context(config.store_params.clone(), config.session.clone())
+            .with_manifest_cache(manifest_cache),
         );
 
         // Replay any WAL entries written after the last successfully-flushed
@@ -2589,7 +2596,15 @@ impl ShardWriter {
     }
 
     /// Get the current shard manifest.
+    /// The manifest as this writer last committed it. Only this writer's
+    /// flusher and compactor mutate the manifest under the current epoch, so
+    /// the cached copy is exact for readers on the owning node and costs no
+    /// object-storage round trips. A successor's claim fences the next write
+    /// rather than this read.
     pub async fn manifest(&self) -> Result<Option<ShardManifest>> {
+        if let Some(manifest) = self.manifest_cache.read().await.clone() {
+            return Ok(Some(manifest));
+        }
         self.manifest_store.read_latest().await
     }
 

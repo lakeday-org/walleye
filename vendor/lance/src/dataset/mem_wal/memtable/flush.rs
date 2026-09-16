@@ -140,6 +140,10 @@ pub struct MemTableFlusher {
     /// Session for those opens, sharing the base's store registry. `None` opens
     /// with a fresh session.
     session: Option<Arc<Session>>,
+    /// The writer's last committed manifest. This flusher is the only thing
+    /// that commits under the writer's epoch, so readers on the owning node
+    /// can take the manifest from here instead of probing object storage.
+    manifest_cache: Option<Arc<tokio::sync::RwLock<Option<ShardManifest>>>>,
 }
 
 impl MemTableFlusher {
@@ -160,6 +164,21 @@ impl MemTableFlusher {
             warmer: None,
             store_params: None,
             session: None,
+            manifest_cache: None,
+        }
+    }
+
+    pub fn with_manifest_cache(
+        mut self,
+        cache: Arc<tokio::sync::RwLock<Option<ShardManifest>>>,
+    ) -> Self {
+        self.manifest_cache = Some(cache);
+        self
+    }
+
+    async fn publish_manifest(&self, manifest: &ShardManifest) {
+        if let Some(cache) = &self.manifest_cache {
+            *cache.write().await = Some(manifest.clone());
         }
     }
 
@@ -1434,6 +1453,7 @@ impl MemTableFlusher {
                 }
             })
             .await?;
+        self.publish_manifest(&new_manifest).await;
         info!(
             "Compacted shard {} into generation {} (manifest version {})",
             self.shard_id, generation, new_manifest.version
@@ -1500,6 +1520,7 @@ impl MemTableFlusher {
                 }
             })
             .await?;
+        self.publish_manifest(&manifest).await;
         if let Some(backend) = &self.wal_backend {
             backend
                 .checkpointed(self.shard_id, manifest.replay_after_wal_entry_position)
