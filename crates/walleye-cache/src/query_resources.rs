@@ -120,7 +120,7 @@ impl QueryResources {
     /// closed with `ResourcesExhausted` when the budget cannot cover it.
     pub fn reserve_memory(self: &Arc<Self>, name: &str, bytes: usize) -> Result<MemoryLease> {
         let pool: Arc<dyn MemoryPool> = self.clone();
-        let mut reservation = MemoryConsumer::new(name).register(&pool);
+        let reservation = MemoryConsumer::new(name).register(&pool);
         self.leased
             .fetch_add(bytes, std::sync::atomic::Ordering::AcqRel);
         if reservation.try_grow(bytes).is_err() {
