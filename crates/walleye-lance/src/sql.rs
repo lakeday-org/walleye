@@ -56,6 +56,13 @@ pub(crate) trait SnapshotPlanSource: Send + Sync {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DfResult<Arc<dyn ExecutionPlan>>;
+    /// Build a LanceDB-style search plan: optional SQL filter, projection,
+    /// limit/offset, and optional nearest-neighbor query.
+    async fn search_plan(
+        &self,
+        request: &crate::SearchRequest,
+    ) -> lance::Result<Arc<dyn ExecutionPlan>>;
+    async fn count(&self, filter: Option<&str>) -> lance::Result<u64>;
 }
 
 /// Queries can reference only the supplied stream snapshots. DDL, DML, and external
@@ -121,6 +128,29 @@ pub struct TableSnapshot(Arc<dyn SnapshotPlanSource>);
 impl TableSnapshot {
     pub(crate) fn from_source(source: Arc<dyn SnapshotPlanSource>) -> Self {
         Self(source)
+    }
+    /// Execute a LanceDB-style search against this point-in-time view.
+    pub async fn search(
+        &self,
+        storage: &LanceStorageOptions,
+        request: &crate::SearchRequest,
+    ) -> lance::Result<ScanResult> {
+        tokio::time::timeout(storage.query_timeout(), async {
+            let plan = self.0.search_plan(request).await?;
+            execute(storage, plan).await
+        })
+        .await
+        .map_err(|_| err("query deadline exceeded"))?
+    }
+    /// Count visible rows, optionally under a SQL filter.
+    pub async fn count(
+        &self,
+        storage: &LanceStorageOptions,
+        filter: Option<&str>,
+    ) -> lance::Result<u64> {
+        tokio::time::timeout(storage.query_timeout(), self.0.count(filter))
+            .await
+            .map_err(|_| err("query deadline exceeded"))?
     }
 }
 impl std::fmt::Debug for TableSnapshot {

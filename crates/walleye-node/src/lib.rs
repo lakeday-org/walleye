@@ -1,5 +1,6 @@
 //! Single-deployment stream API, Foyer peer service, and Bitr node composition.
 mod engine;
+mod lancedb;
 mod processor;
 pub use processor::ProcessorConfig;
 pub mod kubernetes;
@@ -11,7 +12,9 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-pub use engine::{ApiConfig, Column, StreamDefinition};
+pub use engine::{
+    ApiConfig, Column, HIDDEN_PK, PK_METADATA_KEY, StreamDefinition, TableExists, TableNotFound,
+};
 use lance_core::cache::{CacheBackend, InternalCacheKey};
 use serde::Deserialize;
 use std::{
@@ -129,8 +132,8 @@ pub struct Service {
     hits: AtomicU64,
     misses: AtomicU64,
     stores: AtomicU64,
-    revision: tokio::sync::Mutex<String>,
-    changed: tokio::sync::Notify,
+    pub(crate) revision: tokio::sync::Mutex<String>,
+    pub(crate) changed: tokio::sync::Notify,
     quiescing: AtomicBool,
 }
 impl Service {
@@ -219,16 +222,23 @@ pub fn router(service: Arc<Service>) -> Router {
         .route("/v1/streams/{name}/events", post(ingest))
         .route("/v1/query", post(query))
         .layer(DefaultBodyLimit::max(8 * 1024 * 1024))
+        .merge(lancedb::routes())
         .with_state(service)
 }
+/// Accepts either `Authorization: Bearer <token>` or the LanceDB SDK's `x-api-key`.
 fn authorize(s: &Service, headers: &HeaderMap) -> Result<(), StatusCode> {
-    let expected = format!("Bearer {}", s.config.token);
-    let value = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .ok_or(StatusCode::UNAUTHORIZED)?;
-    if value.len() != expected.len()
-        || value
+    let presented = match headers.get("x-api-key").and_then(|v| v.to_str().ok()) {
+        Some(key) => key.to_string(),
+        None => headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .ok_or(StatusCode::UNAUTHORIZED)?
+            .to_string(),
+    };
+    let expected = &s.config.token;
+    if presented.len() != expected.len()
+        || presented
             .bytes()
             .zip(expected.bytes())
             .fold(0u8, |d, (a, b)| d | (a ^ b))
@@ -301,7 +311,7 @@ fn failure(e: impl std::fmt::Display) -> ApiError {
         Json(serde_json::json!({"error":e.to_string()})),
     )
 }
-fn api<'a>(s: &'a Service, h: &HeaderMap) -> Result<&'a engine::Engine, ApiError> {
+pub(crate) fn api<'a>(s: &'a Service, h: &HeaderMap) -> Result<&'a engine::Engine, ApiError> {
     authorize(s, h).map_err(|code| (code, Json(serde_json::json!({"error":"unauthorized"}))))?;
     s.engine.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,

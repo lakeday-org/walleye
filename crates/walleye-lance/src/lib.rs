@@ -17,9 +17,12 @@ pub use ipc::{
     encode_fence_sentinel, encode_ipc_batches, with_owner,
 };
 pub use lance::Error as LanceError;
+pub use lance::arrow::json::JsonSchema;
 pub use sql::{SnapshotSource, TableSnapshot, query};
 pub use storage_options::LanceStorageOptions;
-pub use table::{ScanResult, Table, TableConfig};
+pub use table::{
+    IndexInfo, ScanResult, SearchRequest, Table, TableConfig, VectorIndexRequest, VectorQuery,
+};
 pub type Error = WalBackendError;
 pub type Result<T> = std::result::Result<T, WalBackendError>;
 type WalResult<T> = Result<T>;

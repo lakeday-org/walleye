@@ -6340,6 +6340,7 @@ dependencies = [
  "futures",
  "lance",
  "lance-core",
+ "lance-index",
  "lance-io",
  "lance-linalg",
  "object_store 0.13.2",
@@ -6359,7 +6360,9 @@ name = "walleye-node"
 version = "0.1.0"
 dependencies = [
  "arrow-array",
+ "arrow-ipc",
  "arrow-json",
+ "arrow-row",
  "arrow-schema",
  "async-trait",
  "axum",
@@ -6384,6 +6387,7 @@ dependencies = [
  "walleye-cache",
  "walleye-lance",
  "walleye-ring",
+ "xxhash-rust",
 ]
 
 [[package]]

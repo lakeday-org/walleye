@@ -1,9 +1,14 @@
 # Walleye
 
-WAL over S3 (LanceDB). Define a stream, ingest rows, query it with SQL.
+A LanceDB server with a write-ahead log on S3. Connect with the stock
+`lancedb` SDK, point the server at a bucket, and every write is durable in
+object storage before it is acknowledged. Reads are served from a local
+NVMe and RAM cache ([Foyer](https://github.com/foyer-rs/foyer)).
 
-Each stream owns its own memshard, writer lock, WAL sequence, and S3 manifest.
-Different streams ingest concurrently in both S3 CAS and Bitr modes.
+Each table is its own memshard: an independent writer, WAL sequence, and
+manifest, so tables ingest in parallel with no shared lock. Rows are keyed by
+a content hash unless the schema marks a primary key, so a retried insert
+lands once.
 
 ## Quickstart
 
@@ -20,6 +25,28 @@ export AWS_REGION=us-east-1        # or "auto" for Tigris, R2, etc.
 WALLEYE_BUCKET=my-bucket WALLEYE_TOKEN=change-me-to-a-long-secret ./target/release/walleye-node
 ```
 
+Then use LanceDB as usual. Any `lancedb` SDK works: pass the node as
+`host_override` and the token as `api_key`.
+
+```python
+import lancedb
+
+db = lancedb.connect("db://walleye", api_key="change-me-to-a-long-secret",
+                     host_override="http://localhost:8080", region="local")
+
+tbl = db.create_table("clicks", data=[
+    {"id": 1, "city": "seattle",  "vector": [0.0, 1.0]},
+    {"id": 2, "city": "seattle",  "vector": [1.0, 0.0]},
+    {"id": 3, "city": "portland", "vector": [0.0, -1.0]},
+])
+tbl.add([{"id": 4, "city": "boise", "vector": [-1.0, 0.0]}])
+
+tbl.count_rows("city = 'seattle'")                       # 2
+tbl.search().where("id > 1").select(["id", "city"]).to_list()
+tbl.search([0.0, 0.9]).limit(2).to_list()                # nearest first, with _distance
+tbl.search([0.0, 0.9]).where("city = 'portland'").to_list()
+```
+
 That's the whole config. Leave `WALLEYE_TOKEN` unset and the node generates one
 and prints it on startup. Everything else has a default:
 
@@ -27,7 +54,7 @@ and prints it on startup. Everything else has a default:
 | --- | --- | --- |
 | `WALLEYE_BUCKET` | required | Bucket, or `bucket/prefix` |
 | `WALLEYE_PORT` | `8080` | HTTP listen port |
-| `WALLEYE_TOKEN` | generated | Bearer token, at least 16 chars |
+| `WALLEYE_TOKEN` | generated | API key, at least 16 chars |
 | `WALLEYE_RAM_GB` | `1` | In-memory cache size |
 | `WALLEYE_NVME_GB` | `8` | On-disk cache size |
 | `WALLEYE_DIR` | `./walleye-cache` | On-disk cache path |
@@ -39,39 +66,36 @@ and prints it on startup. Everything else has a default:
 `WALLEYE_BUCKET`. `WALLEYE_CONFIG` points at a JSON file for deployments that
 need the full config struct.
 
-Then define a stream, ingest, and query.
-
-```sh
-TOKEN=change-me-to-a-long-secret
-
-# 1. Define a stream.
-curl http://localhost:8080/v1/streams \
-  -H "Authorization: Bearer $TOKEN" \
-  -H 'Content-Type: application/json' \
-  -d '{"name":"clicks","columns":[{"name":"id","type":"int64"},{"name":"city","type":"string"},{"name":"value","type":"float64"}],"primary_key":["id"]}'
-
-# 2. Ingest.
-curl http://localhost:8080/v1/streams/clicks/events \
-  -H "Authorization: Bearer $TOKEN" \
-  -H 'Content-Type: application/json' \
-  -d '{"rows":[{"id":1,"city":"Seattle","value":2.5},{"id":2,"city":"Seattle","value":4.0}]}'
-
-# 3. Query.
-curl http://localhost:8080/v1/query \
-  -H "Authorization: Bearer $TOKEN" \
-  -H 'Content-Type: application/json' \
-  -d '{"sql":"SELECT city, count(*) AS n, sum(value) AS total FROM clicks GROUP BY city"}'
-# [{"city":"Seattle","n":2,"total":6.5}]
-```
-
 Prefer Docker? `docker build -t walleye .` produces an image whose default
 command is `walleye-node`. Pass the same `WALLEYE_*` and `AWS_*` variables
-through. `integration/compose.yaml` runs a full local stack against MinIO.
+through. `integration/compose.yaml` runs a full local stack against MinIO, and
+`integration/lancedb_acceptance.py` drives a node with the Python SDK.
+
+## What works
+
+The server speaks the LanceDB remote protocol, so the SDK's `connect`,
+`create_table`, `open_table`, `list_tables`, `drop_table`, `add`,
+`count_rows`, and `search` with `where`, `select`, `limit`, `offset`, and
+vector queries all work unchanged. Vector search is exact across every tier.
+
+Not yet: `create_index` (vector indexes need base-table rows, and this build
+has no LSM compaction), full-text search, `update`, `delete`, `merge_insert`,
+and namespaces. Each returns a 400 with a plain reason.
+
+**Primary keys.** Mark a field with the Lance metadata
+`lance-schema:unenforced-primary-key = "true"` on your Arrow schema to use it as
+the key. Otherwise Walleye adds a hidden content-hash key: identical rows
+collapse to one, so a retried insert is a no-op and every memshard stays
+idempotent.
+
+**SQL.** `POST /v1/query` with `{"sql": "..."}` and `Authorization: Bearer
+<token>` runs DataFusion SQL across every table. This is a Walleye extension;
+LanceDB has no SQL endpoint.
 
 ## Architecture
 
-**Single node: S3 CAS.** The default. Every write commits straight to S3 with
-conditional puts. No coordination service, no local
+**Single node: S3 CAS.** The default. Every write is appended to a WAL in S3
+with conditional puts before the SDK gets its acknowledgement. No coordination service, no local
 durability, one process.
 
 ```mermaid

@@ -15,7 +15,56 @@ use lance::{
         DatasetMemWalExt, ShardWriter, ShardWriterConfig,
         scanner::{FreshTierWatermark, InMemoryMemTables, LsmScanner, ShardSnapshot},
     },
+    index::{DatasetIndexExt, vector::VectorIndexParams},
 };
+use lance_index::IndexType;
+use lance_linalg::distance::DistanceType;
+
+/// A LanceDB-style search: filter, projection, paging, and an optional
+/// nearest-neighbor query over one vector column.
+#[derive(Clone, Debug, Default)]
+pub struct SearchRequest {
+    pub filter: Option<String>,
+    pub columns: Option<Vec<String>>,
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
+    pub vector: Option<VectorQuery>,
+}
+#[derive(Clone, Debug)]
+pub struct VectorQuery {
+    pub column: String,
+    pub vector: Vec<f32>,
+    pub k: usize,
+    pub nprobes: usize,
+    pub refine_factor: u32,
+    pub metric: Option<String>,
+}
+/// Parameters for a vector index on the base table.
+#[derive(Clone, Debug)]
+pub struct VectorIndexRequest {
+    pub column: String,
+    pub name: Option<String>,
+    pub metric: Option<String>,
+    pub replace: bool,
+    /// IVF_FLAT when false, IVF_PQ when true.
+    pub product_quantization: bool,
+    pub num_partitions: Option<usize>,
+    pub num_sub_vectors: Option<usize>,
+}
+#[derive(Clone, Debug)]
+pub struct IndexInfo {
+    pub name: String,
+    pub uuid: String,
+    pub columns: Vec<String>,
+}
+fn parse_metric(metric: Option<&str>) -> lance::Result<DistanceType> {
+    match metric {
+        None => Ok(DistanceType::L2),
+        Some(m) => {
+            DistanceType::try_from(m).map_err(|e| lance::Error::invalid_input(e.to_string()))
+        }
+    }
+}
 use std::{
     collections::HashMap,
     sync::Arc,
@@ -421,6 +470,88 @@ impl Table {
             schema: self.config.schema.clone(),
         })
     }
+    pub fn config(&self) -> &TableConfig {
+        &self.config
+    }
+    /// Create (or replace) a vector index on the base table. Rows in the
+    /// memtables and SSTables are searched exactly and merged with the index
+    /// results, so the index never has to be rebuilt after ingest.
+    pub async fn create_vector_index(
+        &mut self,
+        request: &VectorIndexRequest,
+    ) -> lance::Result<String> {
+        let field = self
+            .config
+            .schema
+            .field_with_name(&request.column)
+            .map_err(|e| lance::Error::invalid_input(e.to_string()))?;
+        let dim = match field.data_type() {
+            arrow_schema::DataType::FixedSizeList(inner, dim)
+                if inner.data_type() == &arrow_schema::DataType::Float32 =>
+            {
+                *dim as usize
+            }
+            other => {
+                return Err(lance::Error::invalid_input(format!(
+                    "vector index requires a FixedSizeList<Float32> column, got {other}"
+                )));
+            }
+        };
+        if self.dataset.count_rows(None).await? == 0 {
+            return Err(lance::Error::not_supported(
+                "vector indexes need rows in the base table, and this build has no LSM \
+                 compaction yet; searches run exactly over every tier without an index",
+            ));
+        }
+        let metric = parse_metric(request.metric.as_deref())?;
+        let partitions = request.num_partitions.unwrap_or(1).max(1);
+        let params = if request.product_quantization {
+            let sub_vectors = request
+                .num_sub_vectors
+                .unwrap_or_else(|| (dim / 8).max(1))
+                .max(1);
+            VectorIndexParams::ivf_pq(partitions, 8, sub_vectors, metric, 50)
+        } else {
+            VectorIndexParams::ivf_flat(partitions, metric)
+        };
+        let name = request
+            .name
+            .clone()
+            .unwrap_or_else(|| format!("{}_idx", request.column));
+        let mut dataset = (*self.dataset).clone();
+        dataset
+            .create_index(
+                &[request.column.as_str()],
+                IndexType::Vector,
+                Some(name.clone()),
+                &params,
+                request.replace,
+            )
+            .await?;
+        self.dataset = Arc::new(dataset);
+        Ok(name)
+    }
+    pub async fn list_indices(&self) -> lance::Result<Vec<IndexInfo>> {
+        let schema = self.dataset.schema();
+        Ok(self
+            .dataset
+            .load_indices()
+            .await?
+            .iter()
+            // The MemWAL manifest is registered as a system index; clients
+            // only see indexes on their own columns.
+            .filter(|index| !index.name.starts_with("__lance") && !index.fields.is_empty())
+            .map(|index| IndexInfo {
+                name: index.name.clone(),
+                uuid: index.uuid.to_string(),
+                columns: index
+                    .fields
+                    .iter()
+                    .filter_map(|id| schema.field_by_id(*id).map(|f| f.name.clone()))
+                    .collect(),
+            })
+            .collect())
+    }
     /// Flush to Lance SSTables and advance the manifest replay watermark.
     pub async fn checkpoint(&mut self) -> lance::Result<()> {
         self.writer.checkpoint().await
@@ -509,6 +640,39 @@ impl crate::sql::SnapshotPlanSource for CapturedSnapshot {
             .create_plan()
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))
+    }
+
+    async fn search_plan(&self, request: &SearchRequest) -> lance::Result<Arc<dyn ExecutionPlan>> {
+        let mut scanner = self.scanner();
+        if let Some(filter) = request.filter.as_deref() {
+            scanner = scanner.filter(filter)?;
+        }
+        if let Some(columns) = &request.columns {
+            scanner = scanner.project(columns)?;
+        }
+        if request.limit.is_some() || request.offset.is_some() {
+            scanner = scanner.limit(
+                request.limit.map(|l| l as i64),
+                request.offset.map(|o| o as i64),
+            )?;
+        }
+        if let Some(query) = &request.vector {
+            let key = arrow_array::Float32Array::from(query.vector.clone());
+            scanner = scanner
+                .nearest(&query.column, &key, query.k.max(1))?
+                .nprobes(query.nprobes.max(1))
+                .refine(query.refine_factor)
+                .distance_metric(parse_metric(query.metric.as_deref())?);
+        }
+        scanner.create_plan().await
+    }
+
+    async fn count(&self, filter: Option<&str>) -> lance::Result<u64> {
+        let mut scanner = self.scanner();
+        if let Some(filter) = filter {
+            scanner = scanner.filter(filter)?;
+        }
+        scanner.count_rows().await
     }
 }
 

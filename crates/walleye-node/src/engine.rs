@@ -1,6 +1,6 @@
 //! One deployment's stream registry. Definitions use object-store create-if-absent;
 //! one designated ingress owns a separately locked memshard for each stream.
-use arrow_array::RecordBatch;
+use arrow_array::{Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use base64::Engine as _;
 use futures::TryStreamExt;
@@ -11,17 +11,45 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashMap},
     io::Cursor,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Instant,
 };
 use tokio::sync::{MappedMutexGuard, Mutex, MutexGuard, RwLock};
 use walleye_bitr::{HttpReplica, QuorumWriter};
 use walleye_lance::{
-    BitrWalBackend, CachedStorage, LanceDurability, LanceStorageOptions, SnapshotSource, Table,
-    TableConfig, TableSnapshot,
+    BitrWalBackend, CachedStorage, IndexInfo, JsonSchema, LanceDurability, LanceStorageOptions,
+    SearchRequest, SnapshotSource, Table, TableConfig, TableSnapshot, VectorIndexRequest,
 };
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
+
+/// Server-managed primary key for tables created without one. It is an xxh3
+/// hash of the row's full contents, so an identical row (including a retried
+/// insert) collapses to one visible row and every memshard stays idempotent.
+pub const HIDDEN_PK: &str = "_walleye_pk";
+/// Field metadata that marks a user-supplied primary key column.
+pub const PK_METADATA_KEY: &str = "lance-schema:unenforced-primary-key";
+
+#[derive(Debug)]
+pub struct TableNotFound(pub String);
+impl std::fmt::Display for TableNotFound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "table {} not found", self.0)
+    }
+}
+impl std::error::Error for TableNotFound {}
+
+#[derive(Debug)]
+pub struct TableExists(pub String);
+impl std::fmt::Display for TableExists {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "table {} already exists", self.0)
+    }
+}
+impl std::error::Error for TableExists {}
 
 /// Catalog requests are small, but they are still remote object-store
 /// operations. Emit bounded stage markers so a process killed by its startup
@@ -67,11 +95,91 @@ pub struct Column {
 #[serde(deny_unknown_fields)]
 pub struct StreamDefinition {
     pub name: String,
+    #[serde(default)]
     pub columns: Vec<Column>,
     pub primary_key: Vec<String>,
+    /// Full Arrow schema in Lance JSON form, for tables created through the
+    /// LanceDB API. Includes the hidden primary key when one was added.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema: Option<serde_json::Value>,
+}
+fn valid_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || b"_-".contains(&c))
 }
 impl StreamDefinition {
+    /// Build a definition from a LanceDB `create_table` schema. Fields tagged
+    /// with [`PK_METADATA_KEY`] form the primary key; otherwise a hidden
+    /// content-hash key is appended so the memshard stays idempotent.
+    pub fn from_arrow(name: &str, schema: &Schema) -> Result<Self, Error> {
+        if !valid_name(name) {
+            return Err("invalid table name".into());
+        }
+        if schema.fields().is_empty() {
+            return Err("table requires at least one column".into());
+        }
+        let mut fields = Vec::with_capacity(schema.fields().len() + 1);
+        let mut primary_key = Vec::new();
+        for field in schema.fields() {
+            if field.name().starts_with('_') {
+                return Err(format!("column {} uses a reserved name", field.name()).into());
+            }
+            let marked = field.metadata().get(PK_METADATA_KEY).map(|v| v == "true") == Some(true);
+            if marked {
+                primary_key.push(field.name().clone());
+                fields.push(field.as_ref().clone().with_nullable(false));
+            } else {
+                fields.push(field.as_ref().clone());
+            }
+        }
+        if primary_key.is_empty() {
+            fields.push(Field::new(HIDDEN_PK, DataType::UInt64, false));
+            primary_key.push(HIDDEN_PK.into());
+        }
+        let schema = Schema::new(fields);
+        let json = JsonSchema::try_from(&schema)?;
+        Ok(Self {
+            name: name.into(),
+            columns: Vec::new(),
+            primary_key,
+            schema: Some(serde_json::to_value(json)?),
+        })
+    }
+    fn hidden_pk(&self) -> bool {
+        self.primary_key.len() == 1 && self.primary_key[0] == HIDDEN_PK
+    }
+    fn arrow_schema(&self) -> Result<Schema, Error> {
+        let Some(value) = &self.schema else {
+            return Err("definition has no Arrow schema".into());
+        };
+        let json: JsonSchema = serde_json::from_value(value.clone())?;
+        Ok(Schema::try_from(json)?)
+    }
+    /// Schema as clients see it: without the hidden primary key.
+    pub fn user_schema(&self, full: &Schema) -> Schema {
+        Schema::new(
+            full.fields()
+                .iter()
+                .filter(|f| f.name() != HIDDEN_PK)
+                .cloned()
+                .collect::<Vec<_>>(),
+        )
+    }
     fn table_config(&self, root: &str) -> Result<TableConfig, Error> {
+        if self.schema.is_some() {
+            if !self.columns.is_empty() {
+                return Err("definition must use either columns or schema".into());
+            }
+            let schema = self.arrow_schema()?;
+            return Ok(TableConfig::new(
+                &self.name,
+                format!("{}/data/{}", root.trim_end_matches('/'), self.name),
+                Arc::new(schema),
+                self.primary_key.clone(),
+            )?);
+        }
         let mut seen = std::collections::HashSet::new();
         let fields = self
             .columns
@@ -117,6 +225,8 @@ struct Stream {
     storage: LanceStorageOptions,
     durability: LanceDurability,
     table: Mutex<Option<Table>>,
+    /// Monotonic write version reported to LanceDB clients.
+    version: AtomicU64,
 }
 impl Stream {
     async fn table(&self) -> Result<MappedMutexGuard<'_, Table>, Error> {
@@ -155,6 +265,7 @@ pub struct Engine {
     cache: CachedStorage,
     catalog: Arc<ObjectStore>,
     catalog_path: Path,
+    data_path: Path,
     streams: Mutex<BTreeMap<String, Arc<Stream>>>,
     // The catalog is immutable within one deployment authority except for
     // definitions admitted through this Engine. Avoid listing object storage
@@ -205,7 +316,8 @@ impl Engine {
             config,
             cache,
             catalog,
-            catalog_path: prefix.join("streams"),
+            catalog_path: prefix.clone().join("streams"),
+            data_path: prefix.join("data"),
             streams: Mutex::new(BTreeMap::new()),
             catalog_loaded: Mutex::new(false),
             closed: RwLock::new(false),
@@ -236,6 +348,7 @@ impl Engine {
                 durability,
                 storage: self.cache.storage.clone(),
                 table: Mutex::new(None),
+                version: AtomicU64::new(1),
             })
         });
         Ok(stream.clone())
@@ -245,11 +358,7 @@ impl Engine {
             return Ok(stream);
         }
         // Validate before constructing an object key from a request path.
-        if name.is_empty()
-            || !name
-                .bytes()
-                .all(|c| c.is_ascii_alphanumeric() || b"_-".contains(&c))
-        {
+        if !valid_name(name) {
             return Err("invalid stream name".into());
         }
         let path = self.catalog_path.clone().join(format!("{name}.json"));
@@ -265,6 +374,10 @@ impl Engine {
                     return Err(error.into());
                 }
             },
+            Err(object_store::Error::NotFound { .. }) => {
+                catalog_stage_finish("catalog_get", name, get_started, "missing");
+                return Err(Box::new(TableNotFound(name.into())));
+            }
             Err(error) => {
                 catalog_stage_finish("catalog_get", name, get_started, "error");
                 return Err(error.into());
@@ -326,6 +439,16 @@ impl Engine {
         Ok(())
     }
     pub async fn define(&self, definition: StreamDefinition) -> Result<(), Error> {
+        self.define_with(definition, true).await
+    }
+    /// Create a table. An identical existing definition is accepted when
+    /// `exist_ok` is set and rejected with [`TableExists`] otherwise; a
+    /// different existing definition is always rejected.
+    pub async fn define_with(
+        &self,
+        definition: StreamDefinition,
+        exist_ok: bool,
+    ) -> Result<(), Error> {
         definition.table_config(&self.config.root_uri)?;
         let closed = self.closed.read().await;
         if *closed {
@@ -391,7 +514,14 @@ impl Engine {
                 };
                 catalog_stage_finish("catalog_get", &definition.name, get_started, "ok");
                 if existing != definition {
-                    return Err("stream already exists with a different definition".into());
+                    return Err(format!(
+                        "table {} already exists with a different definition",
+                        definition.name
+                    )
+                    .into());
+                }
+                if !exist_ok {
+                    return Err(Box::new(TableExists(definition.name.clone())));
                 }
             }
             Err(error) => {
@@ -452,7 +582,99 @@ impl Engine {
             .build(Cursor::new(ndjson))?
             .collect::<Result<Vec<RecordBatch>, _>>()?;
         stream.table().await?.append(batches).await?;
+        stream.version.fetch_add(1, Ordering::AcqRel);
         Ok(count)
+    }
+    /// Append Arrow batches from a LanceDB client. Returns the new table version.
+    pub async fn append(&self, name: &str, batches: Vec<RecordBatch>) -> Result<u64, Error> {
+        let closed = self.closed.read().await;
+        if *closed {
+            return Err("engine is closed".into());
+        }
+        let stream = self.stream(name).await?;
+        let full = stream.config.schema.clone();
+        let mut prepared = Vec::with_capacity(batches.len());
+        for batch in batches {
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            prepared.push(conform_batch(&stream.definition, &full, batch)?);
+        }
+        if prepared.is_empty() {
+            return Ok(stream.version.load(Ordering::Acquire));
+        }
+        stream.table().await?.append(prepared).await?;
+        Ok(stream.version.fetch_add(1, Ordering::AcqRel) + 1)
+    }
+    pub async fn table_names(&self) -> Result<Vec<String>, Error> {
+        self.refresh_catalog().await?;
+        Ok(self.streams.lock().await.keys().cloned().collect())
+    }
+    /// Current version and client-visible schema.
+    pub async fn describe(&self, name: &str) -> Result<(u64, Schema), Error> {
+        let stream = self.stream(name).await?;
+        Ok((
+            stream.version.load(Ordering::Acquire),
+            stream.definition.user_schema(&stream.config.schema),
+        ))
+    }
+    pub async fn search(
+        &self,
+        name: &str,
+        request: &SearchRequest,
+    ) -> Result<Vec<RecordBatch>, Error> {
+        let closed = self.closed.read().await;
+        if *closed {
+            return Err("engine is closed".into());
+        }
+        let stream = self.stream(name).await?;
+        let snapshot = SnapshotSource::snapshot(stream.as_ref()).await?;
+        let result = snapshot.search(&self.cache.storage, request).await?;
+        Ok(result
+            .iter()
+            .map(strip_hidden_pk)
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+    pub async fn count(&self, name: &str, filter: Option<&str>) -> Result<u64, Error> {
+        let stream = self.stream(name).await?;
+        let snapshot = SnapshotSource::snapshot(stream.as_ref()).await?;
+        Ok(snapshot.count(&self.cache.storage, filter).await?)
+    }
+    /// Remove the catalog entry and every object under the table's data prefix.
+    pub async fn drop_table(&self, name: &str) -> Result<(), Error> {
+        let stream = self.stream(name).await?;
+        if let Some(mut table) = stream.table.lock().await.take() {
+            let _ = table.checkpoint().await;
+            let _ = table.close().await;
+        }
+        self.streams.lock().await.remove(name);
+        let path = self.catalog_path.clone().join(format!("{name}.json"));
+        match self.catalog.inner.delete(&path).await {
+            Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
+            Err(error) => return Err(error.into()),
+        }
+        let prefix = self.data_path.clone().join(name);
+        let objects: Vec<_> = self.catalog.inner.list(Some(&prefix)).try_collect().await?;
+        for object in objects {
+            match self.catalog.inner.delete(&object.location).await {
+                Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
+    }
+    pub async fn create_vector_index(
+        &self,
+        name: &str,
+        request: &VectorIndexRequest,
+    ) -> Result<String, Error> {
+        let stream = self.stream(name).await?;
+        let mut table = stream.table().await?;
+        Ok(table.create_vector_index(request).await?)
+    }
+    pub async fn list_indices(&self, name: &str) -> Result<Vec<IndexInfo>, Error> {
+        let stream = self.stream(name).await?;
+        Ok(stream.table().await?.list_indices().await?)
     }
     async fn query_loaded(&self, sql: &str) -> Result<Vec<u8>, Error> {
         let tables: Vec<_> = self
@@ -503,6 +725,71 @@ impl Engine {
         }))
         .await;
     }
+}
+/// Reorder and validate a client batch against the table schema, adding the
+/// hidden content-hash key when the table has one.
+fn conform_batch(
+    definition: &StreamDefinition,
+    full: &Arc<Schema>,
+    batch: RecordBatch,
+) -> Result<RecordBatch, Error> {
+    let mut columns = Vec::with_capacity(full.fields().len());
+    for field in full.fields() {
+        if field.name() == HIDDEN_PK {
+            continue;
+        }
+        let index = batch
+            .schema()
+            .index_of(field.name())
+            .map_err(|_| format!("missing column {}", field.name()))?;
+        let column = batch.column(index).clone();
+        if column.data_type() != field.data_type() {
+            return Err(format!(
+                "column {} has type {} but the table expects {}",
+                field.name(),
+                column.data_type(),
+                field.data_type()
+            )
+            .into());
+        }
+        if !field.is_nullable() && column.null_count() > 0 {
+            return Err(format!("column {} must not contain nulls", field.name()).into());
+        }
+        columns.push(column);
+    }
+    if batch.num_columns() != columns.len() {
+        return Err("batch contains columns that are not in the table".into());
+    }
+    if definition.hidden_pk() {
+        columns.push(Arc::new(content_hash(&columns)?));
+    }
+    Ok(RecordBatch::try_new(full.clone(), columns)?)
+}
+/// xxh3 of each row's Arrow row-format encoding across all user columns.
+fn content_hash(columns: &[Arc<dyn Array>]) -> Result<UInt64Array, Error> {
+    let fields: Vec<_> = columns
+        .iter()
+        .map(|c| arrow_row::SortField::new(c.data_type().clone()))
+        .collect();
+    if !arrow_row::RowConverter::supports_fields(&fields) {
+        return Err("a column type cannot be hashed for the hidden primary key".into());
+    }
+    let converter = arrow_row::RowConverter::new(fields)?;
+    let rows = converter.convert_columns(columns)?;
+    Ok(UInt64Array::from_iter_values(
+        rows.iter()
+            .map(|row| xxhash_rust::xxh3::xxh3_64(row.as_ref())),
+    ))
+}
+fn strip_hidden_pk(batch: &RecordBatch) -> Result<RecordBatch, Error> {
+    let schema = batch.schema();
+    let keep: Vec<usize> = (0..schema.fields().len())
+        .filter(|&i| schema.field(i).name() != HIDDEN_PK)
+        .collect();
+    if keep.len() == schema.fields().len() {
+        return Ok(batch.clone());
+    }
+    Ok(batch.project(&keep)?)
 }
 struct BoundedOutput(Vec<u8>);
 impl std::io::Write for BoundedOutput {
