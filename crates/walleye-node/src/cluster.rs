@@ -54,11 +54,19 @@ impl Cluster {
             node_id,
             ring,
             token,
-            client: reqwest::Client::builder()
-                .connect_timeout(std::time::Duration::from_secs(2))
-                .timeout(std::time::Duration::from_secs(120))
-                .build()?,
+            client: Self::client()?,
         })
+    }
+    /// Pooled connections are dropped after a few seconds idle, so a peer that
+    /// restarted (new Machine version, new address) stops poisoning forwards
+    /// quickly; a transport failure on a pooled connection also retries once
+    /// on a fresh one.
+    fn client() -> Result<reqwest::Client, reqwest::Error> {
+        reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(2))
+            .timeout(std::time::Duration::from_secs(120))
+            .pool_idle_timeout(std::time::Duration::from_secs(5))
+            .build()
     }
     /// The member that owns `stream`, or `None` when this node does.
     pub fn owner(&self, stream: &str) -> Option<Node> {
@@ -97,17 +105,28 @@ impl Cluster {
         body: Bytes,
     ) -> Response {
         let url = format!("{}{}", owner.endpoint.trim_end_matches('/'), path_and_query);
-        let mut request = self
-            .client
-            .request(method, url)
-            .bearer_auth(&self.token)
-            .header(MEMBERS_HEADER, self.fingerprint())
-            .header(FORWARDED_HEADER, "1")
-            .body(body);
-        if let Some(content_type) = content_type {
-            request = request.header("content-type", content_type);
+        let build = |client: &reqwest::Client| {
+            let mut request = client
+                .request(method.clone(), &url)
+                .bearer_auth(&self.token)
+                .header(MEMBERS_HEADER, self.fingerprint())
+                .header(FORWARDED_HEADER, "1")
+                .body(body.clone());
+            if let Some(content_type) = content_type {
+                request = request.header("content-type", content_type);
+            }
+            request
+        };
+        let mut outcome = build(&self.client).send().await;
+        if let Err(error) = &outcome
+            && (error.is_connect() || (error.is_request() && !error.is_timeout()))
+            && let Ok(fresh) = Self::client()
+        {
+            // The pooled connection may belong to a peer that restarted; a
+            // fresh connection settles whether the owner is really unreachable.
+            outcome = build(&fresh).send().await;
         }
-        match request.send().await {
+        match outcome {
             Ok(response) => {
                 let status = StatusCode::from_u16(response.status().as_u16())
                     .unwrap_or(StatusCode::BAD_GATEWAY);
