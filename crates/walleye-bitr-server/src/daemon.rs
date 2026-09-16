@@ -74,6 +74,10 @@ async fn run_combined(root_key: &str) -> Result<(), Box<dyn std::error::Error>> 
     // conditional writes are checked. The operator may select online
     // scaling only after this process has verified the actual archive
     // backend, and after every active node advertises the new protocol.
+    // A fresh volume must learn the archived prefixes before it serves, or
+    // the first append after a cold start fails for want of a predecessor.
+    let seeded = gateway.seed_from_archive(&node).await?;
+    eprintln!("lakeday.replica boot stage=seed_from_archive streams={seeded}");
     let probe_archive = Arc::clone(&archive);
     let probe_gateway = Arc::clone(&gateway);
     tokio::spawn(async move {

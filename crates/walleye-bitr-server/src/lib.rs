@@ -6359,6 +6359,47 @@ impl ReplicaGateway {
     /// bytes come from the gateway's conservative hot-tail recovery across
     /// the owning cohort, so one partial member can never advance S3.
     pub async fn archive_local_commits(&self, node: &DiskReplica) -> Result<usize, ReplicaError> {
+        self.archive_local_commits_inner(node).await
+    }
+
+    /// Record every archived stream prefix as a durable trim fence on a
+    /// member that has no local history for it. A member booting on an empty
+    /// volume otherwise refuses the writer's next append at
+    /// `archived_lsn + 1` for want of a predecessor, even though the archive
+    /// on object storage is that predecessor. Also carries the archived
+    /// writer epoch forward so a stale writer stays fenced across the restart.
+    /// Returns the number of streams seeded.
+    pub async fn seed_from_archive(&self, node: &DiskReplica) -> Result<usize, ReplicaError> {
+        let snapshot = node.snapshot();
+        let known = snapshot
+            .trimmed
+            .iter()
+            .map(|prefix| prefix.stream.clone())
+            .chain(
+                snapshot
+                    .records
+                    .iter()
+                    .chain(snapshot.committed.iter())
+                    .map(|record| record.stream().to_owned()),
+            )
+            .collect::<BTreeSet<_>>();
+        let prefixes = self
+            .archive
+            .stream_heads()
+            .await
+            .map_err(|error| ReplicaError::NodeStorage(error.to_string()))?
+            .into_iter()
+            .filter(|(stream, _, _)| !known.contains(stream))
+            .collect::<Vec<_>>();
+        if prefixes.is_empty() {
+            return Ok(0);
+        }
+        let count = prefixes.len();
+        node.compact_archived_batch(&prefixes)?;
+        Ok(count)
+    }
+
+    async fn archive_local_commits_inner(&self, node: &DiskReplica) -> Result<usize, ReplicaError> {
         let snapshot = node.snapshot();
         let trimmed = snapshot
             .trimmed
