@@ -61,6 +61,12 @@ fn bad(message: impl Into<String>) -> Response {
 fn engine<'a>(s: &'a Service, h: &HeaderMap) -> Result<&'a engine::Engine, Response> {
     api(s, h).map_err(|(status, body)| (status, body).into_response())
 }
+/// The engine for a durable write; 503 with `Retry-After` while this node's
+/// replica quorum is unreachable.
+fn writable_engine<'a>(s: &'a Service, h: &HeaderMap) -> Result<&'a engine::Engine, Response> {
+    crate::writable(s, h)
+        .map_err(|(status, body)| (status, [("retry-after", "1")], body).into_response())
+}
 /// An inbound Arrow body is held raw and decoded at once; reserve both before
 /// decoding so an oversize insert is refused instead of exceeding the budget.
 fn body_lease(
@@ -135,7 +141,7 @@ async fn create(
     Query(mode): Query<Mode>,
     body: Bytes,
 ) -> Reply {
-    let engine = engine(&s, &h)?;
+    let engine = writable_engine(&s, &h)?;
     let _lease = body_lease(engine, &body)?;
     let (schema, batches) = read_ipc(&body)?;
     let definition =
@@ -178,7 +184,7 @@ async fn describe(State(s): State<Arc<Service>>, Path(name): Path<String>, h: He
 }
 
 async fn drop(State(s): State<Arc<Service>>, Path(name): Path<String>, h: HeaderMap) -> Reply {
-    let engine = engine(&s, &h)?;
+    let engine = writable_engine(&s, &h)?;
     let mut revision = s.revision.lock().await;
     *revision = format!("\"{}\"", uuid::Uuid::new_v4());
     engine
@@ -195,7 +201,7 @@ async fn insert(
     Query(mode): Query<Mode>,
     body: Bytes,
 ) -> Reply {
-    let engine = engine(&s, &h)?;
+    let engine = writable_engine(&s, &h)?;
     if mode.mode.as_deref() == Some("overwrite") {
         return Err(bad(
             "insert mode=overwrite is not supported; drop and recreate the table",
@@ -414,7 +420,7 @@ async fn create_index(
     h: HeaderMap,
     Json(body): Json<CreateIndex>,
 ) -> Reply {
-    let engine = engine(&s, &h)?;
+    let engine = writable_engine(&s, &h)?;
     let kind = body
         .index_type
         .unwrap_or_else(|| "IVF_PQ".into())
@@ -473,7 +479,7 @@ async fn compact_lsm(
     Path(name): Path<String>,
     h: HeaderMap,
 ) -> Reply {
-    let engine = engine(&s, &h)?;
+    let engine = writable_engine(&s, &h)?;
     let result = engine.compact(&name).await.map_err(|e| error(e.as_ref()))?;
     Ok(Json(match result {
         Some(r) => serde_json::json!({"merged": r.merged.len(), "rows": r.rows, "generation": r.output.generation}),
@@ -483,7 +489,7 @@ async fn compact_lsm(
 }
 
 async fn flush_lsm(State(s): State<Arc<Service>>, Path(name): Path<String>, h: HeaderMap) -> Reply {
-    let engine = engine(&s, &h)?;
+    let engine = writable_engine(&s, &h)?;
     engine.flush(&name).await.map_err(|e| error(e.as_ref()))?;
     Ok(Json(serde_json::json!({})).into_response())
 }

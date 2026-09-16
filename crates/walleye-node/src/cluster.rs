@@ -20,6 +20,10 @@ pub const MEMBERS_HEADER: &str = "x-walleye-members";
 pub const FORWARDED_HEADER: &str = "x-walleye-forwarded";
 /// Which member answered, for observability and tests.
 pub const OWNER_HEADER: &str = "x-walleye-owner";
+/// How long a forward waits out an owner that is starting up before it
+/// answers 502. Nodes converge on the same quorum, so the skew between a
+/// ready forwarder and its owner is seconds.
+pub const FORWARD_RETRY_WINDOW: std::time::Duration = std::time::Duration::from_secs(15);
 
 #[derive(Debug)]
 pub struct NotOwner(pub Node);
@@ -117,15 +121,39 @@ impl Cluster {
             }
             request
         };
-        let mut outcome = build(&self.client).send().await;
-        if let Err(error) = &outcome
-            && (error.is_connect() || (error.is_request() && !error.is_timeout()))
-            && let Ok(fresh) = Self::client()
-        {
-            // The pooled connection may belong to a peer that restarted; a
-            // fresh connection settles whether the owner is really unreachable.
-            outcome = build(&fresh).send().await;
-        }
+        // A peer that is still starting refuses with 503, and one that just
+        // restarted fails to connect. Both are safe to retry: a connect error
+        // means the request never arrived, and a 503 is an explicit refusal
+        // with no side effect. Wait out a peer's startup window instead of
+        // turning it into a bare 502.
+        let deadline = std::time::Instant::now() + FORWARD_RETRY_WINDOW;
+        let mut delay = std::time::Duration::from_millis(100);
+        let mut client = self.client.clone();
+        let mut attempts = 0_u32;
+        let outcome = loop {
+            attempts += 1;
+            let outcome = build(&client).send().await;
+            let retryable = match &outcome {
+                Err(error) => error.is_connect() || (error.is_request() && !error.is_timeout()),
+                Ok(response) => response.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            };
+            if !retryable || std::time::Instant::now() >= deadline {
+                if attempts > 1 {
+                    eprintln!(
+                        "walleye.forward owner={} attempts={attempts} settled",
+                        owner.id
+                    );
+                }
+                break outcome;
+            }
+            // A pooled connection may belong to the peer's previous
+            // incarnation; take a fresh one for the retry.
+            if let Ok(fresh) = Self::client() {
+                client = fresh;
+            }
+            tokio::time::sleep(delay).await;
+            delay = (delay * 2).min(std::time::Duration::from_secs(1));
+        };
         match outcome {
             Ok(response) => {
                 let status = StatusCode::from_u16(response.status().as_u16())

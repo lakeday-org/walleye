@@ -197,7 +197,26 @@ pub struct Service {
     pub(crate) revision: tokio::sync::Mutex<String>,
     pub(crate) changed: tokio::sync::Notify,
     quiescing: AtomicBool,
+    /// Writes can be made durable right now: the engine has warmed and, with
+    /// Bitr, the local replica quorum is reachable.
+    write_ready: AtomicBool,
+    /// This node has been write-ready at least once. Sticky, so a quorum lost
+    /// later does not pull a node that still serves reads out of rotation.
+    served: AtomicBool,
 }
+
+/// The local Bitr gateway reports a reachable quorum. `/readyz` there fails
+/// while the daemon is initializing, fenced for maintenance, or short of
+/// `quorum` healthy members.
+async fn quorum_ready(client: &reqwest::Client, gateway: &str) -> bool {
+    client
+        .get(format!("{}/readyz", gateway.trim_end_matches('/')))
+        .timeout(std::time::Duration::from_secs(2))
+        .send()
+        .await
+        .is_ok_and(|r| r.status().is_success())
+}
+
 impl Service {
     pub async fn open(config: Config) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
         let ring = Arc::new(Membership::new(config.members.clone())?);
@@ -214,6 +233,10 @@ impl Service {
         // cache takes what is left after the fixed floors; everything else
         // that allocates (memtables, request bodies, index builds, queries,
         // the Bitr log) borrows from the cache through the governor.
+        let bitr_gateway = config
+            .api
+            .as_ref()
+            .is_some_and(|api| api.bitr_url.is_some());
         let budget = Budget::for_config(&config);
         let log_max = std::env::var("LAKEDAY_REPLICA_LOG_MAX_BYTES")
             .ok()
@@ -274,6 +297,10 @@ impl Service {
             revision: tokio::sync::Mutex::new(format!("\"{}\"", uuid::Uuid::new_v4())),
             changed: tokio::sync::Notify::new(),
             quiescing: AtomicBool::new(false),
+            // Without Bitr there is no quorum to wait for: durability is the
+            // object store, which the engine already opened.
+            write_ready: AtomicBool::new(!bitr_gateway),
+            served: AtomicBool::new(!bitr_gateway),
         });
         if let Some(engine) = &service.engine
             && service.config.bitr
@@ -302,25 +329,32 @@ impl Service {
         // the first request does not pay for it.
         let warming = service.clone();
         tokio::spawn(async move {
-            // In Bitr mode the embedded daemon seeds archived stream prefixes
-            // before its gateway answers health. Opening tables before that
-            // would fence at the archived tail and fail, so wait for it.
-            if let Some(gateway) = warming
+            let gateway = warming
                 .config
                 .api
                 .as_ref()
-                .and_then(|api| api.bitr_url.clone())
-            {
+                .and_then(|api| api.bitr_url.clone());
+            if let Some(gateway) = &gateway {
+                // The embedded daemon seeds archived prefixes and reaches its
+                // replica quorum before it reports ready. A writer opened
+                // before then fails recovery ("replica quorum unavailable"),
+                // so wait rather than open a table that cannot be durable.
                 let client = reqwest::Client::new();
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+                let started = std::time::Instant::now();
+                let deadline = started + std::time::Duration::from_secs(300);
                 loop {
-                    let healthy = client
-                        .get(format!("{}/healthz", gateway.trim_end_matches('/')))
-                        .timeout(std::time::Duration::from_secs(2))
-                        .send()
-                        .await
-                        .is_ok_and(|r| r.status().is_success());
-                    if healthy || std::time::Instant::now() > deadline {
+                    if quorum_ready(&client, gateway).await {
+                        eprintln!(
+                            "walleye.ready stage=quorum outcome=ready elapsed_ms={}",
+                            started.elapsed().as_millis()
+                        );
+                        break;
+                    }
+                    if std::time::Instant::now() > deadline {
+                        eprintln!(
+                            "walleye.ready stage=quorum outcome=timeout elapsed_ms={}",
+                            started.elapsed().as_millis()
+                        );
                         break;
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
@@ -328,6 +362,21 @@ impl Service {
             }
             if let Some(engine) = &warming.engine {
                 engine.warm().await;
+            }
+            warming.write_ready.store(true, Ordering::Release);
+            warming.served.store(true, Ordering::Release);
+            // Keep write readiness current: a quorum lost later stops this
+            // node from accepting writes it could not make durable, while
+            // reads and `/healthz` continue.
+            if let Some(gateway) = gateway {
+                let client = reqwest::Client::new();
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    let ready = quorum_ready(&client, &gateway).await;
+                    if warming.write_ready.swap(ready, Ordering::AcqRel) != ready {
+                        eprintln!("walleye.ready stage=quorum write_ready={ready}");
+                    }
+                }
             }
         });
         Ok(service)
@@ -354,7 +403,8 @@ impl Service {
 }
 pub fn router(service: Arc<Service>) -> Router {
     Router::new()
-        .route("/healthz", get(|| async { "ok" }))
+        .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
         .route("/internal/cache/{key}", get(read).put(write))
         .route("/internal/cache/stats", get(stats))
         .route("/internal/cache/flush", post(flush))
@@ -391,6 +441,35 @@ pub(crate) fn authorize(s: &Service, headers: &HeaderMap) -> Result<(), StatusCo
         return Err(StatusCode::UNAUTHORIZED);
     }
     Ok(())
+}
+/// Liveness plus first-boot readiness. A node that has never been write-ready
+/// reports unavailable so a load balancer does not route to it before its
+/// quorum converges; once it has served, it stays healthy even if the quorum
+/// is later lost, because reads remain correct without one. `/readyz` is the
+/// strict current-write-readiness probe.
+async fn healthz(State(s): State<Arc<Service>>) -> Response {
+    if s.served.load(Ordering::Acquire) {
+        (StatusCode::OK, "ok").into_response()
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [("retry-after", "1")],
+            "starting: waiting for the replica quorum",
+        )
+            .into_response()
+    }
+}
+async fn readyz(State(s): State<Arc<Service>>) -> Response {
+    if s.write_ready.load(Ordering::Acquire) {
+        (StatusCode::OK, "ready").into_response()
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [("retry-after", "1")],
+            "not write-ready: the replica quorum is unreachable",
+        )
+            .into_response()
+    }
 }
 fn key(value: &str) -> Result<InternalCacheKey, StatusCode> {
     Ok(InternalCacheKey::from_bytes(
@@ -465,6 +544,20 @@ fn failure(e: impl std::fmt::Display) -> ApiError {
         Json(serde_json::json!({"error":e.to_string()})),
     )
 }
+/// The engine, for a request that must make a durable write. A node whose
+/// quorum is unreachable declines with 503 and a `Retry-After` instead of
+/// opening a writer that would fail recovery; the caller (or the forwarding
+/// peer) retries.
+pub(crate) fn writable<'a>(s: &'a Service, h: &HeaderMap) -> Result<&'a engine::Engine, ApiError> {
+    let engine = api(s, h)?;
+    if !s.write_ready.load(Ordering::Acquire) {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error":"the replica quorum is unreachable; retry"})),
+        ));
+    }
+    Ok(engine)
+}
 pub(crate) fn api<'a>(s: &'a Service, h: &HeaderMap) -> Result<&'a engine::Engine, ApiError> {
     authorize(s, h).map_err(|code| (code, Json(serde_json::json!({"error":"unauthorized"}))))?;
     s.engine.as_ref().ok_or((
@@ -478,7 +571,7 @@ async fn define(
     Json(def): Json<StreamDefinition>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let name = def.name.clone();
-    let engine = api(&s, &h)?;
+    let engine = writable(&s, &h)?;
     let mut revision = s.revision.lock().await;
     *revision = format!("\"{}\"", uuid::Uuid::new_v4());
     engine.define(def).await.map_err(failure)?;
@@ -495,7 +588,7 @@ async fn ingest(
     h: HeaderMap,
     Json(input): Json<Ingest>,
 ) -> Result<Response, ApiError> {
-    let engine = api(&s, &h)?;
+    let engine = writable(&s, &h)?;
     let mut revision = s.revision.lock().await;
     if let Some(expected) = h.get("if-match") {
         if expected.to_str().ok() != Some(revision.as_str()) {

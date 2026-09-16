@@ -147,6 +147,17 @@ of the topology and never see a 503. Reads go through the owner too, so they
 always include the memtable. SQL that spans tables with different owners is
 refused with a 400 rather than answered from a partial view.
 
+**Readiness.** `/healthz` reports unavailable until a node can make writes
+durable: with Bitr that means its replica quorum is reachable and its owned
+streams have opened. Point a load balancer's health check at it and traffic
+never reaches a node that would refuse writes. Once a node has served, it
+stays healthy even if the quorum is later lost, because reads remain correct
+without one. `/readyz` is the strict probe: it reports write-readiness right
+now. A write that arrives while the quorum is unreachable answers 503 with
+`Retry-After` rather than failing deep in recovery, and a forward to a peer
+that is still starting is retried for up to fifteen seconds before the caller
+sees an error.
+
 **Fencing.** A new owner claims the next MemWAL writer epoch through a
 manifest CAS; the previous owner's WAL appends and manifest commits fail from
 that point. In Bitr mode the Bitr writer epoch is minted from the same claim,
