@@ -1342,10 +1342,8 @@ impl MemTableFlusher {
             rows
         );
         let uri = self.path_to_uri(&gen_path);
-        let reader = RecordBatchIterator::new(
-            out.clone().into_iter().map(Ok),
-            storage_schema.clone(),
-        );
+        let reader =
+            RecordBatchIterator::new(out.clone().into_iter().map(Ok), storage_schema.clone());
         let write_params = WriteParams {
             max_rows_per_file: usize::MAX,
             data_storage_version: Some(self.base_storage_version().await?.to_selector()),
@@ -1468,11 +1466,9 @@ impl MemTableFlusher {
     pub(crate) async fn delete_generations(&self, sstables: &[SsTable]) -> Result<()> {
         use futures::TryStreamExt;
         for sstable in sstables {
-            let prefix = crate::dataset::mem_wal::util::shard_base_path(
-                &self.base_path,
-                &self.shard_id,
-            )
-            .join(sstable.path.as_str());
+            let prefix =
+                crate::dataset::mem_wal::util::shard_base_path(&self.base_path, &self.shard_id)
+                    .join(sstable.path.as_str());
             let objects: Vec<_> = self
                 .object_store
                 .inner
