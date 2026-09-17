@@ -10,9 +10,16 @@ use crate::{DiskReplica, OpaqueArchive, ReplicaGateway, gateway_router, node_rou
 use object_store::aws::{AmazonS3Builder, S3ConditionalPut};
 use tokio::net::TcpListener;
 
-/// Runs one combined storage, gateway, and opaque-archive replica process.
+/// Runs one combined storage, gateway, and opaque-archive replica process,
+/// taking its mode from this process's own command line.
 pub async fn run_from_env() -> Result<(), Box<dyn std::error::Error>> {
-    let arguments: Vec<String> = Vec::new();
+    run_with_arguments(env::args().skip(1).collect()).await
+}
+
+/// Runs one combined replica under an explicit argument list. A host binary
+/// that owns its own command line passes an empty list; reading argv here
+/// would make it inherit flags meant for the host.
+pub async fn run_with_arguments(arguments: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     if arguments == ["--verify-control-head-cas"] {
         let archive = build_archive()?;
         let result = cas_probe::verify(archive.object_store(), archive.prefix())

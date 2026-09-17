@@ -36,7 +36,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .into_future();
     let bitr = async {
         if service.config.bitr {
-            walleye_bitr_server::daemon::run_from_env().await
+            walleye_bitr_server::daemon::run_with_arguments(Vec::new()).await
         } else {
             std::future::pending::<Result<(), Box<dyn std::error::Error>>>().await
         }

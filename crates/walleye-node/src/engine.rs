@@ -10,7 +10,7 @@ use object_store::ObjectStoreExt;
 use object_store::{PutMode, PutOptions, path::Path};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     io::Cursor,
     sync::{
         Arc,
@@ -341,6 +341,11 @@ impl Stream {
                 self.definition.name
             );
         }
+        // Release the budget the dead writer held. Reopening reserves before
+        // it replaces the lease, so keeping this one would make the stream
+        // pay for itself twice and, once that reservation fails, strand the
+        // lease for good: the idle sweeper skips a stream with no table.
+        *self.lease.lock().await = None;
         eprintln!(
             "walleye.storage writer_fenced stream={} reason={reason} outcome=discarded",
             self.definition.name
@@ -444,6 +449,13 @@ pub struct Engine {
     catalog_path: Path,
     data_path: Path,
     streams: Mutex<BTreeMap<String, Arc<Stream>>>,
+    // Names whose drop is still in flight. A catalog load that read the
+    // definition object before `drop_table` deleted it would otherwise
+    // register a stream that outlives the drop, and `register` only inserts
+    // when the entry is absent, so that stale handle would go on to win
+    // against the definition a later create publishes. Locked after
+    // `streams`, never before it.
+    dropping: Mutex<BTreeSet<String>>,
     // The catalog is immutable within one deployment authority except for
     // definitions admitted through this Engine. Avoid listing object storage
     // for every SQL request, while still allowing the query path to refresh
@@ -498,6 +510,7 @@ impl Engine {
             catalog_path: prefix.clone().join("streams"),
             data_path: prefix.join("data"),
             streams: Mutex::new(BTreeMap::new()),
+            dropping: Mutex::new(BTreeSet::new()),
             catalog_loaded: Mutex::new(false),
             closed: RwLock::new(false),
             writer,
@@ -509,6 +522,11 @@ impl Engine {
     async fn register(&self, definition: StreamDefinition) -> Result<Arc<Stream>, Error> {
         let config = definition.table_config(&self.config.root_uri)?;
         let mut streams = self.streams.lock().await;
+        // A drop in flight owns this name until it finishes. Reinstating it
+        // here would resurrect the stream the drop is removing.
+        if self.dropping.lock().await.contains(&definition.name) {
+            return Err(Box::new(TableNotFound(definition.name)));
+        }
         let stream = streams.entry(definition.name.clone()).or_insert_with(|| {
             Arc::new(Stream {
                 definition,
@@ -636,7 +654,14 @@ impl Engine {
                 .filename()
                 .and_then(|s| s.strip_suffix(".json"))
             {
-                self.definition(name).await?;
+                match self.definition(name).await {
+                    Ok(_) => {}
+                    // The listing is a snapshot. A table dropped before this
+                    // fetch reached it must not fail the load for every
+                    // other table in the catalog.
+                    Err(error) if error.downcast_ref::<TableNotFound>().is_some() => {}
+                    Err(error) => return Err(error),
+                }
             }
         }
         Ok(())
@@ -858,7 +883,7 @@ impl Engine {
         let stream = stream.clone();
         let query_timeout = self.cache.storage.query_timeout();
         tokio::spawn(async move {
-            let outcome = compact_stream(&stream, COMPACT_MIN_SSTABLES, query_timeout).await;
+            let outcome = compact_stream(&stream, COMPACT_MIN_SSTABLES, query_timeout, false).await;
             *stream.last_compaction.lock().await = Some(Instant::now());
             stream.compacting.store(false, Ordering::Release);
             if let Err(error) = outcome {
@@ -919,7 +944,7 @@ impl Engine {
     /// Merge flushed generations now. Returns what was merged, if anything.
     pub async fn compact(&self, name: &str) -> Result<Option<CompactionResult>, Error> {
         let stream = self.stream(name).await?;
-        compact_stream(&stream, 2, self.cache.storage.query_timeout()).await
+        compact_stream(&stream, 2, self.cache.storage.query_timeout(), false).await
     }
     /// Flush the memtable into a new generation.
     pub async fn flush(&self, name: &str) -> Result<(), Error> {
@@ -1032,7 +1057,22 @@ impl Engine {
             let _ = table.checkpoint().await;
             let _ = table.close().await;
         }
-        self.streams.lock().await.remove(name);
+        // Claim the name before releasing the map, and hold the claim across
+        // both deletes. A concurrent catalog load that already read the
+        // definition object is either wiped by this removal or refused by
+        // `register`; without the claim it could land in between and leave a
+        // stale stream that no later create can displace.
+        {
+            let mut streams = self.streams.lock().await;
+            self.dropping.lock().await.insert(name.to_owned());
+            streams.remove(name);
+        }
+        let dropped = self.drop_objects(name).await;
+        self.dropping.lock().await.remove(name);
+        dropped
+    }
+    /// Delete the catalog entry and every data object for a claimed name.
+    async fn drop_objects(&self, name: &str) -> Result<(), Error> {
         let path = self.catalog_path.clone().join(format!("{name}.json"));
         match self.catalog.inner.delete(&path).await {
             Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
@@ -1071,29 +1111,34 @@ impl Engine {
             .sort_by(|a, b| a.column.cmp(&b.column));
         // Validate against the schema before touching the catalog.
         definition.table_config(&self.config.root_uri)?;
-        if definition.vector_indexes == stream.definition.vector_indexes {
-            return Ok(());
-        }
-        let path = self.catalog_path.clone().join(format!("{name}.json"));
-        let bytes = serde_json::to_vec(&definition)?;
-        let put_started = catalog_stage_start("catalog_put", name);
-        match self.catalog.inner.put(&path, bytes.into()).await {
-            Ok(_) => catalog_stage_finish("catalog_put", name, put_started, "updated"),
-            Err(error) => {
-                catalog_stage_finish("catalog_put", name, put_started, "error");
-                return Err(error.into());
+        // A definition that already matches proves the catalog was updated,
+        // not that the generations were rewritten: the catalog is written
+        // first, so a retry after a failed rewrite lands here. Skip the
+        // catalog write, never the rewrite.
+        let stream = if definition.vector_indexes == stream.definition.vector_indexes {
+            stream
+        } else {
+            let path = self.catalog_path.clone().join(format!("{name}.json"));
+            let bytes = serde_json::to_vec(&definition)?;
+            let put_started = catalog_stage_start("catalog_put", name);
+            match self.catalog.inner.put(&path, bytes.into()).await {
+                Ok(_) => catalog_stage_finish("catalog_put", name, put_started, "updated"),
+                Err(error) => {
+                    catalog_stage_finish("catalog_put", name, put_started, "error");
+                    return Err(error.into());
+                }
             }
-        }
-        if let Some(mut table) = stream.table.lock().await.take() {
-            let _ = table.checkpoint().await;
-            table.close().await?;
-        }
-        self.streams.lock().await.remove(name);
-        let stream = self.register(definition).await?;
+            if let Some(mut table) = stream.table.lock().await.take() {
+                let _ = table.checkpoint().await;
+                table.close().await?;
+            }
+            self.streams.lock().await.remove(name);
+            self.register(definition).await?
+        };
         drop(stream.table().await?);
         // Rewrite every flushed generation with the new index before
         // returning, so no query sees an index built with the old metric.
-        compact_stream(&stream, 1, self.cache.storage.query_timeout()).await?;
+        compact_stream(&stream, 1, self.cache.storage.query_timeout(), true).await?;
         Ok(())
     }
     pub async fn vector_indexes(&self, name: &str) -> Result<Vec<VectorIndexSpec>, Error> {
@@ -1217,10 +1262,15 @@ impl Engine {
 }
 /// Merge generations without holding the table lock, then delete the replaced
 /// directories once every snapshot taken before the swap has timed out.
+/// `required` decides what a budget that cannot afford the merge means. A
+/// background sweep defers and tries again later; a caller that is rewriting
+/// generations to match a new index must fail instead, because returning
+/// success would leave queries on the old index.
 async fn compact_stream(
     stream: &Arc<Stream>,
     min_sstables: usize,
     query_timeout: std::time::Duration,
+    required: bool,
 ) -> Result<Option<CompactionResult>, Error> {
     let (compactor, stats) = {
         let table = stream.table().await?;
@@ -1249,6 +1299,9 @@ async fn compact_stream(
     ) {
         Ok(lease) => lease,
         Err(error) => {
+            if required {
+                return Err(Box::new(error));
+            }
             eprintln!(
                 "walleye.storage compaction stream={} outcome=deferred error={error}",
                 stream.definition.name

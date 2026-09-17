@@ -11856,13 +11856,12 @@ impl ReplicaGateway {
             // Every member has already proven the archive holds the prefix
             // below its trim checkpoint, so the merge starts there: the
             // watermark never regresses below what the cohort has trimmed.
-            let (floor, floor_epoch) = rebuilt.streams.get(stream).map_or((0, 0), |state| {
-                let trimmed = state
+            let floor = rebuilt.streams.get(stream).map_or(0, |state| {
+                state
                     .records
                     .keys()
                     .next()
-                    .map_or(state.committed_lsn, |first| first.saturating_sub(1));
-                (trimmed, state.writer_epoch)
+                    .map_or(state.committed_lsn, |first| first.saturating_sub(1))
             });
             let archived = self
                 .archive
@@ -11885,7 +11884,13 @@ impl ReplicaGateway {
                 stream_state.committed_lsn = floor;
                 stream_state.records.clear();
                 let mut expected_lsn = floor.saturating_add(1);
-                let mut prefix_epoch = floor_epoch;
+                // Seed below every epoch, as the rebuild from hot snapshots
+                // does. The stream's writer epoch is the highest any member
+                // reported, not the epoch in force at the floor, so seeding
+                // with it would reject the first archived record written
+                // before the last failover and abandon the prefix this
+                // merge has already cleared.
+                let mut prefix_epoch = 0;
                 for record in records {
                     if record.lsn() != expected_lsn
                         || record.committed_lsn() != expected_lsn.saturating_sub(1)
