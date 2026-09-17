@@ -360,6 +360,7 @@ impl Service {
         // readiness is established and then kept current.
         service.clone().spawn_disk_sampler();
         service.clone().spawn_idle_sweeper();
+        service.clone().spawn_view_driver();
         service.clone().spawn_readiness();
         Ok(service)
     }
@@ -401,6 +402,55 @@ impl Service {
                 tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                 if let Some(engine) = &self.engine {
                     engine.close_idle(IDLE_TABLE_TIMEOUT).await;
+                }
+            }
+        });
+    }
+
+    /// Keep every view this node owns caught up, without anybody asking.
+    ///
+    /// The loop advances views until a whole pass moves nothing, then waits
+    /// to be woken by an append or by a slow tick. A pipeline is therefore
+    /// idle when its sources are idle: there is no timer ticking over an
+    /// empty stream, and no refresh anyone has to remember to call.
+    fn spawn_view_driver(self: Arc<Self>) {
+        tokio::spawn(async move {
+            // A first pass on boot catches up anything that arrived while the
+            // node was down.
+            let idle = std::time::Duration::from_secs(
+                std::env::var("WALLEYE_VIEW_IDLE_SECONDS")
+                    .ok()
+                    .and_then(|value| value.parse().ok())
+                    .filter(|value| *value > 0)
+                    .unwrap_or(30),
+            );
+            loop {
+                if self.quiescing.load(Ordering::Acquire) {
+                    return;
+                }
+                if let Some(engine) = &self.engine {
+                    for (name, outcome) in engine.advance_views(64).await {
+                        match outcome {
+                            Ok(progress) if progress.rows > 0 => eprintln!(
+                                "walleye.view view={name} rows={} written={} delivered={} \
+                                 through={}",
+                                progress.rows,
+                                progress.written,
+                                progress.delivered,
+                                progress.through
+                            ),
+                            Ok(_) => {}
+                            Err(error) => {
+                                eprintln!("walleye.view view={name} outcome=error error={error}")
+                            }
+                        }
+                    }
+                }
+                // Woken by a write, or by the tick that covers a write this
+                // node did not see.
+                tokio::select! {
+                    _ = self.changed.notified() => {}
+                    _ = tokio::time::sleep(idle) => {}
                 }
             }
         });

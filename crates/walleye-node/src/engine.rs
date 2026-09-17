@@ -1952,13 +1952,35 @@ pub struct ViewDefinition {
     /// The stream this view reads. Inside the query this name means the rows
     /// that are new, not the whole stream.
     pub source: String,
-    /// The query that turns source rows into target rows.
-    pub sql: String,
-    /// Where the result is written. Created from the query's own output
-    /// shape the first time the view produces rows.
-    pub target: String,
+    /// The query that turns source rows into target rows. A view has this or
+    /// a worker, and a worker sees whatever the query left.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sql: Option<String>,
+    /// JavaScript that turns a batch of rows into the rows to write, written
+    /// as a module with a default export taking an array and returning one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker: Option<String>,
+    /// Where the result is written. Created from the view's own output shape
+    /// the first time it produces rows. A view with only an alert needs no
+    /// target: it is watching, not materialising.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    /// Where to send rows this view produced. Delivery is part of the pass:
+    /// a batch that could not be delivered does not advance the cursor, so
+    /// it is tried again rather than lost.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alert: Option<Alert>,
     #[serde(default = "default_batch_rows")]
     pub batch_rows: usize,
+}
+/// Where a view sends what it found.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Alert {
+    /// The endpoint that receives the rows, as a JSON array.
+    pub url: String,
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub headers: std::collections::HashMap<String, String>,
 }
 fn default_batch_rows() -> usize {
     512
@@ -1970,6 +1992,8 @@ pub struct Progress {
     pub rows: usize,
     /// Rows written to the target.
     pub written: usize,
+    /// Rows delivered to the alert endpoint.
+    pub delivered: usize,
     /// Arrival number the view has now consumed through.
     pub through: u64,
     /// Whether the source had nothing further at the end of the pass.
@@ -1998,22 +2022,36 @@ impl Engine {
     /// Register a view. The source must exist; the target is created when the
     /// view first produces rows, from the shape its own query returns.
     pub async fn define_view(&self, view: ViewDefinition) -> Result<(), Error> {
-        for name in [&view.name, &view.source, &view.target] {
+        for name in [Some(&view.name), Some(&view.source), view.target.as_ref()]
+            .into_iter()
+            .flatten()
+        {
             if !valid_name(name) {
                 return Err(format!("invalid name {name}").into());
             }
         }
-        if view.sql.trim().is_empty() {
-            return Err("a view needs a query".into());
+        let filled = |text: &Option<String>| text.as_ref().is_some_and(|t| !t.trim().is_empty());
+        if !filled(&view.sql) && !filled(&view.worker) {
+            return Err("a view needs a query, a worker, or both".into());
+        }
+        if view.target.is_none() && view.alert.is_none() {
+            return Err("a view needs a target to write to, an alert to send to, or both".into());
         }
         if view.batch_rows == 0 || view.batch_rows > 100_000 {
             return Err("batch_rows must be between 1 and 100000".into());
         }
-        if view.target == view.source {
+        if view.target.as_deref() == Some(view.source.as_str()) {
             return Err("a view cannot write back into its own source".into());
         }
-        // Fail here rather than at the first refresh, when nobody is watching.
-        self.definition(&view.source).await?;
+        if let Some(alert) = &view.alert {
+            let url = reqwest::Url::parse(&alert.url).map_err(|e| format!("alert url: {e}"))?;
+            if !matches!(url.scheme(), "http" | "https") {
+                return Err("an alert url must be http or https".into());
+            }
+        }
+        // The source need not exist yet. A pipeline is declared as a whole,
+        // and a tier's source is usually the target of the tier above it,
+        // which will not exist until that tier first produces rows.
         let path = self.views_path.clone().join(format!("{}.json", view.name));
         let bytes = serde_json::to_vec(&view)?;
         self.catalog.inner.put(&path, bytes.into()).await?;
@@ -2078,12 +2116,24 @@ impl Engine {
             "SELECT * FROM \"{}\" WHERE {HIDDEN_SEQ} > {cursor} ORDER BY {HIDDEN_SEQ} LIMIT {}",
             view.source, view.batch_rows
         );
+        // A source that does not exist yet is a tier whose upstream has not
+        // produced anything. That is idleness, not failure: the view waits.
+        if self.definition(&view.source).await.is_err() {
+            return Ok(Progress {
+                rows: 0,
+                written: 0,
+                delivered: 0,
+                through: cursor,
+                caught_up: true,
+            });
+        }
         let fresh = self.query_batches(&pick, &[]).await?;
         let rows: usize = fresh.iter().map(RecordBatch::num_rows).sum();
         if rows == 0 {
             return Ok(Progress {
                 rows: 0,
                 written: 0,
+                delivered: 0,
                 through: cursor,
                 caught_up: true,
             });
@@ -2094,26 +2144,79 @@ impl Engine {
         // to know about cursors at all.
         let schema = fresh[0].schema();
         let gathered = vec![(view.source.clone(), schema, fresh.to_vec())];
-        let produced = self.query_batches(&view.sql, &gathered).await?;
-        let produced = produced
-            .iter()
-            .map(strip_hidden)
-            .collect::<Result<Vec<_>, _>>()?;
-        let written: usize = produced.iter().map(RecordBatch::num_rows).sum();
-        if written > 0 {
-            if self.definition(&view.target).await.is_err() {
-                let definition = StreamDefinition::from_arrow(&view.target, &produced[0].schema())?;
+        let mut produced: Vec<RecordBatch> = match &view.sql {
+            Some(sql) if !sql.trim().is_empty() => self
+                .query_batches(sql, &gathered)
+                .await?
+                .iter()
+                .map(strip_hidden)
+                .collect::<Result<Vec<_>, _>>()?,
+            _ => fresh
+                .iter()
+                .map(strip_hidden)
+                .collect::<Result<Vec<_>, _>>()?,
+        };
+        if let Some(worker) = &view.worker
+            && !worker.trim().is_empty()
+        {
+            let worker = worker.clone();
+            let handed = produced;
+            produced = tokio::task::spawn_blocking(move || run_worker(&worker, &handed))
+                .await
+                .map_err(|error| -> Error { error.to_string().into() })??;
+        }
+        let made: usize = produced.iter().map(RecordBatch::num_rows).sum();
+
+        // Deliver before the cursor moves. A batch that could not be sent is
+        // offered again on the next pass rather than quietly skipped, which
+        // makes an alert at least once and never at most once.
+        let mut delivered = 0;
+        if let Some(alert) = &view.alert
+            && made > 0
+        {
+            self.deliver(alert, &produced).await?;
+            delivered = made;
+        }
+        let mut written = 0;
+        if let Some(target) = &view.target
+            && made > 0
+        {
+            if self.definition(target).await.is_err() {
+                let definition = StreamDefinition::from_arrow(target, &produced[0].schema())?;
                 self.define_with(definition, true).await?;
             }
-            self.append(&view.target, produced).await?;
+            self.append(target, produced).await?;
+            written = made;
         }
         self.set_cursor(&consumer, through).await?;
         Ok(Progress {
             rows,
             written,
+            delivered,
             through,
             caught_up: rows < view.batch_rows,
         })
+    }
+    /// Send produced rows to an alert endpoint as a JSON array.
+    async fn deliver(&self, alert: &Alert, batches: &[RecordBatch]) -> Result<(), Error> {
+        let mut writer = arrow_json::ArrayWriter::new(Vec::new());
+        writer.write_batches(&batches.iter().collect::<Vec<_>>())?;
+        writer.finish()?;
+        let body = writer.into_inner();
+        let mut request = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()?
+            .post(&alert.url)
+            .header("content-type", "application/json");
+        for (name, value) in &alert.headers {
+            request = request.header(name, value);
+        }
+        let response = request.body(body).send().await?;
+        if !response.status().is_success() {
+            return Err(format!("alert endpoint answered {}", response.status()).into());
+        }
+        Ok(())
     }
     /// Advance a view until its source has nothing further, or until `passes`
     /// batches have been done. Bounded so one call cannot run forever.
@@ -2121,6 +2224,7 @@ impl Engine {
         let mut total = Progress {
             rows: 0,
             written: 0,
+            delivered: 0,
             through: 0,
             caught_up: false,
         };
@@ -2128,6 +2232,7 @@ impl Engine {
             let pass = self.refresh_view(name).await?;
             total.rows += pass.rows;
             total.written += pass.written;
+            total.delivered += pass.delivered;
             total.through = pass.through;
             total.caught_up = pass.caught_up;
             if pass.caught_up {
@@ -2137,6 +2242,58 @@ impl Engine {
         Ok(total)
     }
 
+    /// Drive every view this node owns until none of them can make progress.
+    ///
+    /// The rule is progress, not fullness. A pass over all the views repeats
+    /// while any of them committed a batch, so a tier that fills its
+    /// downstream tier feeds it on the next pass without anyone having to
+    /// notice that a batch came back full. When a whole pass moves nothing,
+    /// the work is done and the caller can go quiet rather than poll.
+    ///
+    /// A view whose source this node does not own is left alone: its owner
+    /// drives it, and two nodes driving one cursor would do the same work
+    /// twice.
+    pub async fn advance_views(&self, budget: usize) -> Vec<(String, Result<Progress, Error>)> {
+        let mut reports: Vec<(String, Result<Progress, Error>)> = Vec::new();
+        let names = match self.view_names().await {
+            Ok(names) => names,
+            Err(error) => return vec![("*".to_owned(), Err(error))],
+        };
+        let mut spent = 0;
+        while spent < budget.max(1) {
+            let mut moved = false;
+            for name in &names {
+                if spent >= budget.max(1) {
+                    break;
+                }
+                let Ok(view) = self.view(name).await else {
+                    continue;
+                };
+                if self.owner(&view.source).is_some() {
+                    continue;
+                }
+                let outcome = self.refresh_view(name).await;
+                spent += 1;
+                if let Ok(progress) = &outcome {
+                    if progress.rows == 0 {
+                        continue;
+                    }
+                    moved = true;
+                }
+                let failed = outcome.is_err();
+                reports.push((name.clone(), outcome));
+                if failed {
+                    // A failing view stops being retried this round rather
+                    // than starving its siblings out of the budget.
+                    continue;
+                }
+            }
+            if !moved {
+                break;
+            }
+        }
+        reports
+    }
     /// Where a consumer stopped, or zero when it has never run.
     pub async fn cursor(&self, consumer: &str) -> Result<u64, Error> {
         if self.definition(CURSORS).await.is_err() {
@@ -2201,4 +2358,57 @@ fn highest_in(batches: &[RecordBatch]) -> Result<Option<u64>, Error> {
         }
     }
     Ok(highest)
+}
+
+/// Hand a batch of rows to a worker and take back the rows it returns.
+///
+/// Rows cross as JSON in both directions. A worker therefore never holds an
+/// Arrow buffer and the node never holds a JavaScript value, which is the
+/// whole of the isolation at this boundary.
+///
+/// The returned shape is whatever the worker produced. It is read back by
+/// inference rather than forced into the source's schema, because a transform
+/// that could not change the shape of a row would not be much of a transform.
+fn run_worker(worker: &str, batches: &[RecordBatch]) -> Result<Vec<RecordBatch>, Error> {
+    let mut writer = arrow_json::ArrayWriter::new(Vec::new());
+    writer.write_batches(&batches.iter().collect::<Vec<_>>())?;
+    writer.finish()?;
+    let rows = String::from_utf8(writer.into_inner())?;
+
+    let produced = walleye_v8::run(worker, &rows, worker_limits())?;
+    let values: Vec<serde_json::Value> = serde_json::from_str(&produced)?;
+    if values.is_empty() {
+        return Ok(Vec::new());
+    }
+    if let Some(index) = values.iter().position(|row| !row.is_object()) {
+        return Err(
+            format!("worker returned a row that is not an object at position {index}").into(),
+        );
+    }
+    let schema = Arc::new(arrow_json::reader::infer_json_schema_from_iterator(
+        values
+            .iter()
+            .map(Ok::<&serde_json::Value, arrow_schema::ArrowError>),
+    )?);
+    if schema.fields().iter().any(|f| hidden(f.name())) {
+        return Err("worker returned a column using a reserved name".into());
+    }
+    let mut decoder = arrow_json::ReaderBuilder::new(schema).build_decoder()?;
+    decoder.serialize(&values)?;
+    Ok(decoder.flush()?.into_iter().collect())
+}
+/// What one worker batch may spend. Both are declared before the worker runs,
+/// because a limit discovered afterwards is not a limit.
+fn worker_limits() -> walleye_v8::Limits {
+    let number = |name: &str, fallback: u64| {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(fallback)
+    };
+    walleye_v8::Limits {
+        heap_bytes: number("WALLEYE_WORKER_HEAP_MB", 128) as usize * 1024 * 1024,
+        deadline: std::time::Duration::from_secs(number("WALLEYE_WORKER_SECONDS", 15)),
+    }
 }

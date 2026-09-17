@@ -1,7 +1,19 @@
 //! Combined local cluster member: an opaque Bitr durability service and deployment-local Foyer cache.
 use std::{future::IntoFuture, sync::Arc};
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // V8 sets up process-global memory protection keys, and a thread created
+    // before that setup cannot later enter an isolate. Workers run on the
+    // blocking pool, so the platform has to start before the runtime builds
+    // any threads at all.
+    walleye_v8::start();
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(serve())
+}
+
+async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     let config = if std::env::var_os("WALLEYE_DISCOVERY_SERVICE").is_some() {
         walleye_node::kubernetes::config_from_env()?
     } else if let Some(path) = std::env::var("WALLEYE_CONFIG").ok().or_else(|| {

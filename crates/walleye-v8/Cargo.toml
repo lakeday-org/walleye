@@ -1,0 +1,16 @@
+[package]
+name = "walleye-v8"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+license-file.workspace = true
+publish = false
+
+[dependencies]
+v8.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
