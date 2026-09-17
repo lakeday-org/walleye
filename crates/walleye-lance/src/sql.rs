@@ -83,13 +83,26 @@ pub async fn query(
 /// owns them. A gathered table is a point-in-time copy taken by its owner, so
 /// it carries that owner's unflushed rows; it is registered in memory for the
 /// life of this query only.
+/// Tables are registered under exactly the name the catalog holds.
+///
+/// `register_table` accepts anything that converts into a `TableReference`,
+/// and converting from a string *parses* it, which folds an unquoted
+/// identifier to lower case. Registering `"Pets"` that way filed it under
+/// `pets`, so `FROM "Pets"` — the only form available to a name holding a
+/// space or a reserved word — could never resolve, while the catalog, the
+/// table API and cluster routing all still called it `Pets`.
+///
+/// `TableReference::bare` takes the name as given. Folding then happens only
+/// where SQL says it should: on the reference in the statement, so `FROM
+/// "Pets"` resolves and unquoted `FROM Pets` does not, as in any other
+/// case-sensitive catalog.
 pub async fn query_with_gathered(
     storage: &LanceStorageOptions,
     tables: &[(String, Arc<dyn SnapshotSource>)],
     gathered: &[(String, SchemaRef, Vec<arrow_array::RecordBatch>)],
     sql: &str,
 ) -> lance::Result<ScanResult> {
-    use lance::deps::datafusion::datasource::MemTable;
+    use lance::deps::datafusion::{common::TableReference, datasource::MemTable};
     tokio::time::timeout(storage.query_timeout(), async {
         let ctx = context(storage)?;
         for (name, table) in tables {
@@ -97,7 +110,7 @@ pub async fn query_with_gathered(
                 continue;
             }
             ctx.register_table(
-                name.as_str(),
+                TableReference::bare(name.clone()),
                 Arc::new(StreamProvider {
                     source: table.clone(),
                     snapshot: tokio::sync::OnceCell::new(),
@@ -107,7 +120,7 @@ pub async fn query_with_gathered(
         }
         for (name, schema, batches) in gathered {
             ctx.register_table(
-                name.as_str(),
+                TableReference::bare(name.clone()),
                 Arc::new(MemTable::try_new(schema.clone(), vec![batches.clone()]).map_err(err)?),
             )
             .map_err(err)?;
