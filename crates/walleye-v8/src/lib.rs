@@ -48,6 +48,25 @@ impl Default for Limits {
     }
 }
 
+/// What one batch produced.
+///
+/// A worker may return rows, write them to named streams, or both. Returning
+/// them is the short way to fill the view's own target; writing them is how a
+/// worker fans out, sends a row somewhere else, or splits a batch between
+/// streams. The host commits all of it together, so a worker chooses where
+/// rows go without owning the transaction they go in.
+#[derive(Debug, Default)]
+pub struct Outcome {
+    /// The array the worker returned, as JSON. Empty when it returned nothing.
+    pub returned: String,
+    /// Rows the worker wrote, in the order it wrote them, as (stream, JSON).
+    pub writes: Vec<(String, String)>,
+}
+
+/// Rows a worker wrote during one turn, collected for the host.
+#[derive(Default)]
+struct Written(std::sync::Mutex<Vec<(String, String)>>);
+
 #[derive(Debug)]
 pub enum Error {
     /// The worker could not be compiled, or is not shaped like a worker.
@@ -152,10 +171,11 @@ impl Drop for Deadline {
 ///
 /// This blocks the calling thread for as long as the worker runs, so call it
 /// from a thread that is allowed to block.
-pub fn run(worker: &str, rows: &str, limits: Limits) -> Result<String, Error> {
+pub fn run(worker: &str, rows: &str, limits: Limits) -> Result<Outcome, Error> {
     start();
     let heap = limits.heap_bytes.max(8 * 1024 * 1024);
     let mut isolate = v8::Isolate::new(v8::CreateParams::default().heap_limits(0, heap));
+    isolate.set_slot(std::sync::Arc::new(Written::default()));
 
     // Running out of heap has to stop the worker, not grow the host. The
     // small grant is headroom for V8 to unwind in; returning a bigger limit
@@ -211,7 +231,45 @@ extern "C" fn near_heap_limit(
     current + 16 * 1024 * 1024
 }
 
-fn evaluate(isolate: &mut v8::Isolate, worker: &str, rows: &str) -> Result<String, Error> {
+/// `ctx.write(stream, rowOrRows)` from inside a worker. The rows are held
+/// until the turn ends; nothing reaches storage while the worker is still
+/// running, so a worker that later throws writes nothing at all.
+fn write_callback(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue,
+) {
+    let fail = |scope: &mut v8::PinScope<'_, '_>, message: &str| {
+        if let Some(message) = v8::String::new(scope, message) {
+            let exception = v8::Exception::error(scope, message);
+            scope.throw_exception(exception);
+        }
+    };
+    let stream = args.get(0);
+    if !stream.is_string() {
+        return fail(scope, "write needs the name of a stream first");
+    }
+    let stream = stream.to_rust_string_lossy(scope);
+    if stream.is_empty() {
+        return fail(scope, "write needs the name of a stream first");
+    }
+    let rows = args.get(1);
+    if rows.is_null_or_undefined() {
+        return fail(scope, "write needs a row, or an array of rows");
+    }
+    let Some(json) = v8::json::stringify(scope, rows) else {
+        return fail(scope, "those rows cannot be written down");
+    };
+    let json = json.to_rust_string_lossy(scope);
+    let Some(written) = scope.get_slot::<std::sync::Arc<Written>>().cloned() else {
+        return fail(scope, "this worker cannot write");
+    };
+    if let Ok(mut held) = written.0.lock() {
+        held.push((stream, json));
+    }
+}
+
+fn evaluate(isolate: &mut v8::Isolate, worker: &str, rows: &str) -> Result<Outcome, Error> {
     v8::scope!(let scope, isolate);
     let context = v8::Context::new(scope, Default::default());
     let scope = &mut v8::ContextScope::new(scope, context);
@@ -268,8 +326,18 @@ fn evaluate(isolate: &mut v8::Isolate, worker: &str, rows: &str) -> Result<Strin
         v8::String::new(scope, rows).ok_or_else(|| Error::Invalid("batch too large".into()))?;
     let input = v8::json::parse(scope, input)
         .ok_or_else(|| Error::Invalid("the batch could not be given to it".into()))?;
+    // The second argument is how a worker reaches storage. There is nothing
+    // else on it: no network, no clock, no host beyond this.
+    let context_object = v8::Object::new(scope);
+    let write_key = v8::String::new(scope, "write").expect("a short name");
+    let write = v8::Function::new(scope, write_callback)
+        .ok_or_else(|| Error::Invalid("the runtime could not be prepared".into()))?;
+    if context_object.set(scope, write_key.into(), write.into()) != Some(true) {
+        return Err(Error::Invalid("the runtime could not be prepared".into()));
+    }
     let receiver = v8::undefined(scope);
-    let Some(returned) = transform.call(scope, receiver.into(), &[input]) else {
+    let Some(returned) = transform.call(scope, receiver.into(), &[input, context_object.into()])
+    else {
         return Err(Error::Threw(
             thrown!(scope).unwrap_or_else(|| "without a message".into()),
         ));
@@ -298,6 +366,25 @@ fn evaluate(isolate: &mut v8::Isolate, worker: &str, rows: &str) -> Result<Strin
         returned
     };
 
+    let writes = scope
+        .get_slot::<std::sync::Arc<Written>>()
+        .cloned()
+        .and_then(|written| written.0.lock().ok().map(|held| held.clone()))
+        .unwrap_or_default();
+
+    // A worker that wrote its rows need not also return them. One that did
+    // neither has done nothing, and saying so beats a silent empty tier.
+    if returned.is_null_or_undefined() {
+        if writes.is_empty() {
+            return Err(Error::Returned(
+                "nothing: a worker must return rows, write them, or both".into(),
+            ));
+        }
+        return Ok(Outcome {
+            returned: String::new(),
+            writes,
+        });
+    }
     if !returned.is_array() {
         return Err(Error::Returned(format!(
             "{}, but a worker must return an array of rows",
@@ -306,7 +393,10 @@ fn evaluate(isolate: &mut v8::Isolate, worker: &str, rows: &str) -> Result<Strin
     }
     let output = v8::json::stringify(scope, returned)
         .ok_or_else(|| Error::Returned("rows that cannot be written down".into()))?;
-    Ok(output.to_rust_string_lossy(scope))
+    Ok(Outcome {
+        returned: output.to_rust_string_lossy(scope),
+        writes,
+    })
 }
 
 fn describe(scope: &mut v8::PinScope<'_, '_>, value: v8::Local<v8::Value>) -> String {
@@ -337,7 +427,14 @@ mod tests {
     use super::*;
 
     fn run_ok(worker: &str, rows: &str) -> String {
-        run(worker, rows, Limits::default()).expect("worker ran")
+        run(worker, rows, Limits::default())
+            .expect("worker ran")
+            .returned
+    }
+    fn wrote(worker: &str, rows: &str) -> Vec<(String, String)> {
+        run(worker, rows, Limits::default())
+            .expect("worker ran")
+            .writes
     }
 
     #[test]
@@ -363,6 +460,78 @@ mod tests {
             r#"[{"n":1}]"#,
         );
         assert_eq!(out, r#"[{"n":1}]"#);
+    }
+    #[test]
+    fn a_worker_writes_rows_to_the_streams_it_names() {
+        let writes = wrote(
+            "export default (rows, ctx) => { \
+               for (const r of rows) ctx.write(r.ok ? 'kept' : 'quarantine', r); \
+             }",
+            r#"[{"ok":true,"n":1},{"ok":false,"n":2},{"ok":true,"n":3}]"#,
+        );
+        let streams: Vec<&str> = writes.iter().map(|(stream, _)| stream.as_str()).collect();
+        assert_eq!(
+            streams,
+            vec!["kept", "quarantine", "kept"],
+            "in the order written"
+        );
+        assert!(writes[1].1.contains("\"n\":2"), "{:?}", writes[1]);
+    }
+    #[test]
+    fn a_worker_may_write_a_whole_array_at_once() {
+        let writes = wrote(
+            "export default (rows, ctx) => ctx.write('bulk', rows.map(r => ({ n: r.n * 10 })))",
+            r#"[{"n":1},{"n":2}]"#,
+        );
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].0, "bulk");
+        assert_eq!(writes[0].1, r#"[{"n":10},{"n":20}]"#);
+    }
+    #[test]
+    fn a_worker_may_both_return_and_write() {
+        let outcome = run(
+            "export default (rows, ctx) => { ctx.write('audit', { seen: rows.length }); \
+             return rows; }",
+            r#"[{"n":1}]"#,
+            Limits::default(),
+        )
+        .expect("worker ran");
+        assert_eq!(outcome.returned, r#"[{"n":1}]"#);
+        assert_eq!(outcome.writes.len(), 1);
+        assert_eq!(outcome.writes[0].0, "audit");
+    }
+    #[test]
+    fn a_worker_that_neither_returns_nor_writes_is_refused() {
+        let error =
+            run("export default () => {}", "[]", Limits::default()).expect_err("it did nothing");
+        assert!(
+            matches!(error, Error::Returned(ref detail) if detail.contains("return rows, write them")),
+            "{error}"
+        );
+    }
+    #[test]
+    fn a_write_without_a_stream_name_throws_inside_the_worker() {
+        let error = run(
+            "export default (rows, ctx) => { ctx.write('', {a:1}); return [] }",
+            "[]",
+            Limits::default(),
+        )
+        .expect_err("no stream named");
+        assert!(
+            matches!(error, Error::Threw(ref detail) if detail.contains("name of a stream")),
+            "{error}"
+        );
+    }
+    #[test]
+    fn a_worker_that_throws_after_writing_writes_nothing() {
+        let error = run(
+            "export default (rows, ctx) => { ctx.write('kept', {a:1}); throw new Error('later') }",
+            "[]",
+            Limits::default(),
+        )
+        .expect_err("it threw");
+        assert!(matches!(error, Error::Threw(_)), "{error}");
+        // The rows never reach the host, so nothing was written.
     }
     #[test]
     fn a_worker_that_throws_reports_what_it_threw() {

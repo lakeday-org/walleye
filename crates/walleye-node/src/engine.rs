@@ -2222,6 +2222,7 @@ impl Engine {
         // to know about cursors at all.
         let schema = fresh[0].schema();
         let gathered = vec![(view.source.clone(), schema, fresh.to_vec())];
+        let mut side_written = 0usize;
         let mut produced: Vec<RecordBatch> = match &view.sql {
             Some(sql) if !sql.trim().is_empty() => self
                 .query_batches(sql, &gathered)
@@ -2255,10 +2256,29 @@ impl Engine {
             };
             let worker = worker.clone();
             let handed = produced;
-            produced =
+            let (target_rows, elsewhere) =
                 tokio::task::spawn_blocking(move || run_worker(&worker, &handed, limits, expected))
                     .await
                     .map_err(|error| -> Error { error.to_string().into() })??;
+            produced = target_rows;
+            // A worker chooses where its rows go; the host still owns the
+            // transaction they go in. These land before the cursor moves, so
+            // a pass that fails anywhere is replayed whole.
+            for (stream, batches) in elsewhere {
+                if batches.is_empty() {
+                    continue;
+                }
+                if stream == view.source {
+                    return Err(format!("a worker wrote back into its own source, {stream}").into());
+                }
+                if self.definition(&stream).await.is_err() {
+                    let definition = StreamDefinition::from_arrow(&stream, &batches[0].schema())?;
+                    self.define_with(definition, true).await?;
+                }
+                let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+                self.append(&stream, batches).await?;
+                side_written += rows;
+            }
         }
         let made: usize = produced.iter().map(RecordBatch::num_rows).sum();
 
@@ -2283,6 +2303,7 @@ impl Engine {
             self.append(target, produced).await?;
             written = made;
         }
+        let written = written + side_written;
         self.set_cursor(&consumer, through).await?;
         Ok(Progress {
             rows,
@@ -2455,6 +2476,10 @@ fn highest_in(batches: &[RecordBatch]) -> Result<Option<u64>, Error> {
     Ok(highest)
 }
 
+/// What one worker turn produced: rows for the view's own target, and rows it
+/// wrote to streams it named itself.
+type WorkerOutput = (Vec<RecordBatch>, Vec<(String, Vec<RecordBatch>)>);
+
 /// Hand a batch of rows to a worker and take back the rows it returns.
 ///
 /// Rows cross as JSON in both directions. A worker therefore never holds an
@@ -2469,20 +2494,59 @@ fn run_worker(
     batches: &[RecordBatch],
     limits: walleye_v8::Limits,
     expected: Option<Arc<Schema>>,
-) -> Result<Vec<RecordBatch>, Error> {
+) -> Result<WorkerOutput, Error> {
     let mut writer = arrow_json::ArrayWriter::new(Vec::new());
     writer.write_batches(&batches.iter().collect::<Vec<_>>())?;
     writer.finish()?;
     let rows = String::from_utf8(writer.into_inner())?;
 
-    let produced = walleye_v8::run(worker, &rows, limits)?;
-    let values: Vec<serde_json::Value> = serde_json::from_str(&produced)?;
+    let outcome = walleye_v8::run(worker, &rows, limits)?;
+
+    // Rows the worker sent elsewhere, grouped by stream and kept in the order
+    // it wrote them.
+    let mut elsewhere: Vec<(String, Vec<serde_json::Value>)> = Vec::new();
+    for (stream, written) in outcome.writes {
+        if !valid_name(&stream) {
+            return Err(format!("a worker wrote to an invalid stream name: {stream}").into());
+        }
+        let value: serde_json::Value = serde_json::from_str(&written)?;
+        let rows = match value {
+            serde_json::Value::Array(rows) => rows,
+            row => vec![row],
+        };
+        match elsewhere.iter_mut().find(|(name, _)| name == &stream) {
+            Some((_, held)) => held.extend(rows),
+            None => elsewhere.push((stream, rows)),
+        }
+    }
+    let mut written = Vec::with_capacity(elsewhere.len());
+    for (stream, rows) in elsewhere {
+        let batches = rows_to_batches(rows, None)?;
+        written.push((stream, batches));
+    }
+
+    if outcome.returned.is_empty() {
+        return Ok((Vec::new(), written));
+    }
+    let values: Vec<serde_json::Value> = serde_json::from_str(&outcome.returned)?;
+    if values.is_empty() {
+        return Ok((Vec::new(), written));
+    }
+    Ok((rows_to_batches(values, expected)?, written))
+}
+
+/// Turn JSON rows into Arrow batches, against a known schema when there is
+/// one and by inference otherwise.
+fn rows_to_batches(
+    values: Vec<serde_json::Value>,
+    expected: Option<Arc<Schema>>,
+) -> Result<Vec<RecordBatch>, Error> {
     if values.is_empty() {
         return Ok(Vec::new());
     }
     if let Some(index) = values.iter().position(|row| !row.is_object()) {
         return Err(
-            format!("worker returned a row that is not an object at position {index}").into(),
+            format!("a worker produced a row that is not an object at position {index}").into(),
         );
     }
     // Once a target exists its schema is the authority. Inferring afresh from
@@ -2497,7 +2561,7 @@ fn run_worker(
         )?),
     };
     if schema.fields().iter().any(|f| hidden(f.name())) {
-        return Err("worker returned a column using a reserved name".into());
+        return Err("a worker produced a column using a reserved name".into());
     }
     let mut decoder = arrow_json::ReaderBuilder::new(schema).build_decoder()?;
     decoder.serialize(&values)?;

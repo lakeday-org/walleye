@@ -20,11 +20,16 @@ const ARROW: &str = "application/vnd.apache.arrow.stream";
 const JSON: &str = "application/json";
 
 fn config(path: &std::path::Path) -> Config {
+    sized(path, 512 * 1024 * 1024)
+}
+/// Every open stream holds a writer against the budget, so a worker that
+/// fans out to several streams needs room for several writers.
+fn sized(path: &std::path::Path, memory_bytes: usize) -> Config {
     Config {
         node_id: "n".into(),
         listen: "127.0.0.1:0".into(),
         directory: path.join("cache"),
-        memory_bytes: 512 * 1024 * 1024,
+        memory_bytes,
         disk_bytes: 64 * 1024 * 1024,
         token: TOKEN.into(),
         bitr: false,
@@ -124,7 +129,10 @@ async fn refresh(app: &axum::Router, name: &str) -> Value {
 }
 
 async fn seeded(path: &std::path::Path, names: &[&str], values: &[f64]) -> axum::Router {
-    let app = router(Service::open(config(path)).await.unwrap());
+    seeded_with(config(path), names, values).await
+}
+async fn seeded_with(config: Config, names: &[&str], values: &[f64]) -> axum::Router {
+    let app = router(Service::open(config).await.unwrap());
     let (status, body) = post(
         &app,
         "/v1/table/raw/create/?mode=create",
@@ -459,4 +467,117 @@ async fn a_view_sizes_its_own_worker() {
         .map(|row| row["twice"].as_f64().unwrap())
         .collect();
     assert_eq!(doubled, vec![2.0, 4.0], "{rows}");
+}
+
+/// A worker does not have to hand its rows back to be written somewhere it did
+/// not choose. It writes them itself, to whichever stream each row belongs in,
+/// and the host commits the lot with the cursor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_worker_routes_rows_to_the_streams_it_names() {
+    let d = tempfile::tempdir().unwrap();
+    let app = seeded_with(
+        sized(d.path(), 2048 * 1024 * 1024),
+        &["a", "b", "c"],
+        &[5.0, 95.0, 120.0],
+    )
+    .await;
+    defined(
+        &app,
+        "router",
+        json!({
+            "source": "raw",
+            "target": "normal",
+            "worker": "export default (rows, ctx) => {\
+                 const kept = [];\
+                 for (const r of rows) {\
+                   if (r.celsius > 100) ctx.write('overheating', { sensor: r.sensor, c: r.celsius });\
+                   else if (r.celsius > 50) ctx.write('warm', { sensor: r.sensor, c: r.celsius });\
+                   else kept.push({ sensor: r.sensor, c: r.celsius });\
+                 }\
+                 return kept;\
+               }"
+        }),
+    )
+    .await;
+
+    let progress = refresh(&app, "router").await;
+    assert_eq!(progress["rows"], 3, "{progress}");
+    assert_eq!(
+        progress["written"], 3,
+        "every row landed somewhere: {progress}"
+    );
+
+    // Three streams, none of which the view declared except the target.
+    for (stream, sensor) in [("normal", "a"), ("warm", "b"), ("overheating", "c")] {
+        let rows = sql(&app, &format!("SELECT sensor FROM {stream}")).await;
+        let got: Vec<&str> = rows
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["sensor"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            got,
+            vec![sensor],
+            "{stream} holds only its own rows: {rows}"
+        );
+    }
+}
+
+/// A worker that writes and returns nothing is still a worker: the rows it
+/// wrote are the output, and the view needs no target of its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_worker_may_be_the_only_writer() {
+    let d = tempfile::tempdir().unwrap();
+    let app = seeded_with(
+        sized(d.path(), 2048 * 1024 * 1024),
+        &["a", "b"],
+        &[1.0, 2.0],
+    )
+    .await;
+    defined(
+        &app,
+        "fanout",
+        json!({
+            "source": "raw",
+            "target": "mirror",
+            "worker": "export default (rows, ctx) => {\
+                 ctx.write('by_sensor', rows.map(r => ({ sensor: r.sensor })));\
+                 ctx.write('audit', { seen: rows.length });\
+                 return [];\
+               }"
+        }),
+    )
+    .await;
+    let progress = refresh(&app, "fanout").await;
+    assert_eq!(progress["rows"], 2, "{progress}");
+    assert_eq!(
+        progress["written"], 3,
+        "two rows and one audit line: {progress}"
+    );
+
+    let audited = sql(&app, "SELECT seen FROM audit").await;
+    assert_eq!(audited.as_array().unwrap()[0]["seen"], 2, "{audited}");
+    let counted = sql(&app, "SELECT count(*) AS n FROM by_sensor").await;
+    assert_eq!(counted.as_array().unwrap()[0]["n"], 2, "{counted}");
+}
+
+/// Writing back into the source would feed a worker its own output for ever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_worker_may_not_write_into_its_own_source() {
+    let d = tempfile::tempdir().unwrap();
+    let app = seeded(d.path(), &["a"], &[1.0]).await;
+    defined(
+        &app,
+        "ouroboros",
+        json!({
+            "source": "raw",
+            "target": "out",
+            "worker": "export default (rows, ctx) => { ctx.write('raw', rows[0]); return [] }"
+        }),
+    )
+    .await;
+    let (status, body) = post(&app, "/v1/view/ouroboros/refresh/", JSON, b"{}".to_vec()).await;
+    assert_ne!(status, StatusCode::OK, "a worker that eats its own output");
+    assert!(body.to_string().contains("own source"), "{body}");
 }
