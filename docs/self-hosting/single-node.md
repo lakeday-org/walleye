@@ -26,9 +26,12 @@ curl -s localhost:8080/readyz  -H "authorization: Bearer $WALLEYE_TOKEN"
 ```
 
 `/healthz` answers as soon as the process can route. `/readyz` reports whether
-writes can be made durable and names which members are serving. On a single
-node the two say the same thing; in a cluster they do not, which is the point
-of having both.
+writes can be made durable. On a single node the two say the same thing; in a
+cluster they do not, which is the point of having both.
+
+Naming which members are serving, and `?require=all`, come from the replica
+gateway, so on a node without `WALLEYE_BITR_URL` there are no members to name
+and `?require=all` asks nothing extra.
 
 ## Connecting
 
@@ -37,7 +40,15 @@ The LanceDB client is the primary way in and needs no adapter:
 ```python
 import lancedb
 
-db = lancedb.connect("http://127.0.0.1:8080", api_key=TOKEN, region="auto")
+# The address goes in host_override. The name after db:// is a label the
+# client wants and the node ignores, and region is required by the client
+# and ignored by the node.
+db = lancedb.connect(
+    "db://walleye",
+    api_key=TOKEN,
+    host_override="http://127.0.0.1:8080",
+    region="local",
+)
 table = db.create_table("docs", data=[
     {"id": "a", "text": "first", "vector": [0.1, 0.2, 0.3]},
 ])

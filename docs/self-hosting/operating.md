@@ -36,7 +36,9 @@ the managed side either:
 - namespaces, which are accepted and ignored
 - vector index types other than the one layout, an in-memory graph flushed per
   generation
-- any scheduled compaction you do not trigger
+- a compaction schedule you can set; merging is automatic once eight
+  generations exist, and `compact_lsm/` forces one, but there is no window or
+  cron to configure
 
 ## Different on the managed side
 

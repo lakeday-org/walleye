@@ -121,7 +121,9 @@ fan-out stays bounded. `POST /v1/table/{name}/compact_lsm/` runs one now,
 counts and index names.
 
 Not yet: full-text search, `update`, `delete`, `merge_insert`, and namespaces.
-Each returns a 400 with a plain reason.
+A full-text query is a 400 naming the reason. `update`, `delete` and
+`merge_insert` have no route at all, so they are a 404. Namespaces are
+accepted and ignored rather than refused.
 
 **Primary keys.** Mark a field with the Lance metadata
 `lance-schema:unenforced-primary-key = "true"` on your Arrow schema to use it as

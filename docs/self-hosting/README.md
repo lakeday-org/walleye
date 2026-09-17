@@ -27,6 +27,14 @@ at it and the rest is ordinary:
 
 ```python
 import lancedb
-db = lancedb.connect("http://127.0.0.1:8080", api_key="<token>", region="auto")
+
+# The node's address goes in host_override, never in the URI: the client
+# picks its transport from the scheme, and db:// is what means remote.
+db = lancedb.connect(
+    "db://walleye",
+    api_key="<token>",
+    host_override="http://127.0.0.1:8080",
+    region="local",
+)
 db.create_table("docs", data=[{"id": "a", "vector": [0.1, 0.2]}])
 ```
