@@ -50,6 +50,40 @@ pub struct Refusal {
 
 const NONE: &str = "none";
 
+/// The words a catalog name is made of. `Template_Type_Code` is three words
+/// and `GovernmentForm` is two, and a phrase using any of them is naming the
+/// column rather than offering a value: "how many templates have template type
+/// code CV" filtered on `= 'type' AND = 'code' AND = 'CV'` until each part
+/// counted as part of the name.
+fn name_parts(known: &[String]) -> Vec<String> {
+    let mut parts = Vec::new();
+    for name in known {
+        for chunk in name.split(['_', '-', ' ']) {
+            // Split runs of camel case as well, so GovernmentForm gives both.
+            let mut word = String::new();
+            for ch in chunk.chars() {
+                if ch.is_ascii_uppercase() && !word.is_empty() {
+                    parts.push(std::mem::take(&mut word));
+                }
+                word.push(ch.to_ascii_lowercase());
+            }
+            if !word.is_empty() {
+                parts.push(word);
+            }
+        }
+    }
+    parts.retain(|p| p.len() > 1);
+    parts.sort();
+    parts.dedup();
+    parts
+}
+
+/// Whether a candidate is a bare number. A number needs no adjudicating: it
+/// is a value wherever it appears.
+fn is_number(value: &str) -> bool {
+    value.parse::<f64>().is_ok()
+}
+
 /// Candidate literals in the phrase: quoted strings and bare numbers.
 ///
 /// A value cannot be a choice over the catalog, because it is not in the
@@ -129,6 +163,76 @@ fn literals(phrase: &str, known: &[String]) -> Vec<String> {
         "down",
         "list",
         "give",
+        // Verbs and function words. A phrase is mostly these, and every one
+        // of them left in is a question asked and a predicate risked.
+        "have",
+        "has",
+        "had",
+        "be",
+        "been",
+        "being",
+        "am",
+        "do",
+        "does",
+        "did",
+        "use",
+        "used",
+        "using",
+        "get",
+        "got",
+        "find",
+        "finds",
+        "we",
+        "i",
+        "you",
+        "they",
+        "he",
+        "she",
+        "their",
+        "theirs",
+        "its",
+        "his",
+        "her",
+        "our",
+        "my",
+        "this",
+        "these",
+        "those",
+        "not",
+        "no",
+        "only",
+        "also",
+        "just",
+        "can",
+        "could",
+        "should",
+        "would",
+        "will",
+        "shall",
+        "may",
+        "might",
+        "must",
+        "please",
+        "tell",
+        "display",
+        "return",
+        "select",
+        "fetch",
+        "whose",
+        "whom",
+        "made",
+        "make",
+        "having",
+        "include",
+        "includes",
+        "including",
+        "between",
+        "into",
+        "out",
+        "about",
+        "only",
+        "distinct",
+        "different",
         // Counting words. "top ten" says how many rows, not what to match.
         "one",
         "two",
@@ -148,6 +252,7 @@ fn literals(phrase: &str, known: &[String]) -> Vec<String> {
         "several",
         "dozen",
     ];
+    let parts = name_parts(known);
     let mut found = Vec::new();
     let mut rest = phrase;
     while let Some(open) = rest.find(['\'', '"']) {
@@ -173,6 +278,31 @@ fn literals(phrase: &str, known: &[String]) -> Vec<String> {
             found.push(word.to_owned());
         }
     }
+    // Adjacent capitalised words are one name.
+    let mut run: Vec<&str> = Vec::new();
+    let flush = |run: &mut Vec<&str>, found: &mut Vec<String>| {
+        if run.len() > 1 {
+            let joined = run.join(" ");
+            if !found.iter().any(|f| f.eq_ignore_ascii_case(&joined)) {
+                found.push(joined);
+            }
+        }
+        run.clear();
+    };
+    for token in phrase.split(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-') {
+        let capital = token.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+            && token.len() > 1
+            && !GRAMMAR.contains(&token.to_ascii_lowercase().as_str())
+            && !parts.contains(&token.to_ascii_lowercase())
+            && !known.iter().any(|k| k.eq_ignore_ascii_case(token));
+        if capital {
+            run.push(token);
+        } else {
+            flush(&mut run, &mut found);
+        }
+    }
+    flush(&mut run, &mut found);
+
     // A bare word can be a value too: a city, a status, a name. Anything the
     // catalog already names is an identifier rather than a value, and the
     // grammar words above are neither.
@@ -181,12 +311,18 @@ fn literals(phrase: &str, known: &[String]) -> Vec<String> {
         if word.is_empty()
             || word.len() < 2
             || GRAMMAR.contains(&lower.as_str())
+            || parts.contains(&lower)
             || known.iter().any(|k| {
                 k.eq_ignore_ascii_case(word)
                     || lower
                         .strip_suffix('s')
                         .is_some_and(|stem| k.eq_ignore_ascii_case(stem))
                     || k.to_ascii_lowercase().strip_suffix('s') == Some(lower.as_str())
+            })
+            || found.iter().any(|f| {
+                f.to_ascii_lowercase()
+                    .split_whitespace()
+                    .any(|part| part == lower)
             })
             || found.iter().any(|f| f.eq_ignore_ascii_case(word))
         {
@@ -211,6 +347,7 @@ fn describe_type(kind: &DataType) -> &'static str {
 
 /// Every question about one phrase, built from what the catalog actually has.
 fn questions(
+    phrase: &str,
     candidates: &[String],
     tables: &[(String, Schema)],
     columns: &Schema,
@@ -330,6 +467,42 @@ fn questions(
     // its own, and a phrase naming two values gets both.
     for (index, value) in candidates.iter().enumerate() {
         let n = index + 1;
+        // A number is a value by being one; only a word needs adjudicating.
+        // Whether the word is a value at all is a question on its own, and
+        // asking it inside the column question got it wrong nearly every
+        // time: offered a list of columns and a "none", the service reliably
+        // found a column the word was *about* and chose that. "using" went
+        // into the Language column at 0.96, "written" into Written_by at
+        // 0.97. Confidence could not separate those from the real ones,
+        // because the service was not unsure -- it was answering a different
+        // question. Asked on its own, as two options rather than as the
+        // unpopular member of twelve, it is answerable.
+        if !is_number(value) {
+            set.insert(
+                format!("is_value_{n}"),
+                Question::choice(
+                    format!(
+                        "The phrase is: {phrase}\n\nThe rows may have to be narrowed down by \
+                     matching a column against \"{value}\". Or \"{value}\" may just be part \
+                     of how the question is worded. Which is it?"
+                    ),
+                    [
+                        (
+                            "value".to_owned(),
+                            "The rows are narrowed by it: it names a particular thing, like a \
+                         person, a place, a code, a status or a language."
+                                .to_owned(),
+                        ),
+                        (
+                            "wording".to_owned(),
+                            "It is how the question is phrased: a verb, a word naming a table or \
+                         a column, or a word holding the sentence together."
+                                .to_owned(),
+                        ),
+                    ],
+                ),
+            );
+        }
         set.insert(
             format!("where_column_{n}"),
             Question::choice(
@@ -464,6 +637,11 @@ fn assemble(
     let mut matched: Vec<String> = Vec::new();
     for (index, value) in candidates.iter().enumerate() {
         let n = index + 1;
+        let value_key = format!("is_value_{n}");
+        let adjudicated = !is_number(value);
+        if adjudicated && take(&value_key).as_deref() != Some("value") {
+            continue;
+        }
         let (column_key, op_key) = (format!("where_column_{n}"), format!("where_op_{n}"));
         let Some(column) = take(&column_key).filter(|c| c != NONE && has(c)) else {
             continue;
@@ -483,6 +661,9 @@ fn assemble(
             "contains" => format!("{} LIKE '%{}%'", quote(&column), value.replace('\'', "''")),
             _ => format!("{} = {rendered}", quote(&column)),
         });
+        if adjudicated {
+            matched.push(value_key);
+        }
         matched.extend([column_key, op_key]);
     }
     let group_column = take("group_column").filter(|c| c != NONE && has(c));
@@ -636,7 +817,7 @@ impl Engine {
         let mut candidates = literals(phrase, &known);
         candidates.truncate(VALUES);
 
-        let set = questions(&candidates, &tables, &columns);
+        let set = questions(phrase, &candidates, &tables, &columns);
         let mut corrected: Vec<Refusal> = Vec::new();
         for attempt in 1..=ATTEMPTS {
             // The refusals are part of the state, so each retry is a different
@@ -765,6 +946,8 @@ mod tests {
         let reading = assemble(
             &answers(&[
                 ("shape", "rows"),
+                ("is_value_1", "value"),
+                ("is_value_2", "value"),
                 ("where_column_1", "status"),
                 ("where_op_1", "equals"),
                 ("where_column_2", "city"),
@@ -793,6 +976,7 @@ mod tests {
         let reading = assemble(
             &answers(&[
                 ("shape", "rows"),
+                ("is_value_1", "value"),
                 ("where_column_1", "total"),
                 ("where_op_1", "above"),
                 ("group_column", NONE),
@@ -815,6 +999,7 @@ mod tests {
         let reading = assemble(
             &answers(&[
                 ("shape", "rows"),
+                ("is_value_1", "value"),
                 ("where_column_1", "days_late"),
                 ("where_op_1", "above"),
                 ("order_column", "carrier"),
@@ -876,5 +1061,96 @@ mod tests {
             again.contains("Do not choose the same way again"),
             "{again}"
         );
+    }
+}
+
+#[cfg(test)]
+mod value_tests {
+    use super::*;
+    use arrow_schema::Field;
+
+    fn orders() -> (String, Schema) {
+        (
+            "orders".to_owned(),
+            Schema::new(vec![
+                Field::new("id", DataType::Int64, true),
+                Field::new("city", DataType::Utf8, true),
+                Field::new("status", DataType::Utf8, true),
+            ]),
+        )
+    }
+
+    /// A word the service placed in a column still has to have been called a
+    /// value first. Every junk predicate in the Spider run came in this way,
+    /// confidently: "using" against the Language column at 0.96.
+    #[test]
+    fn a_word_of_the_question_reaches_no_predicate() {
+        let tables = [orders()];
+        let answers: BTreeMap<String, Answer> = [
+            ("shape", "rows"),
+            ("is_value_1", "wording"),
+            ("where_column_1", "status"),
+            ("where_op_1", "equals"),
+            ("group_column", NONE),
+            ("order_column", NONE),
+            ("limit", "all"),
+        ]
+        .iter()
+        .map(|(k, v)| {
+            (
+                (*k).to_owned(),
+                Answer::Choice {
+                    choice: (*v).to_owned(),
+                    confidence: 0.97,
+                    probabilities: Default::default(),
+                },
+            )
+        })
+        .collect();
+        let reading = assemble(&answers, &["using".to_owned()], &tables, Some(&tables[0])).unwrap();
+        assert_eq!(reading.sql, r#"SELECT * FROM "orders""#);
+    }
+
+    /// A quoted value is one value. Its words were also being offered
+    /// separately, so "Joseph Kuhr" became four predicates.
+    #[test]
+    fn the_words_of_a_quoted_value_are_not_values_too() {
+        let known: Vec<String> = vec!["orders".into(), "id".into(), "city".into(), "status".into()];
+        let found = literals(r#"cartoons written by "Joseph Kuhr""#, &known);
+        assert_eq!(found, ["Joseph Kuhr", "cartoons", "written"]);
+    }
+}
+
+#[cfg(test)]
+mod name_tests {
+    use super::*;
+
+    /// A word that a column name is built from is naming that column.
+    #[test]
+    fn the_words_of_a_column_name_are_not_values() {
+        let known = [
+            "Templates".to_owned(),
+            "Template_Type_Code".to_owned(),
+            "GovernmentForm".to_owned(),
+        ];
+        assert_eq!(
+            name_parts(&known),
+            [
+                "code",
+                "form",
+                "government",
+                "template",
+                "templates",
+                "type"
+            ]
+        );
+        assert_eq!(
+            literals("How many templates have template type code CV?", &known),
+            ["CV"]
+        );
+        let got = literals("countries with a republic form of government", &known);
+        assert_eq!(got, ["countries", "republic"]);
+        // A verb is never a value, so it never becomes a question either.
+        assert!(literals("which templates do we have", &known).is_empty());
     }
 }
