@@ -1,0 +1,7 @@
+{
+  "source": "labelled",
+  "sql": "SELECT topic, heat, round(newsworthy,2) AS newsworthy, text, uri FROM labelled WHERE newsworthy >= 0.4 AND topic_sure >= 0.7 AND topic IN ('news','technology')",
+  "alert": {
+    "url": "http://127.0.0.1:8099/desk"
+  }
+}

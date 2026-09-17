@@ -1,0 +1,6 @@
+{
+  "source": "sampled",
+  "target": "labelled",
+  "batch_rows": 64,
+  "sql": "SELECT uri, author, posted_at, text, d['topic']['label'] AS topic, d['topic']['confidence'] AS topic_sure, d['heat']['label'] AS heat, d['newsworthy']['value'] AS newsworthy FROM (SELECT uri, author, posted_at, text, decide(text, '{\"topic\":{\"type\":\"choice\",\"instructions\":\"What is this post mainly about?\",\"criteria\":{\"news\":\"Current events, politics, or something that just happened in the world.\",\"technology\":\"Software, hardware, science, or the industry around them.\",\"culture\":\"Art, music, film, books, games, or fandom.\",\"sport\":\"Matches, players, results, or following a team.\",\"personal\":\"The writer''s own day, feelings, work, pets, or family.\",\"other\":\"None of the above, or too short to tell.\"}},\"heat\":{\"type\":\"score\",\"instructions\":\"How heated is the writing, judging by its tone rather than its subject.\",\"criteria\":[\"calm\",\"opinionated\",\"angry\"]},\"newsworthy\":{\"type\":\"noul\",\"instructions\":\"This post reports something that actually happened and that a news desk would want to look into.\"}}') AS d FROM sampled)"
+}

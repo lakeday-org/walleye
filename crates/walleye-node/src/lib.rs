@@ -268,6 +268,7 @@ async fn quorum_state(client: &reqwest::Client, gateway: &str) -> (bool, serde_j
 
 impl Service {
     pub async fn open(config: Config) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
+        use_tls();
         let ring = Arc::new(Membership::new(config.members.clone())?);
         if config.token.len() < 16
             || !ring
@@ -546,6 +547,7 @@ impl Service {
                 HeaderValue::from_str(&value)?,
             );
         }
+        use_tls();
         let (mut stream, _) = tokio_tungstenite::connect_async(request).await?;
         eprintln!("walleye.socket view={name} outcome=open");
         if let Some(opening) = &socket.subscribe {
@@ -712,6 +714,18 @@ impl Service {
         let _ = self.cache.close().await;
     }
 }
+/// Choose the cipher provider once for the process.
+///
+/// A secure socket needs one picked before the first handshake, and rustls
+/// panics rather than erroring when it cannot tell which. Doing it here means
+/// a `wss://` view works without every caller remembering.
+pub fn use_tls() {
+    static TLS: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    TLS.get_or_init(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
 pub fn router(service: Arc<Service>) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
