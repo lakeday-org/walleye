@@ -149,3 +149,93 @@ async fn automatic_memtable_flush_also_releases_covered_payloads() {
     assert_eq!(backend.retained_wal_bytes().await, 0);
     table.close().await.unwrap();
 }
+/// A stream written far below the size threshold releases its covered WAL
+/// prefix anyway, once the memtable's age elapses — no `checkpoint()` call, and
+/// no size trigger to reach. Without the age trigger this stream's WAL grows for
+/// the life of the writer and a successor's open has to replay all of it.
+#[tokio::test]
+async fn a_slow_stream_releases_its_wal_prefix_once_the_memtable_ages() {
+    let d = tempfile::tempdir().unwrap();
+    let (config, backend, schema) = setup(format!("file://{}/table", d.path().display()));
+    let config = config.with_memtable_max_age(std::time::Duration::from_millis(400));
+    let mut table = Table::open(
+        config.clone(),
+        LanceStorageOptions::default(),
+        LanceDurability::Bitr(backend.clone()),
+    )
+    .await
+    .unwrap();
+    // Four tiny rows, written slowly. Nowhere near Table::MEMTABLE_BYTES, so
+    // nothing here can reach the size trigger.
+    for id in 0..4 {
+        table
+            .append(vec![row(schema.clone(), id, "payload")])
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(backend.retained_wal_bytes().await > 0);
+    assert!(table.lsm_stats().await.unwrap().sstables.is_empty());
+    // No further appends and no checkpoint: only the memtable age can release
+    // the prefix from here.
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        while backend.retained_wal_bytes().await > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("an aged memtable must release its covered WAL prefix without an explicit checkpoint");
+    assert_eq!(
+        table
+            .lsm_stats()
+            .await
+            .unwrap()
+            .sstables
+            .iter()
+            .map(|s| s.rows)
+            .sum::<u64>(),
+        4,
+        "the released rows must be durable in a generation, not merely dropped"
+    );
+    // Only what is written after the release is still WAL-resident.
+    table
+        .append(vec![row(schema.clone(), 4, "tail")])
+        .await
+        .unwrap();
+    assert!(backend.retained_wal_bytes().await > 0);
+    // Dropped, not closed: `close` would flush the tail and leave the reopen
+    // below nothing to replay.
+    drop(table);
+    let backend = reopen_backend(&config, &backend).await;
+    let mut reopened = Table::open(
+        config,
+        LanceStorageOptions::default(),
+        LanceDurability::Bitr(backend.clone()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        reopened
+            .lsm_stats()
+            .await
+            .unwrap()
+            .sstables
+            .iter()
+            .map(|s| s.rows)
+            .sum::<u64>(),
+        4,
+        "replay saw only the tail, so it sealed no further generation"
+    );
+    assert_eq!(
+        reopened
+            .scan(None, 100)
+            .await
+            .unwrap()
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum::<usize>(),
+        5,
+        "the generation and the replayed tail together hold every row"
+    );
+    reopened.close().await.unwrap();
+}

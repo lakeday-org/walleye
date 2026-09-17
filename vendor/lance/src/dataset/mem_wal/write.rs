@@ -133,6 +133,28 @@ pub struct ShardWriterConfig {
     /// Default: 8,000 batches
     pub max_memtable_batches: usize,
 
+    /// How long an active MemTable may hold rows before it is rotated —
+    /// frozen, flushed to a generation, and thereby released from the WAL —
+    /// regardless of how few bytes or rows it holds.
+    ///
+    /// This is what bounds WAL replay and WAL retention for a writer whose
+    /// volume never reaches `max_memtable_size`. Without it a slowly-written
+    /// stream never rotates: its WAL grows without bound and a successor's open
+    /// has to replay all of it, and a stream that stops being written holds its
+    /// last memtable — and the WAL prefix that memtable covers — forever.
+    ///
+    /// The clock starts at the first write into an empty active memtable, so an
+    /// idle writer rotates once and then stays quiet. A memtable that a replay
+    /// recovered rows into is dated from the open instead, so a successor that
+    /// replays and then goes quiet still releases the prefix it replayed rather
+    /// than leaving it for the next successor to replay again. Checked both on
+    /// the put path and on a background ticker, since a quiet writer makes no
+    /// puts.
+    ///
+    /// `None` leaves rotation size-driven only.
+    /// Default: 60 seconds
+    pub max_memtable_age: Option<Duration>,
+
     /// Batch size for parallel HEAD requests when scanning for manifest versions.
     ///
     /// Higher values scan faster but use more parallel requests.
@@ -268,6 +290,7 @@ impl Default for ShardWriterConfig {
             max_memtable_size: 256 * 1024 * 1024, // 256MB
             max_memtable_rows: 100_000,           // 100k rows
             max_memtable_batches: 8_000,          // 8k batches
+            max_memtable_age: Some(Duration::from_secs(60)),
             manifest_scan_batch_size: 2,
             max_unflushed_memtable_bytes: 1024 * 1024 * 1024, // 1GB
             backpressure_log_interval: Duration::from_secs(30),
@@ -345,6 +368,14 @@ impl ShardWriterConfig {
     /// Set maximum MemTable batches for batch store pre-allocation.
     pub fn with_max_memtable_batches(mut self, batches: usize) -> Self {
         self.max_memtable_batches = batches;
+        self
+    }
+
+    /// Set how long an active MemTable may hold rows before it rotates
+    /// regardless of size. `None` leaves rotation size-driven only.
+    /// See [`ShardWriterConfig::max_memtable_age`].
+    pub fn with_max_memtable_age(mut self, age: Option<Duration>) -> Self {
+        self.max_memtable_age = age;
         self
     }
 
@@ -859,6 +890,11 @@ struct WriterState {
     frozen_memtables: VecDeque<FrozenMemTable>,
     /// Flag to prevent duplicate memtable flush requests.
     flush_requested: bool,
+    /// When the active memtable first accepted a row, in `now_millis()`. `0`
+    /// means the active memtable is empty — set on the put that makes its batch
+    /// store non-empty, reset by `freeze_memtable` for the replacement. The
+    /// `max_memtable_age` trigger measures from here.
+    memtable_first_write_ms: u64,
     /// Counter for WAL flush threshold crossings.
     wal_flush_trigger_count: usize,
     /// Last time a WAL flush was triggered (for time-based flush).
@@ -1320,6 +1356,9 @@ impl SharedWriterState {
         new_memtable.set_indexes_arc(Arc::new(indexes));
 
         let mut old_memtable = std::mem::replace(&mut state.memtable, new_memtable);
+        // The replacement memtable is empty, so its age clock restarts at its
+        // first write rather than carrying the outgoing memtable's stamp.
+        state.memtable_first_write_ms = 0;
         old_memtable.freeze(last_wal_entry_position);
 
         // Set up completion tracking on the outgoing table before it is retained
@@ -1444,7 +1483,44 @@ impl SharedWriterState {
             state.flush_requested = true;
             self.freeze_memtable(state)?;
             state.flush_requested = false;
+            return Ok(());
         }
+
+        // Age is deliberately not folded into `memtable_reached_flush_threshold`:
+        // that predicate is shared with WAL replay, and replay must stay
+        // size-driven. A replayed WAL is arbitrarily old, so an age term there
+        // would fire on the first entry and rotate once per entry after that.
+        if let Some(age) = self.config.max_memtable_age {
+            self.rotate_if_aged(state, age)?;
+        }
+        Ok(())
+    }
+
+    /// Rotate the active memtable once it has held rows for at least `age`.
+    ///
+    /// The single implementation of the age rule. The put path runs it after the
+    /// size check, and `MemTableAgeHandler` runs it on a ticker — a writer that
+    /// stops writing makes no puts, so without the ticker its last memtable, and
+    /// the WAL prefix that memtable covers, would be held forever.
+    ///
+    /// Does nothing when a flush is already in flight, when the active memtable
+    /// is empty, or when its stamp is absent or younger than `age`. Takes
+    /// `&mut WriterState` directly since the caller already holds the lock.
+    fn rotate_if_aged(&self, state: &mut WriterState, age: Duration) -> Result<()> {
+        if state.flush_requested || state.memtable.batch_store().is_empty() {
+            return Ok(());
+        }
+        let first_write = state.memtable_first_write_ms;
+        if first_write == 0 {
+            return Ok(());
+        }
+        if now_millis().saturating_sub(first_write) < age.as_millis() as u64 {
+            return Ok(());
+        }
+
+        state.flush_requested = true;
+        self.freeze_memtable(state)?;
+        state.flush_requested = false;
         Ok(())
     }
 
@@ -1952,6 +2028,19 @@ impl ShardWriter {
         // means "no entry covered yet."
         let initial_covered_wal_entry_position = next_wal_position.saturating_sub(1);
 
+        // A replay that recovered rows leaves them in the active memtable,
+        // still covered by the WAL prefix they were read from. Date that
+        // memtable from the open so the age rule releases that prefix even if
+        // no further write ever arrives: left unstamped, a successor that
+        // replays and then goes quiet holds the prefix for the life of the
+        // writer, and the next successor replays exactly the same entries. An
+        // empty replay starts unstamped, so its clock begins at the first put.
+        let replayed_at_ms = if memtable.batch_store().is_empty() {
+            0
+        } else {
+            now_millis()
+        };
+
         let state = Arc::new(RwLock::new(WriterState {
             memtable,
             last_flushed_wal_entry_position: initial_covered_wal_entry_position,
@@ -1959,6 +2048,7 @@ impl ShardWriter {
             frozen_flush_watchers: VecDeque::new(),
             frozen_memtables: VecDeque::new(),
             flush_requested: false,
+            memtable_first_write_ms: replayed_at_ms,
             wal_flush_trigger_count: 0,
             last_wal_flush_trigger_time: 0,
         }));
@@ -2030,6 +2120,24 @@ impl ShardWriter {
             config.max_memtable_rows,
             index_configs.to_vec(),
         ));
+
+        // Background memtable-age handler — rotates an active memtable that has
+        // held rows for `max_memtable_age`. Registered after `writer_state`
+        // because it drives the very same rotation the put path drives, through
+        // the same `rotate_if_aged`.
+        let (memtable_age_tx, memtable_age_rx) = mpsc::unbounded_channel();
+        let age_handler = MemTableAgeHandler {
+            state: state.clone(),
+            writer_state: writer_state.clone(),
+            age: config.max_memtable_age,
+            enable_memtable: config.enable_memtable,
+            _tx: memtable_age_tx,
+        };
+        task_executor.add_handler(
+            "memtable_ager".to_string(),
+            Box::new(age_handler),
+            memtable_age_rx,
+        )?;
 
         Ok((
             WriterMode::MemTable {
@@ -2386,6 +2494,13 @@ impl ShardWriter {
             //    jumps past batches that were never appended.
             let batch_store = state.memtable.batch_store();
             let indexes = state.memtable.indexes_arc();
+
+            // Start the active memtable's age clock on the put that first makes
+            // it non-empty. `freeze_memtable` resets it to 0 for the
+            // replacement, so this stamps once per memtable.
+            if state.memtable_first_write_ms == 0 && !batch_store.is_empty() {
+                state.memtable_first_write_ms = now_millis();
+            }
 
             let start_pos = results.first().map(|(pos, _, _)| *pos).unwrap_or(0);
             let end_pos = results.last().map(|(pos, _, _)| pos + 1).unwrap_or(0);
@@ -3559,6 +3674,60 @@ impl WalFlushHandler {
         }
 
         Ok(flush_result)
+    }
+}
+
+/// The only message `MemTableAgeHandler` takes: rotate the active memtable if
+/// it has aged out. Nothing ever sends it — it exists so the handler can carry
+/// a ticker, which is the only thing that reaches a writer making no puts.
+#[derive(Debug)]
+enum TriggerMemTableAge {
+    Rotate,
+}
+
+/// Background handler that rotates an active memtable which has held rows for
+/// `max_memtable_age`.
+///
+/// The put path applies the same rule through the same
+/// [`SharedWriterState::rotate_if_aged`], but only a put can run it. A stream
+/// that stops being written would otherwise hold its last unflushed memtable —
+/// and the WAL prefix that memtable covers — for the life of the writer.
+struct MemTableAgeHandler {
+    state: Arc<RwLock<WriterState>>,
+    writer_state: Arc<SharedWriterState>,
+    /// The configured age. `None` disables the ticker entirely.
+    age: Option<Duration>,
+    /// WAL-only writers have no memtable to rotate.
+    enable_memtable: bool,
+    /// Held only to keep the channel open. Nothing ever sends on it, and a
+    /// channel with no live sender makes the dispatcher's `recv()` return
+    /// `None`, which ends the task — and its ticker with it.
+    _tx: mpsc::UnboundedSender<TriggerMemTableAge>,
+}
+
+#[async_trait]
+impl MessageHandler<TriggerMemTableAge> for MemTableAgeHandler {
+    fn tickers(&mut self) -> Vec<(Duration, MessageFactory<TriggerMemTableAge>)> {
+        if !self.enable_memtable {
+            return vec![];
+        }
+        let Some(age) = self.age else {
+            return vec![];
+        };
+        // Tick at a quarter of the age so a memtable rotates within ~5/4 of it.
+        // Floored so a very short age cannot spin the dispatcher (and cannot
+        // hand tokio a zero interval, which panics).
+        let tick = (age / 4).max(Duration::from_millis(100));
+        vec![(tick, Box::new(|| TriggerMemTableAge::Rotate))]
+    }
+
+    async fn handle(&mut self, message: TriggerMemTableAge) -> Result<()> {
+        let TriggerMemTableAge::Rotate = message;
+        let Some(age) = self.age else {
+            return Ok(());
+        };
+        let mut state = self.state.write().await;
+        self.writer_state.rotate_if_aged(&mut state, age)
     }
 }
 
@@ -5625,6 +5794,364 @@ mod tests {
         );
 
         writer.close().await.unwrap();
+    }
+
+    /// Poll the writer's manifest until it reports a flushed generation.
+    /// `None` on timeout, so the caller can name what failed to happen.
+    async fn wait_for_generation(writer: &ShardWriter, timeout: Duration) -> Option<ShardManifest> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if let Some(manifest) = writer.manifest().await.unwrap()
+                && !manifest.sstables.is_empty()
+            {
+                return Some(manifest);
+            }
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    async fn generation_rows(base_uri: &str, shard_id: Uuid, manifest: &ShardManifest) -> usize {
+        let mut rows = 0;
+        for sstable in &manifest.sstables {
+            let uri = format!("{}/_mem_wal/{}/{}", base_uri, shard_id, sstable.path);
+            rows += crate::Dataset::open(&uri)
+                .await
+                .unwrap()
+                .count_rows(None)
+                .await
+                .unwrap();
+        }
+        rows
+    }
+
+    /// A memtable that never reaches the size trigger still rotates once
+    /// `max_memtable_age` elapses — with no put to drive the check.
+    ///
+    /// This is the idle case, and only the age ticker can serve it: the size
+    /// predicate is evaluated on the put path, so a stream that stops being
+    /// written would otherwise hold its last unflushed memtable — and the WAL
+    /// prefix that memtable covers — for the life of the writer.
+    #[tokio::test]
+    async fn test_idle_memtable_rotates_on_age() {
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let schema = schema_with_pk();
+        let shard_id = Uuid::new_v4();
+
+        let config = ShardWriterConfig {
+            // Orders of magnitude beyond anything written here, so the size
+            // trigger cannot account for any rotation this test observes.
+            max_memtable_size: 64 * 1024 * 1024,
+            max_memtable_age: Some(Duration::from_millis(300)),
+            ..memtable_config_with_pk(shard_id)
+        };
+
+        let writer = ShardWriter::open(
+            store.clone(),
+            base_path.clone(),
+            base_uri.clone(),
+            config.clone(),
+            schema.clone(),
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        for id in 0..4 {
+            writer
+                .put(vec![create_test_batch(&schema, id * 5, 5)])
+                .await
+                .unwrap();
+        }
+        assert_eq!(writer.memtable_stats().await.unwrap().row_count, 20);
+        assert!(
+            writer
+                .manifest()
+                .await
+                .unwrap()
+                .is_none_or(|m| m.sstables.is_empty()),
+            "twenty small rows are nowhere near the size trigger"
+        );
+
+        // Not one put from here on. Only the age ticker can rotate this.
+        let manifest = wait_for_generation(&writer, Duration::from_secs(20))
+            .await
+            .expect("an idle memtable must rotate once max_memtable_age elapses");
+
+        assert_eq!(
+            writer.memtable_stats().await.unwrap().row_count,
+            0,
+            "rotation installs a fresh, empty active memtable"
+        );
+        assert_eq!(
+            generation_rows(&base_uri, shard_id, &manifest).await,
+            20,
+            "every row must land in the flushed generation"
+        );
+        assert!(
+            manifest.replay_after_wal_entry_position > 0,
+            "the flush must advance the manifest's WAL replay cursor past the rotated entries"
+        );
+
+        // Nothing is left in the active memtable, so `close` flushes nothing and
+        // the reopen below measures the rotation alone.
+        writer.close().await.unwrap();
+
+        // The cursor really is past every entry: a reopen replays none of them.
+        let reopened = ShardWriter::open(store, base_path, base_uri, config, schema, vec![])
+            .await
+            .unwrap();
+        assert_eq!(
+            reopened.memtable_stats().await.unwrap().row_count,
+            0,
+            "the released WAL prefix must not be replayed again"
+        );
+        reopened.close().await.unwrap();
+    }
+
+    /// The same writer with the age trigger off holds its rows indefinitely.
+    /// Without this, the test above could be passing on something incidental
+    /// rather than on the trigger it names.
+    #[tokio::test]
+    async fn test_memtable_without_an_age_never_rotates_while_idle() {
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let schema = schema_with_pk();
+        let shard_id = Uuid::new_v4();
+
+        let config = ShardWriterConfig {
+            max_memtable_size: 64 * 1024 * 1024,
+            max_memtable_age: None,
+            ..memtable_config_with_pk(shard_id)
+        };
+
+        let writer = ShardWriter::open(store, base_path, base_uri, config, schema.clone(), vec![])
+            .await
+            .unwrap();
+
+        for id in 0..4 {
+            writer
+                .put(vec![create_test_batch(&schema, id * 5, 5)])
+                .await
+                .unwrap();
+        }
+
+        // Five times the age the companion test rotates within.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+
+        assert_eq!(
+            writer.memtable_stats().await.unwrap().row_count,
+            20,
+            "with no age configured the rows stay in the active memtable"
+        );
+        assert!(
+            writer
+                .manifest()
+                .await
+                .unwrap()
+                .is_none_or(|m| m.sstables.is_empty()),
+            "with no age configured nothing may be flushed to a generation"
+        );
+
+        writer.close().await.unwrap();
+    }
+
+    /// An empty memtable is not aged out. Ticking over an idle, never-written
+    /// writer must cost nothing: no generation, and no manifest commit either —
+    /// a commit is an object-store round trip per tick, forever.
+    #[tokio::test]
+    async fn test_empty_memtable_is_not_rotated_by_the_age_ticker() {
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let schema = schema_with_pk();
+        let shard_id = Uuid::new_v4();
+
+        let config = ShardWriterConfig {
+            max_memtable_age: Some(Duration::from_millis(200)),
+            ..memtable_config_with_pk(shard_id)
+        };
+
+        let writer = ShardWriter::open(store, base_path, base_uri, config, schema, vec![])
+            .await
+            .unwrap();
+
+        let before = writer.manifest().await.unwrap().map(|m| m.version);
+
+        // Six ages, and a dozen ticks, with nothing ever written.
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+
+        let after = writer.manifest().await.unwrap();
+        assert_eq!(
+            after.as_ref().map(|m| m.version),
+            before,
+            "an empty memtable must not commit a manifest on every tick"
+        );
+        assert!(
+            after.is_none_or(|m| m.sstables.is_empty()),
+            "an empty memtable must not be flushed to a generation"
+        );
+
+        writer.close().await.unwrap();
+    }
+
+    /// WAL replay rotates on size, never on age.
+    ///
+    /// The flush predicate is shared between the put path and replay, and the
+    /// age term is deliberately outside it: a WAL is replayed arbitrarily long
+    /// after it was written, so an age term inside would be satisfied by the
+    /// first entry and would then seal a generation per entry for the whole
+    /// replay.
+    #[tokio::test]
+    async fn test_replay_rotates_on_size_not_age() {
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let schema = schema_with_pk();
+        let shard_id = Uuid::new_v4();
+
+        const N: i32 = 8;
+
+        // Writer A ages out nothing and has room for every put, so it leaves an
+        // eight-entry WAL and no generations when dropped without close.
+        let writer_a_config = ShardWriterConfig {
+            max_memtable_age: None,
+            max_memtable_batches: 1000,
+            ..memtable_config_with_pk(shard_id)
+        };
+        {
+            let writer_a = ShardWriter::open(
+                store.clone(),
+                base_path.clone(),
+                base_uri.clone(),
+                writer_a_config,
+                schema.clone(),
+                vec![],
+            )
+            .await
+            .unwrap();
+            for id in 0..N {
+                writer_a
+                    .put(vec![create_test_batch(&schema, id, 1)])
+                    .await
+                    .unwrap();
+            }
+        }
+
+        // Age the WAL well past writer B's trigger before it is replayed.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // Writer B's age is shorter than that WAL is old, and its capacity holds
+        // every entry. Rotation during replay would therefore have to come from
+        // age, and must not.
+        let config = ShardWriterConfig {
+            max_memtable_age: Some(Duration::from_millis(50)),
+            max_memtable_batches: 1000,
+            ..memtable_config_with_pk(shard_id)
+        };
+        let writer_b = ShardWriter::open(store, base_path, base_uri, config, schema, vec![])
+            .await
+            .unwrap();
+
+        // Both assertions read state `open` produced synchronously, before any
+        // ticker could have run.
+        assert!(
+            writer_b
+                .manifest()
+                .await
+                .unwrap()
+                .is_none_or(|m| m.sstables.is_empty()),
+            "replay of an old WAL under the size trigger must seal nothing"
+        );
+        assert_eq!(
+            writer_b.memtable_stats().await.unwrap().row_count as i32,
+            N,
+            "every replayed row belongs to the one active memtable"
+        );
+
+        writer_b.close().await.unwrap();
+    }
+
+    /// A successor that replays rows and then never receives a write must still
+    /// release the WAL prefix it replayed. Left unstamped, that memtable would
+    /// be held for the life of the writer and the next successor would replay
+    /// exactly the same entries — the cost this whole rule exists to bound.
+    #[tokio::test]
+    async fn test_replayed_memtable_rotates_without_a_single_put() {
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let schema = schema_with_pk();
+        let shard_id = Uuid::new_v4();
+
+        const N: i32 = 6;
+
+        // Writer A leaves a six-entry WAL and no generations: dropped, never
+        // closed, and far below every size trigger.
+        let writer_a_config = ShardWriterConfig {
+            max_memtable_size: 64 * 1024 * 1024,
+            max_memtable_age: None,
+            max_memtable_batches: 1000,
+            ..memtable_config_with_pk(shard_id)
+        };
+        {
+            let writer_a = ShardWriter::open(
+                store.clone(),
+                base_path.clone(),
+                base_uri.clone(),
+                writer_a_config,
+                schema.clone(),
+                vec![],
+            )
+            .await
+            .unwrap();
+            for id in 0..N {
+                writer_a
+                    .put(vec![create_test_batch(&schema, id, 1)])
+                    .await
+                    .unwrap();
+            }
+        }
+
+        let config = ShardWriterConfig {
+            max_memtable_size: 64 * 1024 * 1024,
+            max_memtable_age: Some(Duration::from_millis(300)),
+            max_memtable_batches: 1000,
+            ..memtable_config_with_pk(shard_id)
+        };
+        let writer_b = ShardWriter::open(
+            store.clone(),
+            base_path.clone(),
+            base_uri.clone(),
+            config.clone(),
+            schema.clone(),
+            vec![],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            writer_b.memtable_stats().await.unwrap().row_count as i32,
+            N,
+            "the replay must recover every entry into the active memtable"
+        );
+
+        // Not one put on writer B. Only the age rule can rotate this.
+        let manifest = wait_for_generation(&writer_b, Duration::from_secs(20))
+            .await
+            .expect("a replayed memtable must rotate once max_memtable_age elapses");
+        assert_eq!(
+            generation_rows(&base_uri, shard_id, &manifest).await as i32,
+            N,
+            "every replayed row must land in the flushed generation"
+        );
+
+        writer_b.close().await.unwrap();
+
+        // The prefix really was released: a third open replays nothing.
+        let writer_c = ShardWriter::open(store, base_path, base_uri, config, schema, vec![])
+            .await
+            .unwrap();
+        assert_eq!(
+            writer_c.memtable_stats().await.unwrap().row_count,
+            0,
+            "a successor must not replay entries an earlier rotation already covered"
+        );
+        writer_c.close().await.unwrap();
     }
 
     /// The two fields count different things on purpose: bytes drain on flush

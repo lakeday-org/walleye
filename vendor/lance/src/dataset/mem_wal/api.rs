@@ -444,6 +444,12 @@ fn writer_config_to_defaults(config: &ShardWriterConfig) -> HashMap<String, Stri
             config.enable_memtable.to_string(),
         ),
     ]);
+    if let Some(age) = config.max_memtable_age {
+        defaults.insert(
+            "max_memtable_age_ms".to_string(),
+            age.as_millis().to_string(),
+        );
+    }
     if let Some(interval) = config.max_wal_flush_interval {
         defaults.insert(
             "max_wal_flush_interval_ms".to_string(),
