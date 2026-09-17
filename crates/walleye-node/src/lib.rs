@@ -937,6 +937,14 @@ fn write_failure(error: &Error) -> ApiError {
                 "outcome": "unknown",
             })),
         ),
+        // A request that reached the wrong node is not a bad request: the
+        // caller did nothing wrong and the same call to the owner will work.
+        // The LanceDB surface already answers 409 for this; these routes
+        // used to answer 400, which no client retries.
+        _ if error.downcast_ref::<crate::cluster::NotOwner>().is_some() => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": error.to_string()})),
+        ),
         _ => failure(error),
     }
 }

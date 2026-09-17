@@ -965,11 +965,23 @@ impl Engine {
                 Err(error) => error,
             };
             let reason = walleye_lance::writer_fence_reason(&*error);
-            match reason {
-                Some(reason) if attempt == 0 && stream.discard_fenced_writer(reason).await => {
-                    continue;
-                }
-                _ => return Err(error),
+            let Some(reason) = reason.filter(|_| attempt == 0) else {
+                return Err(error);
+            };
+            // A fence means somebody else claimed this stream's writer.
+            // Reopening claims it straight back, because claiming is the only
+            // way an epoch ever moves, so a node that reopens a stream it no
+            // longer owns takes the writer from the node that does. Both then
+            // answer 200 for writes to the same stream while stealing it from
+            // each other, and neither client is told anything is wrong.
+            //
+            // Only a node that still owns the stream may reopen. One that does
+            // not says so, and the owner is named so the caller can go there.
+            if let Some(owner) = self.owner(&stream.definition.name) {
+                return Err(Box::new(NotOwner(owner)));
+            }
+            if !stream.discard_fenced_writer(reason).await {
+                return Err(error);
             }
         }
         unreachable!("the loop returns on both outcomes")
