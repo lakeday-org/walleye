@@ -70,10 +70,30 @@ being gone.
 
 ## Losing a node
 
-With a quorum of two out of three, one node can be down without stopping
-writes. Streams it owned move to their next rendezvous winner for as long as
-it is away, and move back when it returns, because the member list has not
-changed.
+Read this part carefully, because durability and availability come apart here.
+
+**Nothing committed is lost.** A write was acknowledged only once a quorum
+held it, so the two surviving replicas have it and the archive receives it.
+
+**The tables that node owned stop answering.** Membership from
+`WALLEYE_MEMBERS` is static, and a stream's owner is a pure function of its
+name over that list with no liveness in it. A dead node therefore stays the
+owner of its streams. Requests for them are forwarded to it, retried for
+fifteen seconds, and then answered 502. Tables owned by the other two carry on
+untouched.
+
+So a three-node cluster survives losing a node without losing data, and
+without losing service to roughly two thirds of its tables. It is not a
+failover cluster for the remaining third. Plan capacity and expectations on
+that basis, and bring the node back rather than waiting for the cluster to
+route around it.
+
+Ownership does move when membership itself changes, which today means
+Kubernetes EndpointSlice discovery rather than the static list: the ring is
+rebuilt as endpoints come and go, with a warming window during which the
+previous owner still serves. That path is not configured by the environment
+variables above.
 
 Restoring a node that lost its disk is the seeding path above: it reads the
-archive, catches up from its peers, and rejoins.
+archive, catches up from its peers, and rejoins as the owner of the same
+streams it had before, because the list never changed.
