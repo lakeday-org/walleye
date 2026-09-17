@@ -26,9 +26,12 @@ curl -s localhost:8080/readyz  -H "authorization: Bearer $WALLEYE_TOKEN"
 ```
 
 `/healthz` answers as soon as the process can route. `/readyz` reports whether
-writes can be made durable and names which members are serving. On a single
-node the two say the same thing; in a cluster they do not, which is the point
-of having both.
+writes can be made durable. On a single node the two say the same thing; in a
+cluster they do not, which is the point of having both.
+
+Naming which members are serving, and `?require=all`, come from the replica
+gateway, so on a node without `WALLEYE_BITR_URL` there are no members to name
+and `?require=all` asks nothing extra.
 
 ## Connecting
 
