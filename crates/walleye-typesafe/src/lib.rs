@@ -38,10 +38,7 @@ pub enum Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::NoCredentials => write!(
-                f,
-                "no System One API key: set WALLEYE_TYPESAFE_API_KEY or TYPESAFE_API_KEY"
-            ),
+            Self::NoCredentials => write!(f, "no System One API key: set TYPESAFE_API_KEY"),
             Self::Rejected { status, message } => {
                 write!(f, "System One rejected the request ({status}): {message}")
             }
@@ -235,16 +232,20 @@ impl Client {
     /// A client configured from the environment, or `None` when no key is
     /// set. Absence is a configuration state rather than a failure: a
     /// deployment that asks no questions needs no key.
+    ///
+    /// One name for the key, `TYPESAFE_API_KEY`, and no fallback. A second
+    /// name is a second place for a stale value to hide, and a key that
+    /// works on one host and not the next is worse than one that never
+    /// works. `TYPESAFE_URL`, `TYPESAFE_MODEL` and `TYPESAFE_CONCURRENCY`
+    /// adjust the rest.
     pub fn from_env() -> Option<Self> {
-        let key = std::env::var("WALLEYE_TYPESAFE_API_KEY")
-            .or_else(|_| std::env::var("TYPESAFE_API_KEY"))
+        let key = std::env::var("TYPESAFE_API_KEY")
             .ok()
             .filter(|key| !key.trim().is_empty())?;
         let endpoint =
-            std::env::var("WALLEYE_TYPESAFE_URL").unwrap_or_else(|_| DEFAULT_ENDPOINT.to_owned());
-        let model =
-            std::env::var("WALLEYE_TYPESAFE_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_owned());
-        let concurrency = std::env::var("WALLEYE_TYPESAFE_CONCURRENCY")
+            std::env::var("TYPESAFE_URL").unwrap_or_else(|_| DEFAULT_ENDPOINT.to_owned());
+        let model = std::env::var("TYPESAFE_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_owned());
+        let concurrency = std::env::var("TYPESAFE_CONCURRENCY")
             .ok()
             .and_then(|value| value.parse().ok())
             .filter(|value| *value > 0)

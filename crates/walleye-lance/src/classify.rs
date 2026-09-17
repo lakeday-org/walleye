@@ -129,7 +129,7 @@ fn decisions_for(
 ) -> DfResult<Vec<Option<std::sync::Arc<walleye_typesafe::Decision>>>> {
     let Some(client) = client() else {
         return Err(execution(format!(
-            "{function} needs a decision service: set WALLEYE_TYPESAFE_API_KEY"
+            "{function} needs a decision service: set TYPESAFE_API_KEY"
         )));
     };
     let mut distinct: Vec<String> = Vec::new();

@@ -21,9 +21,7 @@ const ARROW: &str = "application/vnd.apache.arrow.stream";
 const JSON: &str = "application/json";
 
 fn keyed() -> bool {
-    ["WALLEYE_TYPESAFE_API_KEY", "TYPESAFE_API_KEY"]
-        .iter()
-        .any(|name| std::env::var(name).is_ok_and(|key| !key.trim().is_empty()))
+    std::env::var("TYPESAFE_API_KEY").is_ok_and(|key| !key.trim().is_empty())
 }
 
 fn config(path: &std::path::Path) -> Config {
