@@ -3,6 +3,7 @@ pub mod cluster;
 mod engine;
 mod lancedb;
 mod processor;
+pub mod reach;
 pub use processor::ProcessorConfig;
 pub mod kubernetes;
 use axum::{
@@ -431,14 +432,20 @@ impl Service {
                 if let Some(engine) = &self.engine {
                     for (name, outcome) in engine.advance_views(64).await {
                         match outcome {
-                            Ok(progress) if progress.rows > 0 => eprintln!(
-                                "walleye.view view={name} rows={} written={} delivered={} \
-                                 through={}",
-                                progress.rows,
-                                progress.written,
-                                progress.delivered,
-                                progress.through
-                            ),
+                            Ok(progress)
+                                if progress.rows > 0
+                                    || progress.written > 0
+                                    || progress.delivered > 0 =>
+                            {
+                                eprintln!(
+                                    "walleye.view view={name} rows={} written={} \
+                                     delivered={} through={}",
+                                    progress.rows,
+                                    progress.written,
+                                    progress.delivered,
+                                    progress.through
+                                )
+                            }
                             Ok(_) => {}
                             Err(error) => {
                                 eprintln!("walleye.view view={name} outcome=error error={error}")

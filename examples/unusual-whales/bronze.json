@@ -1,0 +1,6 @@
+{
+  "every_seconds": 60,
+  "target": "bronze",
+  "worker": "export default (rows, ctx) => {\n  const answer = ctx.call({\n    url: 'https://api.unusualwhales.com/api/option-trades/flow-alerts?limit=100',\n    headers: { Authorization: 'Bearer {{env:UNUSUAL_WHALES_API_KEY}}', Accept: 'application/json' }\n  });\n  if (answer.status !== 200) throw new Error('unusual whales said ' + answer.status);\n  return JSON.parse(answer.body).data.map((a) => ({\n    alert_id: String(a.id ?? ''),\n    ticker: String(a.ticker ?? ''),\n    kind: String(a.type ?? ''),\n    strike: String(a.strike ?? ''),\n    expiry: String(a.expiry ?? ''),\n    premium: String(a.total_premium ?? '0'),\n    ask_side_premium: String(a.total_ask_side_prem ?? '0'),\n    bid_side_premium: String(a.total_bid_side_prem ?? '0'),\n    volume_oi_ratio: String(a.volume_oi_ratio ?? '0'),\n    alert_rule: String(a.alert_rule ?? ''),\n    sweep: a.has_sweep ? 'yes' : 'no',\n    underlying_price: String(a.underlying_price ?? '0'),\n    observed_at: String(a.created_at ?? '')\n  }));\n}",
+  "worker_seconds": 30
+}

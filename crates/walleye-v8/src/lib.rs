@@ -67,6 +67,25 @@ pub struct Outcome {
 #[derive(Default)]
 struct Written(std::sync::Mutex<Vec<(String, String)>>);
 
+/// The one way out of an isolate.
+///
+/// A worker cannot open a socket, read a file, or name a host. It hands the
+/// host a request as text and gets an answer as text, and the host decides
+/// what that request is allowed to be. Keeping the crossing this narrow is
+/// what makes the capability auditable: there is one function to review.
+pub trait Host: Send + Sync {
+    /// Answer one request, or say why not. Both are JSON.
+    fn call(&self, request: &str) -> Result<String, String>;
+}
+/// A host that refuses everything, for a deployment that grants no reach.
+pub struct Sealed;
+impl Host for Sealed {
+    fn call(&self, _request: &str) -> Result<String, String> {
+        Err("this worker has no host access".into())
+    }
+}
+struct Reach(std::sync::Arc<dyn Host>);
+
 #[derive(Debug)]
 pub enum Error {
     /// The worker could not be compiled, or is not shaped like a worker.
@@ -172,10 +191,21 @@ impl Drop for Deadline {
 /// This blocks the calling thread for as long as the worker runs, so call it
 /// from a thread that is allowed to block.
 pub fn run(worker: &str, rows: &str, limits: Limits) -> Result<Outcome, Error> {
+    run_with_host(worker, rows, limits, std::sync::Arc::new(Sealed))
+}
+
+/// Run a worker that may reach the host it was given.
+pub fn run_with_host(
+    worker: &str,
+    rows: &str,
+    limits: Limits,
+    host: std::sync::Arc<dyn Host>,
+) -> Result<Outcome, Error> {
     start();
     let heap = limits.heap_bytes.max(8 * 1024 * 1024);
     let mut isolate = v8::Isolate::new(v8::CreateParams::default().heap_limits(0, heap));
     isolate.set_slot(std::sync::Arc::new(Written::default()));
+    isolate.set_slot(Reach(host));
 
     // Running out of heap has to stop the worker, not grow the host. The
     // small grant is headroom for V8 to unwind in; returning a bigger limit
@@ -269,6 +299,43 @@ fn write_callback(
     }
 }
 
+/// `ctx.call(request)` from inside a worker: one request out, one answer
+/// back, both JSON. A refusal becomes an exception the worker can catch.
+fn call_callback(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue,
+) {
+    let throw = |scope: &mut v8::PinScope<'_, '_>, message: &str| {
+        if let Some(message) = v8::String::new(scope, message) {
+            let exception = v8::Exception::error(scope, message);
+            scope.throw_exception(exception);
+        }
+    };
+    let request = args.get(0);
+    let request = if request.is_string() {
+        request.to_rust_string_lossy(scope)
+    } else {
+        match v8::json::stringify(scope, request) {
+            Some(json) => json.to_rust_string_lossy(scope),
+            None => return throw(scope, "that request cannot be sent"),
+        }
+    };
+    let Some(reach) = scope.get_slot::<Reach>().map(|reach| reach.0.clone()) else {
+        return throw(scope, "this worker has no host access");
+    };
+    match reach.call(&request) {
+        Ok(answer) => match v8::String::new(scope, &answer) {
+            Some(answer) => match v8::json::parse(scope, answer) {
+                Some(value) => rv.set(value),
+                None => throw(scope, "the host answered with something unreadable"),
+            },
+            None => throw(scope, "the host answered with more than fits"),
+        },
+        Err(refused) => throw(scope, &refused),
+    }
+}
+
 fn evaluate(isolate: &mut v8::Isolate, worker: &str, rows: &str) -> Result<Outcome, Error> {
     v8::scope!(let scope, isolate);
     let context = v8::Context::new(scope, Default::default());
@@ -333,6 +400,12 @@ fn evaluate(isolate: &mut v8::Isolate, worker: &str, rows: &str) -> Result<Outco
     let write = v8::Function::new(scope, write_callback)
         .ok_or_else(|| Error::Invalid("the runtime could not be prepared".into()))?;
     if context_object.set(scope, write_key.into(), write.into()) != Some(true) {
+        return Err(Error::Invalid("the runtime could not be prepared".into()));
+    }
+    let call_key = v8::String::new(scope, "call").expect("a short name");
+    let call = v8::Function::new(scope, call_callback)
+        .ok_or_else(|| Error::Invalid("the runtime could not be prepared".into()))?;
+    if context_object.set(scope, call_key.into(), call.into()) != Some(true) {
         return Err(Error::Invalid("the runtime could not be prepared".into()));
     }
     let receiver = v8::undefined(scope);

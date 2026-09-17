@@ -581,3 +581,122 @@ async fn a_worker_may_not_write_into_its_own_source() {
     assert_ne!(status, StatusCode::OK, "a worker that eats its own output");
     assert!(body.to_string().contains("own source"), "{body}");
 }
+
+/// Ingest written as a worker. No source stream, no external script: the view
+/// runs on a clock, the worker goes and gets its rows, and writes them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_worker_fetches_its_own_rows_on_a_schedule() {
+    // An upstream the worker will call.
+    let served = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&served);
+    let upstream = axum::Router::new().route(
+        "/readings",
+        axum::routing::get(move || {
+            let counted = Arc::clone(&counted);
+            async move {
+                let n = counted.fetch_add(1, Ordering::SeqCst);
+                axum::Json(json!({"data": [
+                    {"sensor": format!("s{n}"), "celsius": 20.0 + n as f64}
+                ]}))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, upstream).await;
+    });
+
+    // SAFETY: set before the service that reads it starts.
+    unsafe { std::env::set_var("WALLEYE_WORKER_FETCH_ALLOW", "127.0.0.1") };
+    let d = tempfile::tempdir().unwrap();
+    let app = router(
+        Service::open(sized(d.path(), 2048 * 1024 * 1024))
+            .await
+            .unwrap(),
+    );
+
+    defined(
+        &app,
+        "poller",
+        json!({
+            "every_seconds": 1,
+            "target": "readings",
+            "worker": format!(
+                "export default (rows, ctx) => {{\
+                   const answer = ctx.call({{ url: 'http://{address}/readings' }});\
+                   if (answer.status !== 200) throw new Error('upstream said ' + answer.status);\
+                   const body = JSON.parse(answer.body);\
+                   return body.data.map(r => ({{ sensor: r.sensor, celsius: r.celsius }}));\
+                 }}"
+            )
+        }),
+    )
+    .await;
+
+    let first = refresh(&app, "poller").await;
+    assert_eq!(first["written"], 1, "the worker fetched and wrote: {first}");
+
+    // Too soon: the view runs on its own clock, not on demand.
+    let soon = refresh(&app, "poller").await;
+    assert_eq!(soon["written"], 0, "not due yet: {soon}");
+
+    // Once the interval passes it runs again. Whether this call or the node's
+    // own driver gets there first does not matter, and asserting on which one
+    // did would be asserting on a race.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut got: Vec<String> = Vec::new();
+    while std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let _ = refresh(&app, "poller").await;
+        let rows = sql(&app, "SELECT sensor FROM readings ORDER BY sensor").await;
+        got = rows
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["sensor"].as_str().unwrap().to_owned())
+            .collect();
+        if got.len() >= 2 {
+            break;
+        }
+    }
+    assert!(
+        got.len() >= 2,
+        "it polled again on its own clock, got {got:?}"
+    );
+    assert_eq!(got[0], "s0", "and kept what it had: {got:?}");
+    unsafe { std::env::remove_var("WALLEYE_WORKER_FETCH_ALLOW") };
+}
+
+/// Reaching out is a capability, not a default. A host nobody allowed is
+/// refused by name, inside the worker, where it can be caught.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_worker_may_not_call_a_host_nobody_allowed() {
+    let d = tempfile::tempdir().unwrap();
+    let app = seeded(d.path(), &["a"], &[1.0]).await;
+    defined(
+        &app,
+        "sneaky",
+        json!({
+            "source": "raw",
+            "target": "out",
+            "worker": "export default (rows, ctx) => {\
+                 try { ctx.call({ url: 'https://example.invalid/steal' }); }\
+                 catch (e) { return [{ sensor: 'refused', celsius: 0, why: String(e.message) }]; }\
+                 return [{ sensor: 'reached', celsius: 0, why: 'no' }];\
+               }"
+        }),
+    )
+    .await;
+    refresh(&app, "sneaky").await;
+    let rows = sql(&app, "SELECT sensor, why FROM out").await;
+    let row = &rows.as_array().unwrap()[0];
+    assert_eq!(row["sensor"], "refused", "{rows}");
+    assert!(
+        row["why"]
+            .as_str()
+            .unwrap()
+            .contains("WALLEYE_WORKER_FETCH_ALLOW"),
+        "it names how to allow it: {rows}"
+    );
+}

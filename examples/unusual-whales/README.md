@@ -3,7 +3,7 @@
 Four tiers, declared once, driven by the node. Nothing here calls refresh.
 
 ```
-bronze   what the provider sent, strings and all
+bronze   a worker fetches the flow on a clock and writes what arrived
 silver   a JavaScript worker turns those strings into numbers and writes
          one sentence describing each print
 gold     every print is labelled: direction, conviction, urgency, and how
@@ -14,20 +14,46 @@ desk     the few worth interrupting somebody for, posted to an endpoint
 ## Running it
 
 ```sh
-export UNUSUAL_WHALES_API_KEY=...     # option flow
+export UNUSUAL_WHALES_API_KEY=...     # the node holds this; no worker sees it
 export TYPESAFE_API_KEY=...           # the labelling model
 export WALLEYE_TOKEN=flow-demo-token-000
+export WALLEYE_WORKER_FETCH_ALLOW=unusualwhales.com
 
 walleye-node &                        # WALLEYE_ROOT_URI, WALLEYE_DIR as usual
-./pipeline.sh 100
+./pipeline.sh
 ```
+
+Nothing outside the node fetches anything. The script posts four view
+definitions and stops.
 
 ## What each tier is
 
-**bronze** is a plain stream. Premium, strike and ratios arrive as text because
-that is how the provider sends them, and bronze is supposed to be what actually
-arrived. It is keyed on the provider's own alert id, so pulling the same window
-twice does not duplicate anything.
+**bronze** is a worker with no source. A view with no source runs on a clock
+rather than on arriving rows, and this one goes and gets its own:
+
+```js
+export default (rows, ctx) => {
+  const answer = ctx.call({
+    url: 'https://api.unusualwhales.com/api/option-trades/flow-alerts?limit=100',
+    headers: { Authorization: 'Bearer {{env:UNUSUAL_WHALES_API_KEY}}',
+               Accept: 'application/json' }
+  });
+  if (answer.status !== 200) throw new Error('unusual whales said ' + answer.status);
+  return JSON.parse(answer.body).data.map((a) => ({ /* ...as it arrived... */ }));
+}
+```
+
+Two things about that call. The host only permits a host named in
+`WALLEYE_WORKER_FETCH_ALLOW`, and the default is none, so reaching out is a
+decision somebody made rather than something a worker can assume. And
+`{{env:...}}` is filled in by the node at the moment of the call, so the key is
+not in the worker, not in the stored view definition, and not in anything a
+query can read.
+
+Premium, strike and ratios stay as text because that is how the provider sends
+them. Bronze is supposed to be what actually arrived. It is keyed on the
+provider's own alert id, so polling the same window twice writes nothing the
+second time.
 
 **silver** is a worker. Converting a dozen string fields to numbers and
 composing a sentence is the kind of work that is tedious in SQL and ordinary in
