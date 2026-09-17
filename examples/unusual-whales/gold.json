@@ -1,0 +1,5 @@
+{
+  "source": "silver_flow",
+  "target": "gold_labelled",
+  "sql": "SELECT ticker, kind, premium, summary, d['stance']['label'] AS stance, d['stance']['confidence'] AS stance_sure, d['conviction']['label'] AS conviction, d['urgent']['value'] AS urgency FROM (SELECT ticker, kind, premium, summary, decide(summary, '{\"stance\":{\"type\":\"choice\",\"instructions\":\"Which way is this options print leaning?\",\"criteria\":{\"bullish\":\"Calls bought on the ask, or puts sold on the bid. The buyer wants the underlying higher.\",\"bearish\":\"Puts bought on the ask, or calls sold on the bid. The buyer wants the underlying lower.\",\"neutral\":\"Hedging, spreads, or a print with no clear directional intent.\"}},\"conviction\":{\"type\":\"score\",\"instructions\":\"How much conviction does this single print show, judging by premium, volume against open interest, and whether it swept.\",\"criteria\":[\"routine\",\"notable\",\"aggressive\"]},\"urgent\":{\"type\":\"noul\",\"instructions\":\"A trader watching this name should be told about this print right now.\"}}') AS d FROM silver_flow)"
+}

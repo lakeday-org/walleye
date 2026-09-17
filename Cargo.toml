@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/walleye-workload", "crates/walleye-node", "crates/walleye-ring", "crates/walleye-bitr", "crates/walleye-bitr-server", "crates/walleye-cache", "crates/walleye-lance"]
+members = ["crates/walleye-v8", "crates/walleye-typesafe", "crates/walleye-workload", "crates/walleye-node", "crates/walleye-ring", "crates/walleye-bitr", "crates/walleye-bitr-server", "crates/walleye-cache", "crates/walleye-lance"]
 exclude = ["vendor/lance", "vendor/datafusion-execution"]
 
 [workspace.package]
@@ -12,8 +12,10 @@ publish = false
 
 [workspace.dependencies]
 arrow-array = "58"
+arrow-cast = "58"
 arrow-ipc = "58"
 arrow-schema = "58"
+v8 = "152.1"
 uuid = { version = "1.18", features = ["serde", "v4", "v5", "v7"] }
 axum = "0.8.8"
 bytes = "1.12.0"
@@ -32,6 +34,8 @@ hex = "0.4.3"
 tempfile = "3.20.0"
 thiserror = "2.0.18"
 chrono = "0.4.44"
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+tokio-tungstenite = { version = "0.28", default-features = false, features = ["rustls-tls-webpki-roots", "connect", "handshake"] }
 tokio = { version = "1.49.0", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 xxhash-rust = { version = "0.8.16", features = ["xxh3"] }
 tracing = "0.1.44"

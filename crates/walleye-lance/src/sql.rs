@@ -24,10 +24,14 @@ fn context(storage: &LanceStorageOptions) -> lance::Result<SessionContext> {
             .build_arc()
             .map_err(err)?,
     };
-    Ok(SessionContext::new_with_config_rt(
+    let context = SessionContext::new_with_config_rt(
         SessionConfig::new().with_target_partitions(storage.query_partitions()),
         runtime,
-    ))
+    );
+    // Typed decisions are ordinary functions to a query, so they are added
+    // wherever a session is built rather than only on one path.
+    crate::classify::register(&context);
+    Ok(context)
 }
 fn err(e: impl std::fmt::Display) -> lance::Error {
     lance::Error::io(e.to_string())

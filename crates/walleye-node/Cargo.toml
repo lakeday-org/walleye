@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+rustls.workspace = true
+tokio-tungstenite.workspace = true
+walleye-v8 = { path = "../walleye-v8" }
 async-trait.workspace = true
 walleye-cache.workspace = true
 walleye-lance.workspace = true
@@ -33,6 +36,8 @@ uuid.workspace = true
 lance-core = "=11.0.0"
 
 [dev-dependencies]
+futures.workspace = true
+tokio-tungstenite.workspace = true
 tempfile.workspace = true
 tower.workspace = true
 arrow-ipc.workspace = true

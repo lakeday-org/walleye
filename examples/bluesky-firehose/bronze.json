@@ -1,0 +1,10 @@
+{
+  "websocket": {
+    "url": "wss://jetstream2.us-east.bsky.network/subscribe?wantedCollections=app.bsky.feed.post",
+    "frames": 400,
+    "window_ms": 2000
+  },
+  "target": "posts",
+  "worker": "export default (rows) => rows.flatMap((r) => {\n  let event;\n  try { event = JSON.parse(r.data); } catch { return []; }\n  const commit = event.commit;\n  if (!commit || commit.operation !== 'create') return [];\n  if (commit.collection !== 'app.bsky.feed.post') return [];\n  const record = commit.record || {};\n  const text = typeof record.text === 'string' ? record.text.trim() : '';\n  if (!text) return [];\n  return [{\n    uri: event.did + '/' + commit.rkey,\n    author: event.did,\n    lang: (record.langs && record.langs[0]) || '',\n    text,\n    posted_at: record.createdAt || '',\n    at_us: String(event.time_us || '')\n  }];\n})",
+  "worker_seconds": 20
+}

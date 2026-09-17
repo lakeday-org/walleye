@@ -1,0 +1,5 @@
+{
+  "source": "bronze",
+  "target": "silver_flow",
+  "worker": "export default (rows) => rows.map((r) => {\n  const premium = Number(r.premium);\n  const ask = Number(r.ask_side_premium);\n  const bid = Number(r.bid_side_premium);\n  const side = ask > bid ? 'ask' : bid > ask ? 'bid' : 'mixed';\n  const ratio = Number(r.volume_oi_ratio);\n  const money = Math.round(premium).toLocaleString('en-US');\n  return {\n    ticker: r.ticker,\n    kind: r.kind,\n    strike: r.strike,\n    expiry: r.expiry,\n    premium,\n    side,\n    volume_oi: ratio,\n    observed_at: r.observed_at,\n    summary:\n      `${r.ticker} ${r.kind} $${r.strike} expiring ${r.expiry}: ` +\n      `$${money} of premium, filled on the ${side} side, ` +\n      `volume is ${ratio.toFixed(2)} of open interest, ` +\n      `rule ${r.alert_rule}` +\n      (r.sweep === 'yes' ? ', swept across exchanges' : '')\n  };\n})"
+}

@@ -39,6 +39,18 @@ pub fn routes() -> Router<Arc<Service>> {
         .route("/v1/table/{name}/compact_lsm/", post(compact_lsm))
         .route("/v1/table/{name}/flush_lsm/", post(flush_lsm))
         .route("/v1/table/{name}/get_lsm_stats/", post(lsm_stats))
+        .route("/v1/view/", get(list_views))
+        .route("/v1/view/{name}/create/", post(create_view))
+        .route("/v1/view/{name}/describe/", post(describe_view))
+        .route("/v1/view/{name}/drop/", post(drop_view))
+        .route("/v1/view/{name}/refresh/", post(refresh_view))
+        .route(
+            "/v1/worker/{name}/",
+            get(worker_request)
+                .post(worker_request)
+                .put(worker_request)
+                .delete(worker_request),
+        )
         .layer(DefaultBodyLimit::max(512 * 1024 * 1024))
 }
 
@@ -519,4 +531,149 @@ async fn lsm_stats(State(s): State<Arc<Service>>, Path(name): Path<String>, h: H
         .await
         .map_err(|e| error(e.as_ref()))?;
     Ok(Json(serde_json::to_value(stats).map_err(|e| bad(e.to_string()))?).into_response())
+}
+
+/// How far to drive a view in one request. A refresh does bounded work so a
+/// call cannot run away; a caller that wants a tier fully caught up asks
+/// again until it reports nothing left.
+#[derive(Deserialize)]
+struct Passes {
+    #[serde(default)]
+    passes: Option<usize>,
+}
+
+async fn list_views(State(s): State<Arc<Service>>, h: HeaderMap) -> Reply {
+    let engine = engine(&s, &h)?;
+    let names = engine.view_names().await.map_err(|e| error(e.as_ref()))?;
+    Ok(Json(serde_json::json!({ "views": names })).into_response())
+}
+
+async fn create_view(
+    State(s): State<Arc<Service>>,
+    Path(name): Path<String>,
+    h: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Reply {
+    let engine = writable_engine(&s, &h)?;
+    let mut view: engine::ViewDefinition = serde_json::from_value(
+        // The name lives in the path, so a body that repeats it is accepted
+        // and a body that omits it is too.
+        match body {
+            serde_json::Value::Object(mut fields) => {
+                fields.insert("name".into(), serde_json::Value::String(name.clone()));
+                serde_json::Value::Object(fields)
+            }
+            other => other,
+        },
+    )
+    .map_err(|e| bad(e.to_string()))?;
+    view.name = name;
+    engine
+        .define_view(view)
+        .await
+        .map_err(|e| error(e.as_ref()))?;
+    Ok(Json(serde_json::json!({ "created": true })).into_response())
+}
+
+async fn describe_view(
+    State(s): State<Arc<Service>>,
+    Path(name): Path<String>,
+    h: HeaderMap,
+) -> Reply {
+    let engine = engine(&s, &h)?;
+    let view = engine.view(&name).await.map_err(|e| error(e.as_ref()))?;
+    let cursor = engine
+        .cursor(&format!("view:{name}"))
+        .await
+        .map_err(|e| error(e.as_ref()))?;
+    let mut described = serde_json::to_value(&view).map_err(|e| bad(e.to_string()))?;
+    if let Some(fields) = described.as_object_mut() {
+        fields.insert("cursor".into(), serde_json::json!(cursor));
+    }
+    Ok(Json(described).into_response())
+}
+
+async fn drop_view(State(s): State<Arc<Service>>, Path(name): Path<String>, h: HeaderMap) -> Reply {
+    let engine = writable_engine(&s, &h)?;
+    engine
+        .drop_view(&name)
+        .await
+        .map_err(|e| error(e.as_ref()))?;
+    Ok(Json(serde_json::json!({ "dropped": true })).into_response())
+}
+
+async fn refresh_view(
+    State(s): State<Arc<Service>>,
+    Path(name): Path<String>,
+    h: HeaderMap,
+    passes: Query<Passes>,
+) -> Reply {
+    let engine = writable_engine(&s, &h)?;
+    let progress = engine
+        .drain_view(&name, passes.passes.unwrap_or(1))
+        .await
+        .map_err(|e| write_error(e.as_ref()))?;
+    let mut revision = s.revision.lock().await;
+    *revision = format!("\"{}\"", uuid::Uuid::new_v4());
+    Ok(Json(serde_json::to_value(progress).map_err(|e| bad(e.to_string()))?).into_response())
+}
+
+/// Hand an inbound request to a view's worker.
+///
+/// The worker sees the method, the headers and the body, and answers with a
+/// status, headers and a body of its own. Anything it wrote is durable before
+/// this returns, so a webhook that acknowledges has already stored what it
+/// acknowledged.
+async fn worker_request(
+    State(s): State<Arc<Service>>,
+    Path(name): Path<String>,
+    method: axum::http::Method,
+    h: HeaderMap,
+    body: Bytes,
+) -> Reply {
+    let engine = writable_engine(&s, &h)?;
+    let headers: std::collections::HashMap<String, String> = h
+        .iter()
+        // The deployment token is the node's business, not the worker's.
+        .filter(|(name, _)| !matches!(name.as_str(), "authorization" | "x-api-key" | "cookie"))
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|value| (name.as_str().to_owned(), value.to_owned()))
+        })
+        .collect();
+    let request = serde_json::json!({
+        "method": method.as_str(),
+        "headers": headers,
+        "body": String::from_utf8_lossy(&body),
+    });
+    let answered = engine
+        .handle_request(&name, request)
+        .await
+        .map_err(|e| write_error(e.as_ref()))?;
+
+    let status = answered
+        .get("status")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|status| u16::try_from(status).ok())
+        .and_then(|status| StatusCode::from_u16(status).ok())
+        .unwrap_or(StatusCode::OK);
+    let mut response = match answered.get("body") {
+        Some(serde_json::Value::String(text)) => text.clone().into_response(),
+        Some(other) => Json(other.clone()).into_response(),
+        None => ().into_response(),
+    };
+    *response.status_mut() = status;
+    if let Some(serde_json::Value::Object(fields)) = answered.get("headers") {
+        for (name, value) in fields {
+            if let (Ok(name), Some(value)) = (
+                axum::http::HeaderName::try_from(name.as_str()),
+                value.as_str().and_then(|v| v.parse().ok()),
+            ) {
+                response.headers_mut().insert(name, value);
+            }
+        }
+    }
+    Ok(response)
 }

@@ -1,8 +1,10 @@
 //! Single-deployment stream API, Foyer peer service, and Bitr node composition.
 pub mod cluster;
+pub mod cron;
 mod engine;
 mod lancedb;
 mod processor;
+pub mod reach;
 pub use processor::ProcessorConfig;
 pub mod kubernetes;
 use axum::{
@@ -266,6 +268,7 @@ async fn quorum_state(client: &reqwest::Client, gateway: &str) -> (bool, serde_j
 
 impl Service {
     pub async fn open(config: Config) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
+        use_tls();
         let ring = Arc::new(Membership::new(config.members.clone())?);
         if config.token.len() < 16
             || !ring
@@ -360,6 +363,8 @@ impl Service {
         // readiness is established and then kept current.
         service.clone().spawn_disk_sampler();
         service.clone().spawn_idle_sweeper();
+        service.clone().spawn_view_driver();
+        service.clone().spawn_socket_driver();
         service.clone().spawn_readiness();
         Ok(service)
     }
@@ -404,6 +409,192 @@ impl Service {
                 }
             }
         });
+    }
+
+    /// Keep every view this node owns caught up, without anybody asking.
+    ///
+    /// The loop advances views until a whole pass moves nothing, then waits
+    /// to be woken by an append or by a slow tick. A pipeline is therefore
+    /// idle when its sources are idle: there is no timer ticking over an
+    /// empty stream, and no refresh anyone has to remember to call.
+    fn spawn_view_driver(self: Arc<Self>) {
+        tokio::spawn(async move {
+            // A first pass on boot catches up anything that arrived while the
+            // node was down.
+            let idle = std::time::Duration::from_secs(
+                std::env::var("WALLEYE_VIEW_IDLE_SECONDS")
+                    .ok()
+                    .and_then(|value| value.parse().ok())
+                    .filter(|value| *value > 0)
+                    .unwrap_or(30),
+            );
+            loop {
+                if self.quiescing.load(Ordering::Acquire) {
+                    return;
+                }
+                if let Some(engine) = &self.engine {
+                    for (name, outcome) in engine.advance_views(64).await {
+                        match outcome {
+                            Ok(progress)
+                                if progress.rows > 0
+                                    || progress.written > 0
+                                    || progress.delivered > 0 =>
+                            {
+                                eprintln!(
+                                    "walleye.view view={name} rows={} written={} \
+                                     delivered={} through={}",
+                                    progress.rows,
+                                    progress.written,
+                                    progress.delivered,
+                                    progress.through
+                                )
+                            }
+                            Ok(_) => {}
+                            Err(error) => {
+                                eprintln!("walleye.view view={name} outcome=error error={error}")
+                            }
+                        }
+                    }
+                }
+                // Woken by a write, or by the tick that covers a write this
+                // node did not see.
+                tokio::select! {
+                    _ = self.changed.notified() => {}
+                    _ = tokio::time::sleep(idle) => {}
+                }
+            }
+        });
+    }
+
+    /// Hold open a socket for every view that names one, and hand what
+    /// arrives to that view's worker.
+    ///
+    /// The connection lives here rather than in the isolate, because an
+    /// isolate is a bounded turn and a socket is not. A worker stays a
+    /// stoppable batch of frames while the stream itself keeps running, and
+    /// a worker that fails costs its batch rather than the connection.
+    fn spawn_socket_driver(self: Arc<Self>) {
+        tokio::spawn(async move {
+            let mut held: std::collections::HashSet<String> = std::collections::HashSet::new();
+            loop {
+                if self.quiescing.load(Ordering::Acquire) {
+                    return;
+                }
+                if let Some(engine) = &self.engine {
+                    for name in engine.view_names().await.unwrap_or_default() {
+                        if held.contains(&name) {
+                            continue;
+                        }
+                        let Ok(view) = engine.view(&name).await else {
+                            continue;
+                        };
+                        let Some(socket) = view.websocket.clone() else {
+                            continue;
+                        };
+                        held.insert(name.clone());
+                        tokio::spawn(Arc::clone(&self).hold_socket(name, socket));
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+        });
+    }
+
+    /// One socket, reconnected for as long as the view exists.
+    async fn hold_socket(self: Arc<Self>, name: String, socket: engine::Socket) {
+        let mut backoff = std::time::Duration::from_secs(1);
+        loop {
+            if self.quiescing.load(Ordering::Acquire) {
+                return;
+            }
+            // A view that has been dropped takes its socket with it.
+            let Some(engine) = &self.engine else { return };
+            if engine.view(&name).await.is_err() {
+                eprintln!("walleye.socket view={name} outcome=gone");
+                return;
+            }
+            match self.read_socket(&name, &socket).await {
+                Ok(frames) => {
+                    eprintln!("walleye.socket view={name} outcome=closed frames={frames}");
+                    backoff = std::time::Duration::from_secs(1);
+                }
+                Err(error) => {
+                    eprintln!("walleye.socket view={name} outcome=error error={error}");
+                }
+            }
+            tokio::time::sleep(backoff).await;
+            // Back off to a minute, so a socket that refuses is not hammered.
+            backoff = (backoff * 2).min(std::time::Duration::from_secs(60));
+        }
+    }
+
+    /// Connect once and read until the far end stops. Returns how many frames
+    /// were handled.
+    async fn read_socket(
+        &self,
+        name: &str,
+        socket: &engine::Socket,
+    ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        use futures::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::{
+            Message, client::IntoClientRequest, http::HeaderValue,
+        };
+        let mut request = socket.url.as_str().into_client_request()?;
+        for (header, value) in &socket.headers {
+            let value = crate::reach::substitute_public(value)?;
+            request.headers_mut().insert(
+                tokio_tungstenite::tungstenite::http::HeaderName::try_from(header.as_str())?,
+                HeaderValue::from_str(&value)?,
+            );
+        }
+        use_tls();
+        let (mut stream, _) = tokio_tungstenite::connect_async(request).await?;
+        eprintln!("walleye.socket view={name} outcome=open");
+        if let Some(opening) = &socket.subscribe {
+            let opening = crate::reach::substitute_public(opening)?;
+            stream.send(Message::Text(opening.into())).await?;
+        }
+
+        let mut handled = 0usize;
+        let mut batch: Vec<String> = Vec::with_capacity(socket.frames);
+        let window = std::time::Duration::from_millis(socket.window_ms.max(1));
+        loop {
+            let deadline = tokio::time::sleep(window);
+            tokio::pin!(deadline);
+            let full = loop {
+                tokio::select! {
+                    frame = stream.next() => match frame {
+                        Some(Ok(Message::Text(text))) => {
+                            batch.push(text.to_string());
+                            if batch.len() >= socket.frames {
+                                break false;
+                            }
+                        }
+                        Some(Ok(Message::Binary(_))) => {}
+                        Some(Ok(Message::Ping(payload))) => {
+                            stream.send(Message::Pong(payload)).await?;
+                        }
+                        Some(Ok(_)) => {}
+                        Some(Err(error)) => return Err(error.into()),
+                        None => break true,
+                    },
+                    () = &mut deadline => break false,
+                }
+            };
+            if !batch.is_empty() {
+                let frames = std::mem::take(&mut batch);
+                handled += frames.len();
+                if let Some(engine) = &self.engine
+                    && let Err(error) = engine.handle_frames(name, frames).await
+                {
+                    // A bad batch costs itself, not the connection.
+                    eprintln!("walleye.socket view={name} outcome=batch_error error={error}");
+                }
+            }
+            if full || self.quiescing.load(Ordering::Acquire) {
+                return Ok(handled);
+            }
+        }
     }
 
     /// Wait until writes can be durable, say so, warm the streams this node
@@ -523,6 +714,18 @@ impl Service {
         let _ = self.cache.close().await;
     }
 }
+/// Choose the cipher provider once for the process.
+///
+/// A secure socket needs one picked before the first handshake, and rustls
+/// panics rather than erroring when it cannot tell which. Doing it here means
+/// a `wss://` view works without every caller remembering.
+pub fn use_tls() {
+    static TLS: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    TLS.get_or_init(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
 pub fn router(service: Arc<Service>) -> Router {
     Router::new()
         .route("/healthz", get(healthz))

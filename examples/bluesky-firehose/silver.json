@@ -1,0 +1,6 @@
+{
+  "source": "posts",
+  "target": "sampled",
+  "batch_rows": 400,
+  "worker": "// The firehose is far larger than anything worth labelling one call at a\n// time, so take a fixed share of it. Bucketing on the post's own identity\n// keeps the choice deterministic: the same post is always kept or always\n// dropped, which is what lets a replayed batch produce the same rows.\nconst ONE_IN = 40;\nfunction bucket(text) {\n  let hash = 2166136261;\n  for (let i = 0; i < text.length; i++) {\n    hash ^= text.charCodeAt(i);\n    hash = Math.imul(hash, 16777619);\n  }\n  return (hash >>> 0) % ONE_IN;\n}\nexport default (rows) => rows\n  .filter((r) => r.lang === 'en' && r.text.length >= 80 && bucket(r.uri) === 0)\n  .map((r) => ({\n    uri: r.uri,\n    author: r.author,\n    posted_at: r.posted_at,\n    text: r.text.length > 400 ? r.text.slice(0, 400) : r.text\n  }))"
+}
