@@ -3001,6 +3001,10 @@ impl VerifiedMaintenanceToken {
 pub struct DiskReplica {
     state: Mutex<DiskState>,
     log_path: PathBuf,
+    /// Upper bound on the node log file, from `LAKEDAY_REPLICA_LOG_MAX_BYTES`.
+    /// An append that would cross it is refused so the volume never fills;
+    /// the archive loop drains the log and frees room again.
+    log_max_bytes: Option<u64>,
     data_dir: PathBuf,
     maintenance_path: PathBuf,
     node_name: String,
@@ -3325,6 +3329,10 @@ impl DiskReplica {
                 maintenance,
             }),
             log_path: path.to_owned(),
+            log_max_bytes: std::env::var("LAKEDAY_REPLICA_LOG_MAX_BYTES")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .filter(|v| *v > 0),
             data_dir,
             maintenance_path,
             node_name,
@@ -4097,6 +4105,19 @@ impl DiskReplica {
         }
         let encoded = serde_json::to_vec(&record)
             .map_err(|error| ReplicaError::NodeStorage(error.to_string()))?;
+        if let Some(cap) = self.log_max_bytes {
+            let current = state
+                .file
+                .metadata()
+                .map(|meta| meta.len())
+                .map_err(|error| ReplicaError::NodeStorage(error.to_string()))?;
+            if current.saturating_add(encoded.len() as u64 + 1) > cap {
+                return Err(ReplicaError::NodeStorage(format!(
+                    "node log budget exhausted: {current} bytes used of {cap}; waiting for the \
+                     archive to drain"
+                )));
+            }
+        }
         state
             .file
             .write_all(&encoded)
@@ -6359,6 +6380,47 @@ impl ReplicaGateway {
     /// bytes come from the gateway's conservative hot-tail recovery across
     /// the owning cohort, so one partial member can never advance S3.
     pub async fn archive_local_commits(&self, node: &DiskReplica) -> Result<usize, ReplicaError> {
+        self.archive_local_commits_inner(node).await
+    }
+
+    /// Record every archived stream prefix as a durable trim fence on a
+    /// member that has no local history for it. A member booting on an empty
+    /// volume otherwise refuses the writer's next append at
+    /// `archived_lsn + 1` for want of a predecessor, even though the archive
+    /// on object storage is that predecessor. Also carries the archived
+    /// writer epoch forward so a stale writer stays fenced across the restart.
+    /// Returns the number of streams seeded.
+    pub async fn seed_from_archive(&self, node: &DiskReplica) -> Result<usize, ReplicaError> {
+        let snapshot = node.snapshot();
+        let known = snapshot
+            .trimmed
+            .iter()
+            .map(|prefix| prefix.stream.clone())
+            .chain(
+                snapshot
+                    .records
+                    .iter()
+                    .chain(snapshot.committed.iter())
+                    .map(|record| record.stream().to_owned()),
+            )
+            .collect::<BTreeSet<_>>();
+        let prefixes = self
+            .archive
+            .stream_heads()
+            .await
+            .map_err(|error| ReplicaError::NodeStorage(error.to_string()))?
+            .into_iter()
+            .filter(|(stream, _, _)| !known.contains(stream))
+            .collect::<Vec<_>>();
+        if prefixes.is_empty() {
+            return Ok(0);
+        }
+        let count = prefixes.len();
+        node.compact_archived_batch(&prefixes)?;
+        Ok(count)
+    }
+
+    async fn archive_local_commits_inner(&self, node: &DiskReplica) -> Result<usize, ReplicaError> {
         let snapshot = node.snapshot();
         let trimmed = snapshot
             .trimmed
@@ -10731,7 +10793,15 @@ impl ReplicaGateway {
                 control.adopt_manifest(&manifest, true)?;
                 return Ok(manifest);
             }
-            if acknowledgements + (CONTROL_COHORT_SIZE - unsupported - failures) < ACK_QUORUM {
+            // Saturating on purpose: the cohort is exactly CONTROL_COHORT_SIZE
+            // members, enforced where the peer list is built, so the
+            // subtraction cannot go below zero today. It is 300 lines from the
+            // invariant that guarantees it, and an underflow here would panic
+            // a gateway rather than merely skip an early break.
+            let outstanding = CONTROL_COHORT_SIZE
+                .saturating_sub(unsupported)
+                .saturating_sub(failures);
+            if acknowledgements + outstanding < ACK_QUORUM {
                 // Drain all responses when every observed peer is a legacy
                 // node without a control endpoint. Only after the final
                 // response can the compatibility path distinguish that case
@@ -11786,13 +11856,12 @@ impl ReplicaGateway {
             // Every member has already proven the archive holds the prefix
             // below its trim checkpoint, so the merge starts there: the
             // watermark never regresses below what the cohort has trimmed.
-            let (floor, floor_epoch) = rebuilt.streams.get(stream).map_or((0, 0), |state| {
-                let trimmed = state
+            let floor = rebuilt.streams.get(stream).map_or(0, |state| {
+                state
                     .records
                     .keys()
                     .next()
-                    .map_or(state.committed_lsn, |first| first.saturating_sub(1));
-                (trimmed, state.writer_epoch)
+                    .map_or(state.committed_lsn, |first| first.saturating_sub(1))
             });
             let archived = self
                 .archive
@@ -11815,7 +11884,13 @@ impl ReplicaGateway {
                 stream_state.committed_lsn = floor;
                 stream_state.records.clear();
                 let mut expected_lsn = floor.saturating_add(1);
-                let mut prefix_epoch = floor_epoch;
+                // Seed below every epoch, as the rebuild from hot snapshots
+                // does. The stream's writer epoch is the highest any member
+                // reported, not the epoch in force at the floor, so seeding
+                // with it would reject the first archived record written
+                // before the last failover and abandon the prefix this
+                // merge has already cleared.
+                let mut prefix_epoch = 0;
                 for record in records {
                     if record.lsn() != expected_lsn
                         || record.committed_lsn() != expected_lsn.saturating_sub(1)
@@ -14178,39 +14253,99 @@ async fn gateway_metrics(
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)
 }
 
-async fn gateway_ready(State(state): State<GatewayState>) -> StatusCode {
-    if state.gateway.ensure_initialized().await.is_err() {
-        return StatusCode::SERVICE_UNAVAILABLE;
-    }
-    if state.gateway.refresh_durable_fence().await.is_err()
-        || state.gateway.maintenance_active().await
-    {
-        return StatusCode::SERVICE_UNAVAILABLE;
-    }
-    let Ok(nodes) = state.gateway.nodes_snapshot().await else {
-        return StatusCode::SERVICE_UNAVAILABLE;
-    };
+/// Readiness to accept durable writes: at least `quorum` members answering,
+/// initialized, and not fenced for maintenance. Members are probed first,
+/// because a quorum shortage is both the usual reason a gateway is not ready
+/// and the reason it cannot initialize; a refusal names the members that did
+/// not answer so an operator can see which node is at fault.
+/// `?require=all` makes readiness strict: every configured member must be
+/// serving, not just a quorum. A caller that reaches the cluster through one
+/// address cannot otherwise tell a whole cluster from a quorum of one.
+#[derive(Deserialize)]
+struct ReadyQuery {
+    #[serde(default)]
+    require: Option<String>,
+}
+
+async fn gateway_ready(
+    State(state): State<GatewayState>,
+    Query(query): Query<ReadyQuery>,
+) -> Response {
+    let strict = query.require.as_deref() == Some("all");
     let gateway = Arc::clone(&state.gateway);
     let quorum = gateway.quorum;
-    let healthy = join_all(nodes.iter().map(|node| {
-        let node = node.clone();
-        let gateway = Arc::clone(&gateway);
-        async move {
-            NodeClient::new(node, &gateway.client, &gateway.internal_token)
-                .health()
-                .await
-                .is_ok()
+    let members = gateway.nodes_snapshot().await;
+    let probes = match &members {
+        Ok(nodes) => {
+            join_all(nodes.iter().map(|node| {
+                let node = node.clone();
+                let gateway = Arc::clone(&gateway);
+                async move {
+                    let healthy =
+                        NodeClient::new(node.clone(), &gateway.client, &gateway.internal_token)
+                            .health()
+                            .await
+                            .is_ok();
+                    (node.id, healthy)
+                }
+            }))
+            .await
         }
-    }))
-    .await
-    .into_iter()
-    .filter(|healthy| *healthy)
-    .count();
-    if healthy >= quorum {
-        StatusCode::NO_CONTENT
-    } else {
-        StatusCode::SERVICE_UNAVAILABLE
+        Err(_) => Vec::new(),
+    };
+    let (healthy, unreachable): (Vec<_>, Vec<_>) =
+        probes.into_iter().partition(|(_, healthy)| *healthy);
+    let healthy = healthy.into_iter().map(|(id, _)| id).collect::<Vec<_>>();
+    let unreachable = unreachable
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect::<Vec<_>>();
+    let not_ready = |reason: String| -> Response {
+        let mut body = serde_json::json!({"ready": false, "reason": reason});
+        if members.is_ok() {
+            body["quorum"] = serde_json::json!(quorum);
+            body["healthy"] = serde_json::json!(healthy);
+            body["unreachable"] = serde_json::json!(unreachable);
+        }
+        (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response()
+    };
+    if members.is_err() {
+        return not_ready("the member list could not be read".to_owned());
     }
+    if healthy.len() < quorum {
+        return not_ready(format!(
+            "{} of {quorum} required members are reachable",
+            healthy.len()
+        ));
+    }
+    if strict && !unreachable.is_empty() {
+        return not_ready(format!(
+            "{} of {} members are serving; strict readiness requires all",
+            healthy.len(),
+            healthy.len() + unreachable.len()
+        ));
+    }
+    if state.gateway.ensure_initialized().await.is_err() {
+        return not_ready("the gateway is still initializing".to_owned());
+    }
+    if state.gateway.refresh_durable_fence().await.is_err() {
+        return not_ready("the durable fence could not be refreshed".to_owned());
+    }
+    if state.gateway.maintenance_active().await {
+        return not_ready("maintenance is fencing writes on this gateway".to_owned());
+    }
+    // A ready answer names who is serving, as a refusal names who is not: a
+    // caller with one address can then tell a whole cluster from a quorum.
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ready": true,
+            "quorum": quorum,
+            "healthy": healthy,
+            "unreachable": unreachable,
+        })),
+    )
+        .into_response()
 }
 
 #[derive(Serialize)]

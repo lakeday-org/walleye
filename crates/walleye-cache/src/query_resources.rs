@@ -22,9 +22,16 @@ pub struct QueryResources {
     memory_bytes: usize,
     disk_bytes: usize,
     cache_memory_ceiling: usize,
+    /// Memory the cache keeps whatever else is reserved. A cache squeezed to
+    /// nothing stops serving and stops accepting entries from peers, so
+    /// reservations are capped to leave this much rather than starve it.
+    cache_memory_floor: usize,
     cache_disk_ceiling: usize,
     spill_dir: PathBuf,
     state: Mutex<State>,
+    /// Bytes held by long-lived leases (tables, bodies, index builds), as
+    /// opposed to query reservations that come and go batch by batch.
+    leased: std::sync::atomic::AtomicUsize,
     this: Weak<Self>,
     _owner: crate::lance_backend::QueryOwner,
 }
@@ -32,6 +39,35 @@ pub struct QueryResources {
 #[derive(Debug, Default)]
 struct State {
     spill_files: usize,
+    /// Disk consumed beside the cache file by named users (the Bitr log,
+    /// for one), reported by their owners. The cache's disk ceiling is the
+    /// budget minus these.
+    disk_usage: std::collections::BTreeMap<String, usize>,
+}
+
+/// Memory held by a named non-query user (an open table's memtables, a
+/// decoded request body, an index build). Dropping it returns the memory to
+/// the cache. Obtained from [`QueryResources::reserve_memory`].
+#[derive(Debug)]
+pub struct MemoryLease {
+    resources: Arc<QueryResources>,
+    bytes: usize,
+    /// Held for its drop: releasing it shrinks the pool.
+    _reservation: MemoryReservation,
+}
+impl MemoryLease {
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+}
+impl Drop for MemoryLease {
+    fn drop(&mut self) {
+        // Leave the leased counter first; the reservation's own drop then
+        // shrinks the pool and lets the cache grow back by this amount.
+        self.resources
+            .leased
+            .fetch_sub(self.bytes, std::sync::atomic::Ordering::AcqRel);
+    }
 }
 
 impl QueryResources {
@@ -66,8 +102,16 @@ impl QueryResources {
             std::fs::remove_dir_all(&spill_dir)?;
         }
         std::fs::create_dir_all(&spill_dir)?;
+        // A working set the cache keeps against long-lived leases: a
+        // sixteenth of its ceiling, never more than a quarter of the budget.
+        // Queries may still borrow everything, because they give it back;
+        // a lease that held the cache at zero would not.
+        let cache_memory_floor = (backend.memory_capacity() / 16)
+            .min(64 * 1024 * 1024)
+            .min(memory_bytes / 4);
         Ok(Arc::new_cyclic(|this| Self {
             cache_memory_ceiling: backend.memory_capacity(),
+            cache_memory_floor,
             cache_disk_ceiling: backend.persistent_capacity(),
             backend,
             pool: FairSpillPool::new(memory_bytes),
@@ -75,12 +119,121 @@ impl QueryResources {
             disk_bytes,
             spill_dir,
             state: Mutex::new(State::default()),
+            leased: std::sync::atomic::AtomicUsize::new(0),
             this: this.clone(),
             _owner: owner,
         }))
     }
 
     /// Build the one shared execution environment used by all runtime query sessions.
+    /// Reserve memory for a non-query user. Every reservation, query or not,
+    /// comes out of the one budget: the cache's memory ceiling shrinks by the
+    /// same amount while the lease lives and grows back when it drops. Fails
+    /// closed with `ResourcesExhausted` when the budget cannot cover it.
+    pub fn reserve_memory(self: &Arc<Self>, name: &str, bytes: usize) -> Result<MemoryLease> {
+        // Admission first: a lease that would leave the cache under its
+        // working floor is refused rather than granted, because a cache at
+        // zero serves nothing and accepts nothing from its peers.
+        let held = self.leased.load(std::sync::atomic::Ordering::Acquire);
+        if held.saturating_add(bytes) > self.leasable() {
+            return Err(DataFusionError::ResourcesExhausted(format!(
+                "{name} needs {} MiB but only {} MiB of the {} MiB memory budget can be held \
+                 ({} MiB is the cache's working floor, {} MiB is already held)",
+                bytes / (1024 * 1024),
+                self.leasable().saturating_sub(held) / (1024 * 1024),
+                self.memory_bytes / (1024 * 1024),
+                self.cache_memory_floor / (1024 * 1024),
+                held / (1024 * 1024),
+            )));
+        }
+        let pool: Arc<dyn MemoryPool> = self.clone();
+        let reservation = MemoryConsumer::new(name).register(&pool);
+        self.leased
+            .fetch_add(bytes, std::sync::atomic::Ordering::AcqRel);
+        if reservation.try_grow(bytes).is_err() {
+            self.leased
+                .fetch_sub(bytes, std::sync::atomic::Ordering::AcqRel);
+            return Err(DataFusionError::ResourcesExhausted(format!(
+                "{name} needs {} MiB but only {} MiB of the {} MiB memory budget is free \
+                 ({} MiB of it is the cache's working floor)",
+                bytes / (1024 * 1024),
+                self.memory_available() / (1024 * 1024),
+                self.memory_bytes / (1024 * 1024),
+                self.cache_memory_floor / (1024 * 1024),
+            )));
+        }
+        Ok(MemoryLease {
+            resources: self.clone(),
+            bytes,
+            _reservation: reservation,
+        })
+    }
+    /// Memory budget for everything that is not the fixed runtime floor.
+    pub fn memory_budget(&self) -> usize {
+        self.memory_bytes
+    }
+    /// The part of the budget long-lived leases may hold: the budget less
+    /// the cache's working floor. Queries are not bound by it.
+    pub fn leasable(&self) -> usize {
+        self.memory_bytes.saturating_sub(self.cache_memory_floor)
+    }
+    /// Memory not currently held by queries or leases.
+    pub fn memory_available(&self) -> usize {
+        self.memory_bytes.saturating_sub(self.pool.reserved())
+    }
+    pub fn memory_reserved(&self) -> usize {
+        self.pool.reserved()
+    }
+    /// The whole disk budget; the cache's working floor is carved out of it
+    /// only while a query spills.
+    pub fn disk_budget(&self) -> usize {
+        self.disk_bytes
+    }
+    /// Report how much disk a named user occupies beside the cache file. The
+    /// cache's disk ceiling becomes the budget minus every reported usage,
+    /// applied at once; it grows back as usages fall.
+    pub async fn set_disk_usage(self: &Arc<Self>, name: &str, bytes: usize) -> Result<()> {
+        let this = self.clone();
+        let name = name.to_string();
+        tokio::task::spawn_blocking(move || this.set_disk_usage_blocking(&name, bytes))
+            .await
+            .map_err(|error| DataFusionError::External(Box::new(error)))?
+    }
+    pub fn set_disk_usage_blocking(&self, name: &str, bytes: usize) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if bytes == 0 {
+            state.disk_usage.remove(name);
+        } else {
+            state.disk_usage.insert(name.to_string(), bytes);
+        }
+        if state.spill_files > 0 {
+            return Ok(());
+        }
+        let target = self.cache_disk_target(&state);
+        self.backend
+            .resize_disk_blocking(target)
+            .map_err(resource_error)?;
+        Ok(())
+    }
+    /// Disk used beside the cache file, as reported by its owners.
+    pub fn disk_used_elsewhere(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .disk_usage
+            .values()
+            .sum()
+    }
+    fn cache_disk_target(&self, state: &State) -> usize {
+        let elsewhere: usize = state.disk_usage.values().sum();
+        self.cache_disk_ceiling
+            .min(self.disk_bytes.saturating_sub(elsewhere))
+            .max(self.backend.disk_floor())
+    }
+
     pub fn runtime(self: &Arc<Self>) -> Result<Arc<RuntimeEnv>> {
         let manager = DiskManager::builder()
             .with_mode(DiskManagerMode::Directories(vec![self.spill_dir.clone()]))
@@ -100,7 +253,7 @@ impl QueryResources {
         let target = available.min(self.cache_memory_ceiling);
         if self.backend.memory_capacity() > target {
             // Round down so small operator reservations do not repeatedly spawn eviction workers.
-            let quantum = (8 * 1024 * 1024).min(self.cache_memory_ceiling);
+            let quantum = (8 * 1024 * 1024).min(self.cache_memory_ceiling).max(1);
             self.backend
                 .resize_memory(target / quantum * quantum)
                 .map_err(resource_error)?;
@@ -119,9 +272,24 @@ impl QueryResources {
     }
 
     /// Restore admission after the last query releases its buffers, avoiding per-batch resize churn.
+    /// Give the cache back what the budget no longer needs: the ceiling minus
+    /// live leases, once no query holds memory. Queries release batch by
+    /// batch, and regrowing between batches would make the cache oscillate.
     fn return_memory(&self) {
-        if self.pool.reserved() == 0
-            && let Err(error) = self.backend.resize_memory(self.cache_memory_ceiling)
+        let leased = self.leased.load(std::sync::atomic::Ordering::Acquire);
+        if self.pool.reserved() > leased {
+            return;
+        }
+        let quantum = (8 * 1024 * 1024).min(self.cache_memory_ceiling).max(1);
+        let target = (self
+            .memory_bytes
+            .saturating_sub(leased)
+            .min(self.cache_memory_ceiling)
+            / quantum
+            * quantum)
+            .max(self.cache_memory_floor.min(self.cache_memory_ceiling));
+        if self.backend.memory_capacity() != target
+            && let Err(error) = self.backend.resize_memory(target)
         {
             tracing::warn!(%error, "could not restore cache memory capacity");
         }
@@ -235,13 +403,11 @@ impl Drop for SpillLease {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.spill_files -= 1;
-        if state.spill_files == 0
-            && let Err(error) = self
-                .resources
-                .backend
-                .resize_disk_blocking(self.resources.cache_disk_ceiling)
-        {
-            tracing::warn!(%error, "could not restore cache disk capacity");
+        if state.spill_files == 0 {
+            let target = self.resources.cache_disk_target(&state);
+            if let Err(error) = self.resources.backend.resize_disk_blocking(target) {
+                tracing::warn!(%error, "could not restore cache disk capacity");
+            }
         }
     }
 }

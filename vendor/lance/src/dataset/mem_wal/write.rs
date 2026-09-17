@@ -245,6 +245,12 @@ pub struct ShardWriterConfig {
     /// Session for those opens, injected alongside `store_params`.
     /// Default: `None`.
     pub session: Option<Arc<Session>>,
+
+    /// Memtable index configs declared by the caller, in addition to the
+    /// `maintained_indexes` derived from base-table indexes. Lets a table
+    /// maintain an in-memory HNSW graph (flushed as IVF_HNSW_SQ per
+    /// generation) before any base-table index can be trained.
+    pub extra_index_configs: Vec<crate::dataset::mem_wal::index::MemIndexConfig>,
 }
 
 impl Default for ShardWriterConfig {
@@ -253,6 +259,7 @@ impl Default for ShardWriterConfig {
             shard_id: Uuid::new_v4(),
             shard_spec_id: 0,
             wal_backend: None,
+            extra_index_configs: Vec::new(),
             durable_write: true,
             max_wal_buffer_size: 10 * 1024 * 1024, // 10MB
             max_wal_flush_interval: Some(Duration::from_millis(100)), // 100ms
@@ -396,6 +403,15 @@ impl ShardWriterConfig {
         params: HnswBuildParams,
     ) -> Self {
         self.hnsw_params.insert(index_name.into(), params);
+        self
+    }
+
+    /// Declare a memtable index that does not derive from a base-table index.
+    pub fn with_index_config(
+        mut self,
+        config: crate::dataset::mem_wal::index::MemIndexConfig,
+    ) -> Self {
+        self.extra_index_configs.push(config);
         self
     }
 }
@@ -926,6 +942,7 @@ async fn replay_memtable_from_wal(
     wal_flusher: &WalFlusher,
     index_configs: &[MemIndexConfig],
     max_memtable_size: usize,
+    max_memtable_rows: usize,
 ) -> Result<ReplayResult> {
     // WAL positions are 1-based (see `FIRST_WAL_ENTRY_POSITION`), so a
     // cursor of 0 means "no flush has ever stamped this shard" and replay
@@ -992,6 +1009,7 @@ async fn replay_memtable_from_wal(
                         && memtable_reached_flush_threshold(
                             &active,
                             max_memtable_size,
+                            max_memtable_rows,
                             batches.len(),
                         )
                     {
@@ -1074,9 +1092,14 @@ async fn replay_memtable_from_wal(
 fn memtable_reached_flush_threshold(
     memtable: &MemTable,
     max_memtable_size: usize,
+    max_memtable_rows: usize,
     incoming_batches: usize,
 ) -> bool {
+    // Rows trigger at half the capacity: a put is never split across
+    // memtables, so a memtable that freezes at half leaves room for one more
+    // put of up to half the capacity without exhausting the vector graph.
     memtable.estimated_size() >= max_memtable_size
+        || memtable.row_count().saturating_mul(2) >= max_memtable_rows
         || memtable.batch_store().remaining_capacity() < incoming_batches
 }
 
@@ -1410,8 +1433,12 @@ impl SharedWriterState {
 
         // Checked post-insert: flush if there is no longer room for even one more
         // batch (or the byte threshold is crossed). Same predicate replay uses.
-        let should_flush =
-            memtable_reached_flush_threshold(&state.memtable, self.config.max_memtable_size, 1);
+        let should_flush = memtable_reached_flush_threshold(
+            &state.memtable,
+            self.config.max_memtable_size,
+            self.config.max_memtable_rows,
+            1,
+        );
 
         if should_flush {
             state.flush_requested = true;
@@ -1572,6 +1599,10 @@ pub struct ShardWriter {
     manifest_store: Arc<ShardManifestStore>,
     stats: SharedWriteStats,
     mode: WriterMode,
+    /// Merges flushed generations; `None` in WAL-only mode.
+    compactor: Option<super::memtable::flush::Compactor>,
+    /// Last manifest this writer committed (seeded by the epoch claim).
+    manifest_cache: Arc<RwLock<Option<ShardManifest>>>,
     /// The base table's schema as the caller passed it — no `_tombstone`,
     /// nullability untouched. Caller input is held to it (see
     /// [`Self::validate_against_logical_schema`]) and the scan narrows back to
@@ -1665,6 +1696,7 @@ impl ShardWriter {
         // Claim the shard (epoch-based fencing) — done once, then shared
         // with the WalAppender via `with_claimed_epoch`.
         let (epoch, manifest) = manifest_store.claim_epoch(config.shard_spec_id).await?;
+        let manifest_cache = Arc::new(RwLock::new(Some(manifest.clone())));
 
         info!(
             "Opened ShardWriter for shard {} (epoch {}, generation {}, enable_memtable {})",
@@ -1731,10 +1763,13 @@ impl ShardWriter {
         let stats = new_shared_stats();
         let task_executor = Arc::new(TaskExecutor::new());
 
+        let mut compactor = None;
         let mode = if config.enable_memtable {
             let (pk_field_ids, pk_columns, storage_schema) = memtable_validation
                 .expect("memtable_validation is Some when enable_memtable is true");
-            Self::open_memtable_mode(
+            let compactor_pk_columns = pk_columns.clone();
+            let (mode, flusher) = Self::open_memtable_mode(
+                manifest_cache.clone(),
                 &config,
                 &storage_schema,
                 &manifest,
@@ -1754,7 +1789,15 @@ impl ShardWriter {
                 stats.clone(),
                 &task_executor,
             )
-            .await?
+            .await?;
+            compactor = Some(super::memtable::flush::Compactor {
+                flusher,
+                epoch,
+                logical_schema: logical_schema.clone(),
+                pk_columns: compactor_pk_columns,
+                index_configs: index_configs.clone(),
+            });
+            mode
         } else {
             Self::open_wal_only_mode(
                 &config,
@@ -1774,12 +1817,15 @@ impl ShardWriter {
             manifest_store,
             stats,
             mode,
+            compactor,
+            manifest_cache,
             logical_schema,
         })
     }
 
     #[allow(clippy::too_many_arguments)]
     async fn open_memtable_mode(
+        manifest_cache: Arc<RwLock<Option<ShardManifest>>>,
         config: &ShardWriterConfig,
         schema: &Arc<ArrowSchema>,
         manifest: &ShardManifest,
@@ -1798,7 +1844,7 @@ impl ShardWriter {
         manifest_store: Arc<ShardManifestStore>,
         stats: SharedWriteStats,
         task_executor: &Arc<TaskExecutor>,
-    ) -> Result<WriterMode> {
+    ) -> Result<(WriterMode, Arc<MemTableFlusher>)> {
         // PK metadata and index/interval validation were resolved in `open`
         // before the epoch was claimed (a doomed open must not fence the
         // incumbent first).
@@ -1842,7 +1888,8 @@ impl ShardWriter {
             )
             .with_wal_backend(wal_backend.clone())
             .with_warmer(config.warmer.clone())
-            .with_storage_context(config.store_params.clone(), config.session.clone()),
+            .with_storage_context(config.store_params.clone(), config.session.clone())
+            .with_manifest_cache(manifest_cache),
         );
 
         // Replay any WAL entries written after the last successfully-flushed
@@ -1868,6 +1915,7 @@ impl ShardWriter {
             &wal_flusher,
             index_configs,
             config.max_memtable_size,
+            config.max_memtable_rows,
         )
         .await?;
 
@@ -1938,7 +1986,7 @@ impl ShardWriter {
         // It rebuilds the same secondary indexes on each SSTable.
         let memtable_handler = MemTableFlushHandler::new(
             state.clone(),
-            flusher,
+            flusher.clone(),
             wal_flusher.clone(),
             epoch,
             index_configs.to_vec(),
@@ -1983,11 +2031,14 @@ impl ShardWriter {
             index_configs.to_vec(),
         ));
 
-        Ok(WriterMode::MemTable {
-            state,
-            writer_state,
-            backpressure,
-        })
+        Ok((
+            WriterMode::MemTable {
+                state,
+                writer_state,
+                backpressure,
+            },
+            flusher,
+        ))
     }
 
     fn open_wal_only_mode(
@@ -2557,11 +2608,25 @@ impl ShardWriter {
     }
 
     /// Get the current shard manifest.
+    /// The manifest as this writer last committed it. Only this writer's
+    /// flusher and compactor mutate the manifest under the current epoch, so
+    /// the cached copy is exact for readers on the owning node and costs no
+    /// object-storage round trips. A successor's claim fences the next write
+    /// rather than this read.
     pub async fn manifest(&self) -> Result<Option<ShardManifest>> {
+        if let Some(manifest) = self.manifest_cache.read().await.clone() {
+            return Ok(Some(manifest));
+        }
         self.manifest_store.read_latest().await
     }
 
     /// Get the writer's epoch.
+    /// A handle that merges this shard's flushed generations. It borrows
+    /// nothing from the writer, so callers can compact without holding the
+    /// writer lock; the manifest CAS and epoch fence keep it safe.
+    pub fn compactor(&self) -> Option<super::memtable::flush::Compactor> {
+        self.compactor.clone()
+    }
     pub fn epoch(&self) -> u64 {
         self.epoch
     }

@@ -198,6 +198,31 @@ impl OpaqueArchive {
     }
 
     /// Returns the highest contiguous record named by the authoritative head.
+    /// Every stream with an archived prefix: `(stream, archived_lsn,
+    /// writer_epoch)`. A member booting on an empty volume uses this to
+    /// learn the prefixes it must treat as compacted before it accepts an
+    /// append at `archived_lsn + 1`.
+    pub async fn stream_heads(&self) -> Result<Vec<(String, u64, u64)>, ArchiveError> {
+        use futures::TryStreamExt;
+        let prefix = Path::from(format!("{}/streams", self.prefix));
+        let mut listing = self.store.list(Some(&prefix));
+        let mut heads = Vec::new();
+        while let Some(object) = listing.try_next().await? {
+            if object.location.filename() != Some("head.json") {
+                continue;
+            }
+            let bytes = self.store.get(&object.location).await?.bytes().await?;
+            let head: ArchiveHead = serde_json::from_slice(&bytes)?;
+            if head.archived_lsn == 0 {
+                continue;
+            }
+            self.validate_head_chain(&head.stream, &head)?;
+            heads.push((head.stream, head.archived_lsn, head.writer_epoch));
+        }
+        heads.sort();
+        Ok(heads)
+    }
+
     pub async fn archived_lsn(&self, stream: &str) -> Result<u64, ArchiveError> {
         let head = self.load_head(stream).await?.head;
         self.validate_head_chain(stream, &head)?;

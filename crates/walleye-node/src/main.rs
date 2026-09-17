@@ -2,15 +2,32 @@
 use std::{future::IntoFuture, sync::Arc};
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let path =
-        std::env::var("WALLEYE_CONFIG").unwrap_or_else(|_| "/etc/walleye/config.json".into());
     let config = if std::env::var_os("WALLEYE_DISCOVERY_SERVICE").is_some() {
         walleye_node::kubernetes::config_from_env()?
-    } else {
+    } else if let Some(path) = std::env::var("WALLEYE_CONFIG").ok().or_else(|| {
+        std::fs::exists("/etc/walleye/config.json")
+            .ok()?
+            .then(|| "/etc/walleye/config.json".into())
+    }) {
         serde_json::from_slice(&std::fs::read(path)?)?
+    } else {
+        walleye_node::Config::from_env()?
     };
     let service = walleye_node::Service::open(config).await?;
-    let listener = tokio::net::TcpListener::bind(&service.config.listen).await?;
+    let listener = match tokio::net::TcpListener::bind(&service.config.listen).await {
+        Ok(listener) => listener,
+        // A host without IPv6 cannot bind the dual-stack default; fall back to
+        // IPv4 on the same port rather than refusing to start.
+        Err(error) if service.config.listen.starts_with("[::]:") => {
+            let v4 = format!("0.0.0.0:{}", &service.config.listen["[::]:".len()..]);
+            eprintln!(
+                "walleye.listen bind={} outcome=fallback to={v4} error={error}",
+                service.config.listen
+            );
+            tokio::net::TcpListener::bind(&v4).await?
+        }
+        Err(error) => return Err(error.into()),
+    };
     let (stop_server, stopped) = tokio::sync::oneshot::channel();
     let server = axum::serve(listener, walleye_node::router(Arc::clone(&service)))
         .with_graceful_shutdown(async {
@@ -19,7 +36,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .into_future();
     let bitr = async {
         if service.config.bitr {
-            walleye_bitr_server::daemon::run_from_env().await
+            walleye_bitr_server::daemon::run_with_arguments(Vec::new()).await
         } else {
             std::future::pending::<Result<(), Box<dyn std::error::Error>>>().await
         }

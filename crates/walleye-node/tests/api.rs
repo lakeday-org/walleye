@@ -12,7 +12,7 @@ fn config(path: &std::path::Path, api: bool) -> Config {
         node_id: "n".into(),
         listen: "127.0.0.1:0".into(),
         directory: path.join("cache"),
-        memory_bytes: 32 * 1024 * 1024,
+        memory_bytes: 1024 * 1024 * 1024,
         disk_bytes: 64 * 1024 * 1024,
         token: "deployment-secret-token".into(),
         bitr: false,
@@ -346,5 +346,141 @@ async fn stream_processor_recovers_due_work_and_retries_failed_callbacks() {
         .unwrap();
     server.abort();
     let _ = server.await;
+    service.close().await;
+}
+
+/// A definition written by a later version must still open here, or an
+/// upgrade could not be rolled back. Requests stay strict: a field the server
+/// derives, or a misspelled one, is refused rather than silently ignored.
+#[tokio::test]
+async fn the_catalog_tolerates_fields_this_version_does_not_know() {
+    let d = tempfile::tempdir().unwrap();
+    let service = Service::open(config(d.path(), true)).await.unwrap();
+    let app = router(service.clone());
+    let (status, _) = call(
+        &app,
+        "/v1/streams",
+        json!({"name":"events","columns":[{"name":"id","type":"int64"}],"primary_key":["id"]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    service.close().await;
+
+    // A later version adds a field to the stored definition.
+    let path = d.path().join("store/streams/events.json");
+    let mut stored: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    stored["retention_days"] = json!(30);
+    std::fs::write(&path, serde_json::to_vec(&stored).unwrap()).unwrap();
+
+    // This version opens the stream and reads it.
+    let service = Service::open(config(d.path(), true)).await.unwrap();
+    let app = router(service.clone());
+    let (status, body) = call(
+        &app,
+        "/v1/query",
+        json!({"sql":"SELECT count(*) AS n FROM events"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body[0]["n"], 0);
+
+    // A request carrying that field is still refused.
+    let refused = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/streams")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer deployment-secret-token")
+                .body(Body::from(
+                    json!({"name":"other","columns":[{"name":"id","type":"int64"}],
+                           "primary_key":["id"],"retention_days":30})
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    service.close().await;
+}
+
+/// A fenced writer is a dead handle, not a dead stream. Before this was
+/// handled, a writer fenced once left its table answering the fence error to
+/// every read and write until the process restarted, while readiness reported
+/// the cluster healthy. The next use must open a fresh writer instead.
+#[tokio::test]
+async fn a_fenced_writer_is_replaced_on_the_next_use() {
+    use arrow_schema::{DataType, Field, Schema};
+    use std::sync::Arc;
+    use walleye_lance::{LanceDurability, LanceStorageOptions, Table, TableConfig};
+
+    let d = tempfile::tempdir().unwrap();
+    let service = Service::open(config(d.path(), true)).await.unwrap();
+    let app = router(service.clone());
+    let definition = json!({"name":"events","columns":[
+        {"name":"id","type":"int64"},{"name":"value","type":"int64"}],"primary_key":["id"]});
+    assert_eq!(
+        call(&app, "/v1/streams", definition).await.0,
+        StatusCode::OK
+    );
+    let (status, _) = call(
+        &app,
+        "/v1/streams/events/events",
+        json!({"rows":[{"id":1,"value":10}]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Another writer claims the shard, which fences the one the engine holds.
+    // On a cluster this is what a takeover looks like; a WAL persistence
+    // failure fences a writer the same way, from the writer's own side.
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("value", DataType::Int64, false),
+    ]));
+    let interloper = TableConfig::new(
+        "events",
+        format!("file://{}/store/data/events", d.path().display()),
+        schema,
+        vec!["id".into()],
+    )
+    .unwrap();
+    let claimed = Table::open(
+        interloper,
+        LanceStorageOptions::default(),
+        LanceDurability::ObjectStore,
+    )
+    .await
+    .expect("a second writer claims the next epoch");
+
+    // The stream keeps serving: the next write opens a fresh writer.
+    let (status, body) = call(
+        &app,
+        "/v1/streams/events/events",
+        json!({"rows":[{"id":2,"value":20}]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, rows) = call(
+        &app,
+        "/v1/query",
+        json!({"sql":"SELECT count(*) AS n FROM events"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{rows}");
+    assert_eq!(rows[0]["n"], 2, "both rows survive the fence: {rows}");
+
+    // And reads keep working too.
+    let (status, rows) = call(
+        &app,
+        "/v1/query",
+        json!({"sql":"SELECT sum(value) AS total FROM events"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(rows[0]["total"], 30);
+    drop(claimed);
     service.close().await;
 }

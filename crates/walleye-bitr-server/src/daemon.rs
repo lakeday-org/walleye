@@ -10,9 +10,16 @@ use crate::{DiskReplica, OpaqueArchive, ReplicaGateway, gateway_router, node_rou
 use object_store::aws::{AmazonS3Builder, S3ConditionalPut};
 use tokio::net::TcpListener;
 
-/// Runs one combined storage, gateway, and opaque-archive replica process.
+/// Runs one combined storage, gateway, and opaque-archive replica process,
+/// taking its mode from this process's own command line.
 pub async fn run_from_env() -> Result<(), Box<dyn std::error::Error>> {
-    let arguments: Vec<String> = Vec::new();
+    run_with_arguments(env::args().skip(1).collect()).await
+}
+
+/// Runs one combined replica under an explicit argument list. A host binary
+/// that owns its own command line passes an empty list; reading argv here
+/// would make it inherit flags meant for the host.
+pub async fn run_with_arguments(arguments: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     if arguments == ["--verify-control-head-cas"] {
         let archive = build_archive()?;
         let result = cas_probe::verify(archive.object_store(), archive.prefix())
@@ -74,6 +81,32 @@ async fn run_combined(root_key: &str) -> Result<(), Box<dyn std::error::Error>> 
     // conditional writes are checked. The operator may select online
     // scaling only after this process has verified the actual archive
     // backend, and after every active node advertises the new protocol.
+    // A fresh volume must learn the archived prefixes before it serves, or
+    // the first append after a cold start fails for want of a predecessor.
+    // Seeding reads the archive, so a transient S3 or disk failure here must
+    // not end the process: exiting would restart the node, fail again, and
+    // turn a passing fault into a crash loop whose cause never reaches
+    // readiness. Never proceed unseeded either, because a node that skipped
+    // it refuses the first append to any archived stream. Waiting visibly is
+    // the honest failure: the listeners stay unbound and the node never
+    // reports healthy.
+    let mut attempt = 0_u32;
+    let seeded = loop {
+        match gateway.seed_from_archive(&node).await {
+            Ok(seeded) => break seeded,
+            Err(error) => {
+                if attempt.is_multiple_of(8) {
+                    eprintln!(
+                        "lakeday.replica boot stage=seed_from_archive outcome=retrying \
+                         attempt={attempt} error={error}"
+                    );
+                }
+                attempt += 1;
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+        }
+    };
+    eprintln!("lakeday.replica boot stage=seed_from_archive streams={seeded} attempts={attempt}");
     let probe_archive = Arc::clone(&archive);
     let probe_gateway = Arc::clone(&gateway);
     tokio::spawn(async move {

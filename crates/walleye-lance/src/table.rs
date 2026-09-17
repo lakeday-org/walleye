@@ -3,6 +3,7 @@
 use crate::{LanceDurability, LanceStorageOptions, OWNER_DO_ID_KEY, with_owner};
 use arrow_array::{RecordBatch, RecordBatchIterator};
 use arrow_schema::Schema;
+use futures::TryStreamExt;
 use lance::deps::datafusion::execution::memory_pool::MemoryReservation;
 use lance::deps::datafusion::{
     common::{DataFusionError, Result as DfResult},
@@ -12,10 +13,70 @@ use lance::deps::datafusion::{
 use lance::{
     Dataset,
     dataset::mem_wal::{
-        DatasetMemWalExt, ShardWriter, ShardWriterConfig,
-        scanner::{FreshTierWatermark, InMemoryMemTables, LsmScanner, ShardSnapshot},
+        CompactionResult, Compactor, DatasetMemWalExt, ShardWriter, ShardWriterConfig,
+        index::MemIndexConfig,
+        scanner::{
+            DatasetCache, FreshTierWatermark, InMemoryMemTables, LsmScanner, ShardSnapshot,
+            SsTableCache,
+        },
     },
+    index::DatasetIndexExt,
 };
+use lance_linalg::distance::DistanceType;
+
+/// A vector index maintained by the table: an in-memory HNSW graph over the
+/// memtable, flushed as IVF_HNSW_SQ on every generation and rebuilt by
+/// compaction. No base-table training is involved, so it works from the first
+/// row.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct VectorIndexSpec {
+    pub name: String,
+    pub column: String,
+    /// `l2`, `cosine`, or `dot`.
+    pub metric: String,
+}
+/// Per-generation view of the LSM for diagnostics and tests.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct LsmStats {
+    pub sstables: Vec<SsTableStats>,
+}
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct SsTableStats {
+    pub generation: u64,
+    pub path: String,
+    pub rows: u64,
+    pub indices: Vec<String>,
+}
+
+/// A LanceDB-style search: filter, projection, paging, and an optional
+/// nearest-neighbor query over one vector column.
+#[derive(Clone, Debug, Default)]
+pub struct SearchRequest {
+    pub filter: Option<String>,
+    pub columns: Option<Vec<String>>,
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
+    pub vector: Option<VectorQuery>,
+}
+#[derive(Clone, Debug)]
+pub struct VectorQuery {
+    pub column: String,
+    pub vector: Vec<f32>,
+    pub k: usize,
+    pub nprobes: usize,
+    pub refine_factor: u32,
+    pub metric: Option<String>,
+    /// HNSW search beam width on indexed generations.
+    pub ef: Option<usize>,
+}
+fn parse_metric(metric: Option<&str>) -> lance::Result<DistanceType> {
+    match metric {
+        None => Ok(DistanceType::L2),
+        Some(m) => {
+            DistanceType::try_from(m).map_err(|e| lance::Error::invalid_input(e.to_string()))
+        }
+    }
+}
 use std::{
     collections::HashMap,
     sync::Arc,
@@ -31,6 +92,7 @@ pub struct TableConfig {
     pub primary_keys: Vec<String>,
     pub shard_id: Uuid,
     pub stream: String,
+    pub vector_indexes: Vec<VectorIndexSpec>,
 }
 impl TableConfig {
     pub fn new(
@@ -85,7 +147,44 @@ impl TableConfig {
             primary_keys,
             shard_id,
             stream,
+            vector_indexes: Vec::new(),
         })
+    }
+    /// Smallest possible encoded row: fixed-width columns at their width,
+    /// variable-width ones at one byte. Used to bound rows per memtable.
+    pub fn min_row_bytes(&self) -> usize {
+        self.schema
+            .fields()
+            .iter()
+            .map(|f| match f.data_type() {
+                arrow_schema::DataType::FixedSizeList(inner, dim) => {
+                    *dim as usize * inner.data_type().primitive_width().unwrap_or(1)
+                }
+                other => other.primitive_width().unwrap_or(1),
+            })
+            .sum::<usize>()
+            .max(1)
+    }
+    pub fn with_vector_indexes(mut self, specs: Vec<VectorIndexSpec>) -> lance::Result<Self> {
+        for spec in &specs {
+            let field = self
+                .schema
+                .field_with_name(&spec.column)
+                .map_err(|e| lance::Error::invalid_input(e.to_string()))?;
+            if !matches!(field.data_type(), arrow_schema::DataType::FixedSizeList(inner, _)
+                if inner.data_type() == &arrow_schema::DataType::Float32)
+            {
+                return Err(lance::Error::invalid_input(format!(
+                    "vector index {} needs a FixedSizeList<Float32> column, {} is {}",
+                    spec.name,
+                    spec.column,
+                    field.data_type()
+                )));
+            }
+            parse_metric(Some(&spec.metric))?;
+        }
+        self.vector_indexes = specs;
+        Ok(self)
     }
 }
 /// One owned writer and its read view. The same implementation handles both durability modes.
@@ -95,6 +194,10 @@ pub struct Table {
     writer: ShardWriter,
     storage: LanceStorageOptions,
     durability: LanceDurability,
+    /// Opened generation datasets, keyed by path. Generations are immutable,
+    /// so reusing the open handle saves the manifest resolution and index
+    /// load that every query would otherwise repeat against object storage.
+    sstables: Arc<SsTableCache>,
 }
 
 /// Emit bounded, stage-level open diagnostics without exposing a dataset URI,
@@ -146,6 +249,12 @@ fn open_error_kind(error: &lance::Error) -> &'static str {
 }
 
 impl Table {
+    /// Upper bound on one memtable's bytes.
+    pub const MEMTABLE_BYTES: usize = 16 * 1024 * 1024;
+    /// Row capacity of a memtable's in-memory vector graph.
+    pub const MEMTABLE_ROWS: usize = 100_000;
+    /// Largest single put; see `open` for why it is half the row capacity.
+    pub const PUT_ROWS: usize = 50_000;
     pub async fn open(
         config: TableConfig,
         storage: LanceStorageOptions,
@@ -245,10 +354,15 @@ impl Table {
                 }
             }
         }
+        // The memtable's in-memory vector graph is sized for MEMTABLE_ROWS
+        // rows and a put is never split across memtables, so appends are
+        // chunked to PUT_ROWS rows and the writer freezes a memtable once it
+        // holds half its row capacity. A memtable never exceeds MEMTABLE_ROWS.
         let mut writer_config = ShardWriterConfig::new(config.shard_id)
             .with_durable_write(true)
             .with_max_wal_flush_interval(Duration::from_millis(10))
-            .with_max_memtable_size(16 * 1024 * 1024)
+            .with_max_memtable_size(Self::MEMTABLE_BYTES)
+            .with_max_memtable_rows(Self::MEMTABLE_ROWS)
             .with_max_unflushed_memtable_bytes(32 * 1024 * 1024);
         if let LanceDurability::Bitr(backend) = &durability {
             if backend.stream() != config.stream
@@ -262,6 +376,21 @@ impl Table {
             writer_config = writer_config.with_wal_backend(backend.clone());
         }
         writer_config.store_params = storage.object_store_params();
+        for spec in &config.vector_indexes {
+            let field_id = dataset
+                .schema()
+                .field(&spec.column)
+                .map(|f| f.id)
+                .ok_or_else(|| {
+                    lance::Error::invalid_input(format!("vector column {} missing", spec.column))
+                })?;
+            writer_config = writer_config.with_index_config(MemIndexConfig::hnsw(
+                spec.name.clone(),
+                field_id,
+                spec.column.clone(),
+                parse_metric(Some(&spec.metric))?,
+            ));
+        }
         let writer_started = open_stage_start(&config, "mem_wal_writer");
         let writer = match dataset.mem_wal_writer(config.shard_id, writer_config).await {
             Ok(writer) => {
@@ -279,18 +408,42 @@ impl Table {
                 return Err(error);
             }
         };
+        if let LanceDurability::Bitr(backend) = &durability
+            && backend.writer_epoch() != writer.epoch()
+        {
+            // The Bitr identity was minted from the manifest before the claim;
+            // a concurrent claimant moved the epoch in between. Refuse rather
+            // than write under an epoch Bitr would not fence correctly.
+            let claimed = writer.epoch();
+            let _ = writer.close().await;
+            return Err(lance::Error::io(format!(
+                "Bitr epoch {} does not match the claimed writer epoch {}; another node \
+                 claimed the stream during open, retry",
+                backend.writer_epoch(),
+                claimed
+            )));
+        }
         Ok(Self {
             config,
             dataset: Arc::new(dataset),
             writer,
             storage,
             durability,
+            sstables: Arc::new(SsTableCache::new(256)),
         })
     }
     /// Acknowledge only after the configured WAL authority accepts the Arrow IPC entry.
+    /// Batches are put in slices of at most [`Self::PUT_ROWS`] rows, each its
+    /// own WAL entry, so a large insert can roll across memtables.
     pub async fn append(&mut self, batches: Vec<RecordBatch>) -> lance::Result<()> {
         let mut owned = Vec::new();
-        for b in batches {
+        for b in batches.into_iter().flat_map(|b| {
+            let rows = b.num_rows();
+            (0..rows.max(1))
+                .step_by(Self::PUT_ROWS)
+                .map(move |start| b.slice(start, (rows - start).min(Self::PUT_ROWS)))
+                .collect::<Vec<_>>()
+        }) {
             if !same_fields(b.schema().as_ref(), &self.config.schema)
                 || b.columns()
                     .iter()
@@ -310,7 +463,9 @@ impl Table {
                     .map_err(|e| lance::Error::invalid_input(e.to_string()))?,
             );
         }
-        self.writer.put(owned).await?;
+        for batch in owned {
+            self.writer.put(vec![batch]).await?;
+        }
         Ok(())
     }
     /// Read one stable snapshot spanning base data, flushed generations, and the active log tail.
@@ -419,7 +574,92 @@ impl Table {
             fresh_tier_watermarks,
             primary_keys: self.config.primary_keys.clone(),
             schema: self.config.schema.clone(),
+            sstables: self.sstables.clone(),
         })
+    }
+    pub fn config(&self) -> &TableConfig {
+        &self.config
+    }
+    /// The MemWAL writer epoch this table claimed when it opened.
+    pub fn writer_epoch(&self) -> u64 {
+        self.writer.epoch()
+    }
+    /// A handle for merging flushed generations that outlives the caller's
+    /// lock on this table.
+    pub fn compactor(&self) -> Option<Compactor> {
+        self.writer.compactor()
+    }
+    /// Merge flushed generations into one indexed generation when at least
+    /// `min_sstables` exist. The replaced generation directories are left in
+    /// place; the caller deletes them once no snapshot can reference them.
+    pub async fn compact(&self, min_sstables: usize) -> lance::Result<Option<CompactionResult>> {
+        let result = match self.writer.compactor() {
+            Some(compactor) => compactor.compact(min_sstables).await?,
+            None => None,
+        };
+        if result.is_some()
+            && let Some(manifest) = self.writer.manifest().await?
+        {
+            let base = self.config.uri.trim_end_matches('/');
+            let shard = self.writer.shard_id();
+            let live = manifest
+                .sstables
+                .iter()
+                .map(|s| format!("{base}/_mem_wal/{shard}/{}", s.path))
+                .collect();
+            self.sstables.retain_paths(&live);
+        }
+        Ok(result)
+    }
+    /// Open every flushed generation into the dataset cache and load its
+    /// indexes into the session caches, so the first query pays nothing that
+    /// a later one would not. Purely a cache optimization.
+    pub async fn warm(&self) -> lance::Result<usize> {
+        let Some(manifest) = self.writer.manifest().await? else {
+            return Ok(0);
+        };
+        let snapshot = manifest.sstables.iter().fold(
+            ShardSnapshot::new(self.writer.shard_id())
+                .with_spec_id(manifest.shard_spec_id)
+                .with_current_generation(manifest.current_generation),
+            |s, t| s.with_sstable(t.generation, t.path.clone()),
+        );
+        let cache: Arc<dyn DatasetCache> = self.sstables.clone();
+        self.dataset
+            .prewarm_mem_wal(&[snapshot], Some(&cache))
+            .await?;
+        Ok(manifest.sstables.len())
+    }
+    /// Generations currently in the manifest, with row counts and index names.
+    pub async fn lsm_stats(&self) -> lance::Result<LsmStats> {
+        let Some(manifest) = self.writer.manifest().await? else {
+            return Ok(LsmStats {
+                sstables: Vec::new(),
+            });
+        };
+        let mut sstables = Vec::with_capacity(manifest.sstables.len());
+        for sstable in &manifest.sstables {
+            let uri = format!(
+                "{}/_mem_wal/{}/{}",
+                self.config.uri.trim_end_matches('/'),
+                self.writer.shard_id(),
+                sstable.path
+            );
+            let dataset = self.storage.open_dataset(&uri).await?;
+            let indices = dataset
+                .load_indices()
+                .await?
+                .iter()
+                .map(|i| i.name.clone())
+                .collect();
+            sstables.push(SsTableStats {
+                generation: sstable.generation,
+                path: sstable.path.clone(),
+                rows: dataset.count_rows(None).await? as u64,
+                indices,
+            });
+        }
+        Ok(LsmStats { sstables })
     }
     /// Flush to Lance SSTables and advance the manifest replay watermark.
     pub async fn checkpoint(&mut self) -> lance::Result<()> {
@@ -446,6 +686,7 @@ struct CapturedSnapshot {
     fresh_tier_watermarks: HashMap<Uuid, FreshTierWatermark>,
     primary_keys: Vec<String>,
     schema: Arc<Schema>,
+    sstables: Arc<SsTableCache>,
 }
 
 impl CapturedSnapshot {
@@ -455,6 +696,7 @@ impl CapturedSnapshot {
             vec![self.shard.clone()],
             self.primary_keys.clone(),
         )
+        .with_sstable_cache(self.sstables.clone() as Arc<dyn DatasetCache>)
         .with_in_memory_memtables(self.shard_id, self.memtables.clone())
         .with_in_memory_visible_counts(
             self.shard_id,
@@ -510,6 +752,42 @@ impl crate::sql::SnapshotPlanSource for CapturedSnapshot {
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))
     }
+
+    async fn search_plan(&self, request: &SearchRequest) -> lance::Result<Arc<dyn ExecutionPlan>> {
+        let mut scanner = self.scanner();
+        if let Some(filter) = request.filter.as_deref() {
+            scanner = scanner.filter(filter)?;
+        }
+        if let Some(columns) = &request.columns {
+            scanner = scanner.project(columns)?;
+        }
+        if request.limit.is_some() || request.offset.is_some() {
+            scanner = scanner.limit(
+                request.limit.map(|l| l as i64),
+                request.offset.map(|o| o as i64),
+            )?;
+        }
+        if let Some(query) = &request.vector {
+            let key = arrow_array::Float32Array::from(query.vector.clone());
+            scanner = scanner
+                .nearest(&query.column, &key, query.k.max(1))?
+                .nprobes(query.nprobes.max(1))
+                .refine(query.refine_factor)
+                .distance_metric(parse_metric(query.metric.as_deref())?);
+            if let Some(ef) = query.ef {
+                scanner = scanner.ef(ef);
+            }
+        }
+        scanner.create_plan().await
+    }
+
+    async fn count(&self, filter: Option<&str>) -> lance::Result<u64> {
+        let mut scanner = self.scanner();
+        if let Some(filter) = filter {
+            scanner = scanner.filter(filter)?;
+        }
+        scanner.count_rows().await
+    }
 }
 
 /// Owned query batches retaining their allocation until the caller drops the result.
@@ -530,4 +808,105 @@ fn same_fields(left: &Schema, right: &Schema) -> bool {
             .iter()
             .zip(right.fields())
             .all(|(a, b)| a.name() == b.name() && a.data_type() == b.data_type())
+}
+
+/// Prepare a stream that was last written by a single node for a Bitr
+/// cluster taking ownership. Bitr LSNs must start at 1 for a stream it has
+/// never seen, while the MemWAL manifest continues from the object-store WAL
+/// tail. When Bitr holds no history for the stream and that tail was fully
+/// checkpointed, the manifest's WAL positions are reset so the first Bitr
+/// append lands at LSN 1. Returns whether a reset happened.
+///
+/// A tail with entries after the last checkpoint is refused: only the
+/// object-store WAL holds them, and a Bitr-backed writer could not replay
+/// them. Reopen in single-node mode, checkpoint, then move.
+pub async fn prepare_bitr_takeover(
+    storage: &LanceStorageOptions,
+    uri: &str,
+    shard_id: Uuid,
+    stream: &str,
+    writer: &walleye_bitr::QuorumWriter,
+) -> lance::Result<bool> {
+    use lance::dataset::mem_wal::ShardManifestStore;
+    use lance_index::mem_wal::ShardManifest;
+    let dataset = match storage.open_dataset(uri).await {
+        Ok(dataset) => dataset,
+        Err(lance::Error::DatasetNotFound { .. }) => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let object_store = dataset.object_store(None).await?;
+    let base_path = dataset.branch_location().path;
+    let store = ShardManifestStore::new(object_store, &base_path, shard_id, 64);
+    let Some(manifest) = store.read_latest().await? else {
+        return Ok(false);
+    };
+    // The manifest only learns positions at flush time, so the object-store
+    // WAL directory is the authority on what a single-node writer left behind.
+    let wal_dir = lance::dataset::mem_wal::util::shard_wal_path(&base_path, &shard_id);
+    let object_store = dataset.object_store(None).await?;
+    let mut newest_wal_entry = 0u64;
+    let mut entries = object_store.inner.list(Some(&wal_dir));
+    while let Some(object) = entries.try_next().await? {
+        if let Some(position) = object
+            .location
+            .filename()
+            .and_then(lance::dataset::mem_wal::util::parse_bit_reversed_filename)
+        {
+            newest_wal_entry = newest_wal_entry.max(position);
+        }
+    }
+    if newest_wal_entry == 0 && manifest.wal_entry_position_last_seen == 0 {
+        return Ok(false);
+    }
+    let history = writer
+        .recover(stream, 0)
+        .await
+        .map_err(|e| lance::Error::io(format!("Bitr recovery for {stream}: {e}")))?;
+    if !history.is_empty() {
+        return Ok(false);
+    }
+    if newest_wal_entry > manifest.replay_after_wal_entry_position {
+        return Err(lance::Error::invalid_input(format!(
+            "stream {stream} has WAL entries after its last checkpoint (positions {}..={}) that \
+             only the object-store WAL holds; reopen it in single-node mode and checkpoint \
+             before moving it to Bitr",
+            manifest.replay_after_wal_entry_position + 1,
+            newest_wal_entry
+        )));
+    }
+    let (epoch, _) = store.claim_epoch(manifest.shard_spec_id).await?;
+    store
+        .commit_update(epoch, |current| ShardManifest {
+            version: current.version + 1,
+            replay_after_wal_entry_position: 0,
+            wal_entry_position_last_seen: 0,
+            ..current.clone()
+        })
+        .await?;
+    Ok(true)
+}
+
+/// The epoch the next `Table::open` will claim for this shard: one past the
+/// manifest's current writer epoch, or 1 for a shard that has never been
+/// opened. A Bitr backend built with this epoch is fenced exactly like the
+/// MemWAL writer it accompanies.
+pub async fn next_writer_epoch(
+    storage: &LanceStorageOptions,
+    uri: &str,
+    shard_id: Uuid,
+) -> lance::Result<u64> {
+    use lance::dataset::mem_wal::ShardManifestStore;
+    let dataset = match storage.open_dataset(uri).await {
+        Ok(dataset) => dataset,
+        Err(lance::Error::DatasetNotFound { .. }) => return Ok(1),
+        Err(error) => return Err(error),
+    };
+    let object_store = dataset.object_store(None).await?;
+    let base_path = dataset.branch_location().path;
+    let store = ShardManifestStore::new(object_store, &base_path, shard_id, 64);
+    Ok(store
+        .read_latest()
+        .await?
+        .map(|m| m.writer_epoch + 1)
+        .unwrap_or(1))
 }

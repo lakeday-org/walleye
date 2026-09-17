@@ -9,8 +9,14 @@ TOKEN = 'acceptance-walleye-token'
 def request(base, path, body):
     req = urllib.request.Request(base + path, json.dumps(body).encode(), headers={
         'Content-Type': 'application/json', 'Authorization': 'Bearer ' + TOKEN})
-    with urllib.request.urlopen(req, timeout=90) as response:
-        return json.load(response)
+    try:
+        with urllib.request.urlopen(req, timeout=90) as response:
+            return json.load(response)
+    except urllib.error.HTTPError as error:
+        # The node says why in the body; a bare status turns a one-line
+        # diagnosis into a bisect.
+        raise AssertionError(
+            f'{path} answered {error.code}: {error.read().decode()[:400]}') from None
 
 def verify(base, streams):
     for stream in streams:

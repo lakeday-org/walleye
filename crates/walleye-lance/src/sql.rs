@@ -56,6 +56,13 @@ pub(crate) trait SnapshotPlanSource: Send + Sync {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DfResult<Arc<dyn ExecutionPlan>>;
+    /// Build a LanceDB-style search plan: optional SQL filter, projection,
+    /// limit/offset, and optional nearest-neighbor query.
+    async fn search_plan(
+        &self,
+        request: &crate::SearchRequest,
+    ) -> lance::Result<Arc<dyn ExecutionPlan>>;
+    async fn count(&self, filter: Option<&str>) -> lance::Result<u64>;
 }
 
 /// Queries can reference only the supplied stream snapshots. DDL, DML, and external
@@ -65,15 +72,39 @@ pub async fn query(
     tables: &[(String, Arc<dyn SnapshotSource>)],
     sql: &str,
 ) -> lance::Result<ScanResult> {
+    query_with_gathered(storage, tables, &[], sql).await
+}
+
+/// As [`query`], plus tables whose rows were gathered from the member that
+/// owns them. A gathered table is a point-in-time copy taken by its owner, so
+/// it carries that owner's unflushed rows; it is registered in memory for the
+/// life of this query only.
+pub async fn query_with_gathered(
+    storage: &LanceStorageOptions,
+    tables: &[(String, Arc<dyn SnapshotSource>)],
+    gathered: &[(String, SchemaRef, Vec<arrow_array::RecordBatch>)],
+    sql: &str,
+) -> lance::Result<ScanResult> {
+    use lance::deps::datafusion::datasource::MemTable;
     tokio::time::timeout(storage.query_timeout(), async {
         let ctx = context(storage)?;
         for (name, table) in tables {
+            if gathered.iter().any(|(gathered, _, _)| gathered == name) {
+                continue;
+            }
             ctx.register_table(
                 name.as_str(),
                 Arc::new(StreamProvider {
                     source: table.clone(),
                     snapshot: tokio::sync::OnceCell::new(),
                 }),
+            )
+            .map_err(err)?;
+        }
+        for (name, schema, batches) in gathered {
+            ctx.register_table(
+                name.as_str(),
+                Arc::new(MemTable::try_new(schema.clone(), vec![batches.clone()]).map_err(err)?),
             )
             .map_err(err)?;
         }
@@ -121,6 +152,29 @@ pub struct TableSnapshot(Arc<dyn SnapshotPlanSource>);
 impl TableSnapshot {
     pub(crate) fn from_source(source: Arc<dyn SnapshotPlanSource>) -> Self {
         Self(source)
+    }
+    /// Execute a LanceDB-style search against this point-in-time view.
+    pub async fn search(
+        &self,
+        storage: &LanceStorageOptions,
+        request: &crate::SearchRequest,
+    ) -> lance::Result<ScanResult> {
+        tokio::time::timeout(storage.query_timeout(), async {
+            let plan = self.0.search_plan(request).await?;
+            execute(storage, plan).await
+        })
+        .await
+        .map_err(|_| err("query deadline exceeded"))?
+    }
+    /// Count visible rows, optionally under a SQL filter.
+    pub async fn count(
+        &self,
+        storage: &LanceStorageOptions,
+        filter: Option<&str>,
+    ) -> lance::Result<u64> {
+        tokio::time::timeout(storage.query_timeout(), self.0.count(filter))
+            .await
+            .map_err(|_| err("query deadline exceeded"))?
     }
 }
 impl std::fmt::Debug for TableSnapshot {
@@ -267,4 +321,22 @@ impl ExecutionPlan for SnapshotExec {
     ) -> DfResult<lance::deps::datafusion::physical_plan::SendableRecordBatchStream> {
         self.0.execute(partition, context)
     }
+}
+
+/// Table names a SQL statement reads, for routing a query to the node that
+/// owns them. Names are returned as written (case preserved, unqualified).
+pub fn sql_table_names(sql: &str) -> lance::Result<Vec<String>> {
+    use lance::deps::datafusion::sql::{parser::DFParser, resolve::resolve_table_references};
+    let statements = DFParser::parse_sql(sql).map_err(err)?;
+    let mut names = Vec::new();
+    for statement in &statements {
+        let (tables, _ctes) = resolve_table_references(statement, true).map_err(err)?;
+        for table in tables {
+            let name = table.table().to_string();
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+    }
+    Ok(names)
 }

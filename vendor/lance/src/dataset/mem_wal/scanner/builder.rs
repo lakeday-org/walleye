@@ -52,6 +52,8 @@ struct LsmVectorQuery {
     refine: bool,
     /// Distance metric; `None` defaults to L2 (matching the unindexed memtable arm).
     metric_type: Option<DistanceType>,
+    /// HNSW search beam width for indexed arms; `None` keeps Lance's default.
+    ef: Option<usize>,
 }
 
 /// If `filter` is a point-lookup shape on `pk_col` — `pk = lit` (either
@@ -650,8 +652,18 @@ impl LsmScanner {
             nprobes: 1,
             refine: false,
             metric_type: None,
+            ef: None,
         });
         Ok(self)
+    }
+
+    /// HNSW search beam width on indexed arms. No-op unless [`Self::nearest`]
+    /// was called.
+    pub fn ef(mut self, ef: usize) -> Self {
+        if let Some(q) = self.nearest.as_mut() {
+            q.ef = Some(ef);
+        }
+        self
     }
 
     /// Number of IVF partitions to probe on the base arm (default 1). No-op
@@ -793,6 +805,7 @@ impl LsmScanner {
                 &query_fsl,
                 per_source_k,
                 nearest.nprobes,
+                nearest.ef,
                 self.projection.as_deref(),
                 nearest.refine,
                 overfetch_factor,

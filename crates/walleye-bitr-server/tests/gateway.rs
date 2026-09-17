@@ -810,7 +810,8 @@ async fn gateway_readiness_requires_two_healthy_nodes_and_internal_api_is_privat
             .body(axum::body::Body::empty())?,
     )
     .await?;
-    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    // A ready answer now names the members that are serving.
+    assert_eq!(response.status(), StatusCode::OK);
     let response = tower::ServiceExt::oneshot(
         app,
         axum::http::Request::builder()

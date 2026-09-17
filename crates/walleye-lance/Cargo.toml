@@ -31,6 +31,7 @@ walleye-bitr.workspace = true
 # selects either object-store CAS or Bitr as its WAL authority.
 lance = { path = "../../vendor/lance", default-features = false, features = ["aws"] }
 lance-linalg = "=11.0.0"
+lance-index = "=11.0.0"
 
 [dev-dependencies]
 datafusion-execution = "=54.1.0"

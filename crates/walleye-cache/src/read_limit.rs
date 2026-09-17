@@ -17,6 +17,15 @@ pub struct LanceReadLimiter {
     origin: Arc<dyn ObjectStore>,
     permits: Arc<Semaphore>,
 }
+/// Set `WALLEYE_TRACE_ORIGIN=1` to log every request that reaches object
+/// storage. Everything Lance reads passes through here after the block cache,
+/// so the log is the ground truth for what the cache did not absorb.
+fn trace_origin(op: &str, path: &Path, detail: &str) {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ENABLED.get_or_init(|| std::env::var_os("WALLEYE_TRACE_ORIGIN").is_some()) {
+        eprintln!("walleye.origin op={op} path={path} {detail}");
+    }
+}
 impl LanceReadLimiter {
     /// Reuse one runtime semaphore instead of allocating a per-table limit.
     pub fn new(origin: Arc<dyn ObjectStore>, permits: Arc<Semaphore>) -> Self {
@@ -43,6 +52,11 @@ impl fmt::Display for LanceReadLimiter {
 impl ObjectStore for LanceReadLimiter {
     /// Keep the permit alive until a streaming response is fully consumed or dropped.
     async fn get_opts(&self, path: &Path, options: GetOptions) -> Result<GetResult> {
+        trace_origin(
+            if options.head { "head" } else { "get" },
+            path,
+            &format!("range={:?}", options.range),
+        );
         let permit = Self::acquire(self.permits.clone()).await?;
         let mut result = self.origin.get_opts(path, options).await?;
         result.payload = match result.payload {
@@ -59,6 +73,7 @@ impl ObjectStore for LanceReadLimiter {
     }
     /// Keep listing requests under the same shared bound.
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
+        trace_origin("list", prefix.unwrap_or(&Path::default()), "");
         let origin = self.origin.clone();
         let permits = self.permits.clone();
         let prefix = prefix.cloned();
@@ -79,6 +94,7 @@ impl ObjectStore for LanceReadLimiter {
     }
     /// Bound directory listings through completion.
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
+        trace_origin("list_delim", prefix.unwrap_or(&Path::default()), "");
         let _permit = Self::acquire(self.permits.clone()).await?;
         self.origin.list_with_delimiter(prefix).await
     }
