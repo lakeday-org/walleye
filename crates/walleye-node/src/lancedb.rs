@@ -61,6 +61,22 @@ type Reply = Result<Response, Response>;
 /// failure leaves the outcome unknown rather than failed, and a client told
 /// "failed" would retry a write that may already have been stored.
 fn write_error(e: &(dyn std::error::Error + Send + Sync + 'static)) -> Response {
+    // A writer another process fenced did not store these rows: the append
+    // was refused, not half-done. Whoever holds the writer now will take
+    // them, so the caller should retry rather than be told it made a bad
+    // request. This is what lets a replacement take over a table without the
+    // client seeing anything.
+    if walleye_lance::writer_fence_reason(e) == Some(walleye_lance::FenceReason::PeerClaimedEpoch) {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [("retry-after", "1")],
+            format!(
+                "another writer took this table while the write was in flight: {e}. The rows \
+                 were not stored; retry and the request reaches the writer that holds it now."
+            ),
+        )
+            .into_response();
+    }
     if walleye_lance::writer_fence_reason(e) == Some(walleye_lance::FenceReason::PersistenceFailure)
     {
         return (

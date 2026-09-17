@@ -487,3 +487,85 @@ async fn a_fenced_writer_is_replaced_on_the_next_use() {
     drop(claimed);
     service.close().await;
 }
+
+/// A writer another process fenced did not store its rows. Whoever holds the
+/// table now will take them, so the caller must be told to retry rather than
+/// that it made a bad request.
+///
+/// This is what lets a replacement take over a table while requests are in
+/// flight without the client seeing a failure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_write_fenced_by_another_writer_is_retryable() {
+    use arrow_schema::{DataType, Field, Schema};
+    use std::sync::Arc;
+    use walleye_lance::{LanceDurability, LanceStorageOptions, Table, TableConfig};
+    let d = tempfile::tempdir().unwrap();
+    let service = Service::open(config(d.path(), true)).await.unwrap();
+    let app = router(service.clone());
+
+    let definition = json!({
+        "name": "ledger",
+        "columns": [{"name":"id","type":"int64"},{"name":"value","type":"int64"}],
+        "primary_key": ["id"]
+    });
+    assert_eq!(
+        call(&app, "/v1/streams", definition).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        call(
+            &app,
+            "/v1/streams/ledger/events",
+            json!({"rows":[{"id":1,"value":10}]})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+
+    // A replacement claims the table, exactly as a starting successor does.
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("value", DataType::Int64, false),
+        Field::new("_walleye_seq", DataType::UInt64, false),
+    ]));
+    let successor = TableConfig::new(
+        "ledger",
+        format!("file://{}/store/data/ledger", d.path().display()),
+        schema,
+        vec!["id".into()],
+    )
+    .unwrap();
+    let _claimed = Table::open(
+        successor,
+        LanceStorageOptions::default(),
+        LanceDurability::ObjectStore,
+    )
+    .await
+    .expect("the replacement claims the writer");
+
+    // The original now has a fenced writer. Its next write must tell the
+    // caller to retry, not that the request was bad.
+    let (status, body) = call(
+        &app,
+        "/v1/streams/ledger/events",
+        json!({"rows":[{"id":2,"value":20}]}),
+    )
+    .await;
+    assert_ne!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a fenced write is not the caller's mistake: {body}"
+    );
+    if status != StatusCode::OK {
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a fenced write is retryable: {body}"
+        );
+        assert_eq!(body["outcome"], "not written", "{body}");
+    }
+
+    drop(app);
+    service.close().await;
+}

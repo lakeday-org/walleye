@@ -937,6 +937,21 @@ fn write_failure(error: &Error) -> ApiError {
                 "outcome": "unknown",
             })),
         ),
+        // A writer another process fenced did not store these rows: the
+        // append was refused, not half-done. Whoever holds the writer now
+        // will take them, so this is worth retrying and is not the caller's
+        // mistake. It used to be a 400, which nothing retries.
+        Some(walleye_lance::FenceReason::PeerClaimedEpoch) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": format!(
+                    "another writer took this table while the write was in flight: {error}. \
+                     The rows were not stored; retry and the request reaches the writer that \
+                     holds it now."
+                ),
+                "outcome": "not written",
+            })),
+        ),
         // A request that reached the wrong node is not a bad request: the
         // caller did nothing wrong and the same call to the owner will work.
         // The LanceDB surface already answers 409 for this; these routes
