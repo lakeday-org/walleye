@@ -458,3 +458,59 @@ async fn lancedb_protocol_round_trip() {
     assert_eq!(r.status(), StatusCode::OK);
     service.close().await;
 }
+
+/// A memtable's in-memory vector graph holds a fixed number of rows, and a
+/// put is never split across memtables. Narrow rows reach that count long
+/// before the memtable's byte threshold does, so a large insert into a
+/// small-dimension table used to exhaust the graph and fail the write with
+/// "HNSW vector store capacity 100000 exhausted". Appends are chunked and a
+/// memtable freezes at half its row capacity; both are needed, and only a
+/// table this narrow exercises the second.
+#[tokio::test]
+async fn a_large_insert_into_a_narrow_vector_table_rolls_memtables() {
+    let d = tempfile::tempdir().unwrap();
+    let service = Service::open(config(d.path())).await.unwrap();
+    let app = router(service.clone());
+    let arrow = "application/vnd.apache.arrow.stream";
+
+    let inserted: Vec<(i64, &str, [f32; 2])> = (0..150_000)
+        .map(|id| (id, "n", [id as f32, -(id as f32)]))
+        .collect();
+    let (status, _) = send(
+        &app,
+        "POST",
+        "/v1/table/narrow/create/?mode=create",
+        arrow,
+        ipc(&[batch(&inserted)]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, count) = post_json(&app, "/v1/table/narrow/count_rows/", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        count,
+        json!(150_000),
+        "every row survives the memtable rolls"
+    );
+
+    // The rows are spread across several memtables and generations now, and
+    // search still merges them into one answer.
+    let (status, bytes) = send(
+        &app,
+        "POST",
+        "/v1/table/narrow/query/",
+        "application/json",
+        json!({"k": 1, "vector": [149_999.0, -149_999.0], "prefilter": true, "version": null})
+            .to_string()
+            .into_bytes(),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    assert_eq!(ids(&rows(&bytes)), [149_999]);
+    service.close().await;
+}

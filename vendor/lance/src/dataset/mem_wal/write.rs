@@ -942,6 +942,7 @@ async fn replay_memtable_from_wal(
     wal_flusher: &WalFlusher,
     index_configs: &[MemIndexConfig],
     max_memtable_size: usize,
+    max_memtable_rows: usize,
 ) -> Result<ReplayResult> {
     // WAL positions are 1-based (see `FIRST_WAL_ENTRY_POSITION`), so a
     // cursor of 0 means "no flush has ever stamped this shard" and replay
@@ -1008,6 +1009,7 @@ async fn replay_memtable_from_wal(
                         && memtable_reached_flush_threshold(
                             &active,
                             max_memtable_size,
+                            max_memtable_rows,
                             batches.len(),
                         )
                     {
@@ -1090,9 +1092,14 @@ async fn replay_memtable_from_wal(
 fn memtable_reached_flush_threshold(
     memtable: &MemTable,
     max_memtable_size: usize,
+    max_memtable_rows: usize,
     incoming_batches: usize,
 ) -> bool {
+    // Rows trigger at half the capacity: a put is never split across
+    // memtables, so a memtable that freezes at half leaves room for one more
+    // put of up to half the capacity without exhausting the vector graph.
     memtable.estimated_size() >= max_memtable_size
+        || memtable.row_count().saturating_mul(2) >= max_memtable_rows
         || memtable.batch_store().remaining_capacity() < incoming_batches
 }
 
@@ -1426,8 +1433,12 @@ impl SharedWriterState {
 
         // Checked post-insert: flush if there is no longer room for even one more
         // batch (or the byte threshold is crossed). Same predicate replay uses.
-        let should_flush =
-            memtable_reached_flush_threshold(&state.memtable, self.config.max_memtable_size, 1);
+        let should_flush = memtable_reached_flush_threshold(
+            &state.memtable,
+            self.config.max_memtable_size,
+            self.config.max_memtable_rows,
+            1,
+        );
 
         if should_flush {
             state.flush_requested = true;
@@ -1904,6 +1915,7 @@ impl ShardWriter {
             &wal_flusher,
             index_configs,
             config.max_memtable_size,
+            config.max_memtable_rows,
         )
         .await?;
 
