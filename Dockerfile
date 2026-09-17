@@ -8,8 +8,8 @@ COPY vendor ./vendor
 RUN --mount=type=cache,id=walleye-cargo-registry,target=/usr/local/cargo/registry \
     --mount=type=cache,id=walleye-cargo-git,target=/usr/local/cargo/git \
     --mount=type=cache,id=walleye-cargo-target,target=/src/target \
-    cargo build --locked -j 12 -p walleye-node -p walleye-workload -p walleye-bitr-server && \
-    mkdir /out && cp target/debug/walleye-node target/debug/walleye-workload target/debug/walleye-bitr-server /out/
+    cargo build --locked --release -j 12 -p walleye-node -p walleye-workload -p walleye-bitr-server && \
+    mkdir /out && cp target/release/walleye-node target/release/walleye-workload target/release/walleye-bitr-server /out/
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl && rm -rf /var/lib/apt/lists/*
 COPY --from=build /out/ /usr/local/bin/
