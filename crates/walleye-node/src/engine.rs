@@ -1685,6 +1685,37 @@ mod tests {
         engine.writer = writer;
         engine
     }
+    /// A table whose name has a capital in it is reachable by the quoted name
+    /// the catalog reports, and by nothing else.
+    ///
+    /// Registering it with a `&str` filed it under a folded `pets`, so `FROM
+    /// "Pets"` — the only form available once a name holds a space or a
+    /// reserved word — could not resolve, while `/v1/table/Pets/` and the
+    /// cluster's own routing both still called it `Pets`.
+    #[tokio::test]
+    async fn a_table_is_queried_by_the_name_the_catalog_reports() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = engine(dir.path(), None, "cache").await;
+        e.define(definition("Pets")).await.unwrap();
+        assert_eq!(e.table_names().await.unwrap(), ["Pets"]);
+
+        let answered = e.query(r#"SELECT count(*) AS n FROM "Pets""#).await;
+        assert!(answered.is_ok(), "quoted exact name: {:?}", answered.err());
+
+        // Folding happens on the reference in the statement, as SQL says it
+        // should, so neither of these names the table that exists.
+        for missing in [
+            r#"SELECT count(*) FROM "pets""#,
+            "SELECT count(*) FROM Pets",
+        ] {
+            assert!(
+                e.query(missing).await.is_err(),
+                "{missing} names no table here"
+            );
+        }
+        e.close().await;
+    }
+
     async fn check_independent_streams(bitr: bool) {
         let dir = tempfile::tempdir().unwrap();
         let writer = bitr.then(|| {
