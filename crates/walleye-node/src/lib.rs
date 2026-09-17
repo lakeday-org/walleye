@@ -228,7 +228,9 @@ pub struct Service {
 async fn quorum_state(client: &reqwest::Client, gateway: &str) -> (bool, serde_json::Value) {
     match client
         .get(format!("{}/readyz", gateway.trim_end_matches('/')))
-        .timeout(std::time::Duration::from_secs(2))
+        // Generous: the gateway probes every member before answering, and a
+        // member busy serving writes is not a member that has gone away.
+        .timeout(std::time::Duration::from_secs(10))
         .send()
         .await
     {
@@ -432,12 +434,29 @@ impl Service {
             // reads and `/healthz` continue.
             if let Some(gateway) = gateway {
                 let client = reqwest::Client::new();
+                // Withdrawing write readiness costs every client a refusal, so
+                // it takes several failed polls in a row, while restoring it
+                // takes one. A probe that times out because a member is busy
+                // is not a quorum that has gone away, and the append itself
+                // still refuses a write it cannot make durable. `/readyz`
+                // meanwhile reports what the last poll saw, without waiting.
+                const WITHDRAW_AFTER: u32 = 3;
+                let mut consecutive_failures = 0_u32;
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                     let (ready, detail) = quorum_state(&client, &gateway).await;
                     *self.readiness() = detail.clone();
-                    if self.write_ready.swap(ready, Ordering::AcqRel) != ready {
-                        eprintln!("walleye.ready stage=quorum write_ready={ready} detail={detail}");
+                    consecutive_failures = if ready {
+                        0
+                    } else {
+                        consecutive_failures.saturating_add(1)
+                    };
+                    let writable = ready || consecutive_failures < WITHDRAW_AFTER;
+                    if self.write_ready.swap(writable, Ordering::AcqRel) != writable {
+                        eprintln!(
+                            "walleye.ready stage=quorum write_ready={writable} \
+                             consecutive_failures={consecutive_failures} detail={detail}"
+                        );
                     }
                 }
             }

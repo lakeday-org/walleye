@@ -10793,7 +10793,15 @@ impl ReplicaGateway {
                 control.adopt_manifest(&manifest, true)?;
                 return Ok(manifest);
             }
-            if acknowledgements + (CONTROL_COHORT_SIZE - unsupported - failures) < ACK_QUORUM {
+            // Saturating on purpose: the cohort is exactly CONTROL_COHORT_SIZE
+            // members, enforced where the peer list is built, so the
+            // subtraction cannot go below zero today. It is 300 lines from the
+            // invariant that guarantees it, and an underflow here would panic
+            // a gateway rather than merely skip an early break.
+            let outstanding = CONTROL_COHORT_SIZE
+                .saturating_sub(unsupported)
+                .saturating_sub(failures);
+            if acknowledgements + outstanding < ACK_QUORUM {
                 // Drain all responses when every observed peer is a legacy
                 // node without a control endpoint. Only after the final
                 // response can the compatibility path distinguish that case

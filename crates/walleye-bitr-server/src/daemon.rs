@@ -76,8 +76,30 @@ async fn run_combined(root_key: &str) -> Result<(), Box<dyn std::error::Error>> 
     // backend, and after every active node advertises the new protocol.
     // A fresh volume must learn the archived prefixes before it serves, or
     // the first append after a cold start fails for want of a predecessor.
-    let seeded = gateway.seed_from_archive(&node).await?;
-    eprintln!("lakeday.replica boot stage=seed_from_archive streams={seeded}");
+    // Seeding reads the archive, so a transient S3 or disk failure here must
+    // not end the process: exiting would restart the node, fail again, and
+    // turn a passing fault into a crash loop whose cause never reaches
+    // readiness. Never proceed unseeded either, because a node that skipped
+    // it refuses the first append to any archived stream. Waiting visibly is
+    // the honest failure: the listeners stay unbound and the node never
+    // reports healthy.
+    let mut attempt = 0_u32;
+    let seeded = loop {
+        match gateway.seed_from_archive(&node).await {
+            Ok(seeded) => break seeded,
+            Err(error) => {
+                if attempt.is_multiple_of(8) {
+                    eprintln!(
+                        "lakeday.replica boot stage=seed_from_archive outcome=retrying \
+                         attempt={attempt} error={error}"
+                    );
+                }
+                attempt += 1;
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+        }
+    };
+    eprintln!("lakeday.replica boot stage=seed_from_archive streams={seeded} attempts={attempt}");
     let probe_archive = Arc::clone(&archive);
     let probe_gateway = Arc::clone(&gateway);
     tokio::spawn(async move {
