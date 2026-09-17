@@ -409,9 +409,11 @@ async fn the_catalog_tolerates_fields_this_version_does_not_know() {
 /// A fenced writer is a dead handle, not a dead stream. Before this was
 /// handled, a writer fenced once left its table answering the fence error to
 /// every read and write until the process restarted, while readiness reported
-/// the cluster healthy. The next use must open a fresh writer instead.
+/// the cluster healthy. A process another writer superseded must stand down
+/// instead: it cannot take the writer back, because taking it back is what
+/// makes two processes trade it while both answer 200.
 #[tokio::test]
-async fn a_fenced_writer_is_replaced_on_the_next_use() {
+async fn a_superseded_writer_stands_down_instead_of_taking_it_back() {
     use arrow_schema::{DataType, Field, Schema};
     use std::sync::Arc;
     use walleye_lance::{LanceDurability, LanceStorageOptions, Table, TableConfig};
@@ -458,42 +460,53 @@ async fn a_fenced_writer_is_replaced_on_the_next_use() {
     .await
     .expect("a second writer claims the next epoch");
 
-    // The stream keeps serving: the next write opens a fresh writer.
+    // The superseded process stands down rather than taking the writer back.
+    // Reopening would claim the epoch again and the two would trade it while
+    // both answered 200, so the write is refused, and refused retryably: the
+    // rows were not stored and the writer that holds the table will take them.
     let (status, body) = call(
         &app,
         "/v1/streams/events/events",
         json!({"rows":[{"id":2,"value":20}]}),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let (status, rows) = call(
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "a superseded writer answers retryably: {body}"
+    );
+    assert_eq!(body["outcome"], "not written", "{body}");
+
+    // And it stays stood down: a second attempt does not quietly reopen.
+    let (status, body) = call(
+        &app,
+        "/v1/streams/events/events",
+        json!({"rows":[{"id":3,"value":30}]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    // Reads stand down with it. Serving a stream this process no longer
+    // holds would mean reopening, which is the thing it must not do, so the
+    // whole stream moves to the writer that took it rather than half of it.
+    //
+    // The status is a 400 rather than something retryable, because the SQL
+    // layer flattens the typed fence on its way out. Known, and not fixed
+    // here: the write path is what a takeover needs.
+    let (status, _rows) = call(
         &app,
         "/v1/query",
         json!({"sql":"SELECT count(*) AS n FROM events"}),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "{rows}");
-    assert_eq!(rows[0]["n"], 2, "both rows survive the fence: {rows}");
+    assert_ne!(status, StatusCode::OK, "a stood-down stream serves nothing");
 
-    // And reads keep working too.
-    let (status, rows) = call(
-        &app,
-        "/v1/query",
-        json!({"sql":"SELECT sum(value) AS total FROM events"}),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(rows[0]["total"], 30);
+    // The rows are not lost: the process that took the writer replays the
+    // log below its fence sentinel and adopts them.
     drop(claimed);
+    drop(app);
     service.close().await;
 }
 
-/// A writer another process fenced did not store its rows. Whoever holds the
-/// table now will take them, so the caller must be told to retry rather than
-/// that it made a bad request.
-///
-/// This is what lets a replacement take over a table while requests are in
-/// flight without the client seeing a failure.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_write_fenced_by_another_writer_is_retryable() {
     use arrow_schema::{DataType, Field, Schema};
