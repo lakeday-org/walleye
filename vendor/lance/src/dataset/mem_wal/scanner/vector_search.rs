@@ -212,6 +212,7 @@ impl LsmVectorSearchPlanner {
     /// An execution plan that returns the top-K nearest neighbors across all
     /// LSM levels, with stale results filtered out.
     #[instrument(name = "lsm_vector_search", level = "info", skip_all, fields(k, nprobes, vector_column = %self.vector_column, distance_type = ?self.distance_type))]
+    #[allow(clippy::too_many_arguments)]
     pub async fn plan_search(
         &self,
         query_vector: &FixedSizeListArray,
@@ -413,6 +414,7 @@ impl LsmVectorSearchPlanner {
 
     /// Build KNN plan for a single data source.
     ///
+    #[allow(clippy::too_many_arguments)]
     async fn build_knn_plan(
         &self,
         source: &LsmDataSource,
@@ -726,7 +728,9 @@ mod tests {
         );
 
         let query = create_query_vector();
-        let plan = planner.plan_search(&query, 10, 8, None, false, 1.0).await;
+        let plan = planner
+            .plan_search(&query, 10, 8, None, None, false, 1.0)
+            .await;
 
         // Plan construction must succeed. Execution against empty data is a
         // separate concern handled by integration tests.
@@ -752,7 +756,7 @@ mod tests {
 
         let query = create_query_vector();
         let err = planner
-            .plan_search(&query, 0, 1, None, false, 1.0)
+            .plan_search(&query, 0, 1, None, None, false, 1.0)
             .await
             .unwrap_err();
         assert!(
@@ -761,7 +765,7 @@ mod tests {
         );
 
         let err = planner
-            .plan_search(&query, 1, 0, None, false, 1.0)
+            .plan_search(&query, 1, 0, None, None, false, 1.0)
             .await
             .unwrap_err();
         assert!(
@@ -852,7 +856,7 @@ mod tests {
 
         let query = create_query_vector();
         let plan = planner
-            .plan_search(&query, 3, 1, None, false, 1.0)
+            .plan_search(&query, 3, 1, None, None, false, 1.0)
             .await
             .expect("planner should produce a plan");
 
@@ -974,7 +978,7 @@ mod tests {
 
         let query = create_query_vector();
         let plan = planner
-            .plan_search(&query, 1, 1, None, false, 2.0)
+            .plan_search(&query, 1, 1, None, None, false, 2.0)
             .await
             .unwrap();
         let stream = plan.execute(0, SessionContext::new().task_ctx()).unwrap();
@@ -1052,7 +1056,7 @@ mod tests {
 
         let query = create_query_vector();
         let plan = planner
-            .plan_search(&query, 10, 1, None, false, 1.0)
+            .plan_search(&query, 10, 1, None, None, false, 1.0)
             .await
             .expect("planner should produce a filtered plan");
 
@@ -1135,7 +1139,7 @@ mod tests {
 
         let query = create_query_vector();
         let plan = planner
-            .plan_search(&query, 3, 1, None, false, 1.0)
+            .plan_search(&query, 3, 1, None, None, false, 1.0)
             .await
             .expect("planner should produce a filtered active plan");
 
@@ -1208,7 +1212,7 @@ mod tests {
 
         let query = create_query_vector();
         let plan = planner
-            .plan_search(&query, 2, 1, None, false, 1.0)
+            .plan_search(&query, 2, 1, None, None, false, 1.0)
             .await
             .expect("planner should produce a filtered base plan");
 
@@ -1303,7 +1307,7 @@ mod tests {
 
         let query = create_query_vector();
         let plan = planner
-            .plan_search(&query, 1, 1, None, false, 2.0)
+            .plan_search(&query, 1, 1, None, None, false, 2.0)
             .await
             .unwrap();
         let ctx = SessionContext::new();
@@ -1432,7 +1436,7 @@ mod tests {
 
         let query = create_query_vector();
         let plan = planner
-            .plan_search(&query, 10, 1, None, false, 1.0)
+            .plan_search(&query, 10, 1, None, None, false, 1.0)
             .await
             .expect("planner should produce a filtered plan");
 
@@ -1560,7 +1564,7 @@ mod tests {
 
         let query = create_query_vector();
         let plan = planner
-            .plan_search(&query, 10, 1, None, false, 1.0)
+            .plan_search(&query, 10, 1, None, None, false, 1.0)
             .await
             .expect("planner should produce a filtered base+active plan");
 
@@ -1653,7 +1657,7 @@ mod tests {
 
         let query = create_query_vector();
         let plan = planner
-            .plan_search(&query, 3, 1, None, false, 1.0)
+            .plan_search(&query, 3, 1, None, None, false, 1.0)
             .await
             .expect("planner should produce a plan");
         let ctx = SessionContext::new();
@@ -1761,7 +1765,7 @@ mod tests {
         let query = create_query_vector();
         let projection = vec!["vector".to_string()];
         let plan = planner
-            .plan_search(&query, 3, 1, Some(&projection), false, 1.0)
+            .plan_search(&query, 3, 1, None, Some(&projection), false, 1.0)
             .await
             .expect("planner should produce a plan");
 
@@ -1844,7 +1848,7 @@ mod tests {
             "_rowid".to_string(),
         ];
         let plan = planner
-            .plan_search(&query, 3, 1, Some(&projection), false, 1.0)
+            .plan_search(&query, 3, 1, None, Some(&projection), false, 1.0)
             .await
             .expect(
                 "planner must accept `_distance`/`_rowid` in projection without breaking the plan",
@@ -1952,7 +1956,7 @@ mod tests {
 
         let query = create_query_vector();
         let plan = planner
-            .plan_search(&query, 3, 1, None, false, 1.0)
+            .plan_search(&query, 3, 1, None, None, false, 1.0)
             .await
             .expect("planner should produce a plan");
 
@@ -2101,7 +2105,7 @@ mod tests {
 
         let query = create_query_vector();
         let plan = planner
-            .plan_search(&query, 5, 1, None, false, 1.0)
+            .plan_search(&query, 5, 1, None, None, false, 1.0)
             .await
             .unwrap();
         let ctx = SessionContext::new();
@@ -2224,7 +2228,7 @@ mod tests {
             "vector".to_string(),
         ];
         let plan = planner
-            .plan_search(&query, 3, 1, Some(&projection), false, 1.0)
+            .plan_search(&query, 3, 1, None, Some(&projection), false, 1.0)
             .await
             .expect("planner should produce a plan");
 
@@ -2300,7 +2304,7 @@ mod tests {
         ];
         let query = create_query_vector();
         let plan = planner
-            .plan_search(&query, 5, 1, Some(&projection), false, 1.0)
+            .plan_search(&query, 5, 1, None, Some(&projection), false, 1.0)
             .await
             .expect("empty plan must accept system columns in projection");
 
@@ -2340,7 +2344,7 @@ mod tests {
         let projection = vec!["missing".to_string()];
         let query = create_query_vector();
         let err = planner
-            .plan_search(&query, 5, 1, Some(&projection), false, 1.0)
+            .plan_search(&query, 5, 1, None, Some(&projection), false, 1.0)
             .await
             .unwrap_err();
         assert!(
@@ -2371,7 +2375,7 @@ mod tests {
 
         let query = create_query_vector();
         let plan = planner
-            .plan_search(&query, 10, 8, None, false, 1.0)
+            .plan_search(&query, 10, 8, None, None, false, 1.0)
             .await
             .expect("planner should produce a plan without a base table");
 
@@ -2497,7 +2501,7 @@ mod tests {
         // memtable arm should dedup before top-k so pk=1 appears exactly once.
         let query = create_query_vector();
         let plan = planner
-            .plan_search(&query, 5, 1, None, false, 1.0)
+            .plan_search(&query, 5, 1, None, None, false, 1.0)
             .await
             .unwrap();
 
@@ -2622,7 +2626,7 @@ mod tests {
         // pk1@near cannot leak even though fresh pk1@far ranks 7th by distance.
         let query = create_query_vector();
         let plan = planner
-            .plan_search(&query, 3, 1, None, false, 1.0)
+            .plan_search(&query, 3, 1, None, None, false, 1.0)
             .await
             .unwrap();
         let ctx = SessionContext::new();
@@ -2728,7 +2732,7 @@ mod tests {
 
         let query = create_query_vector();
         let plan = planner
-            .plan_search(&query, 1, 1, None, false, 1.0)
+            .plan_search(&query, 1, 1, None, None, false, 1.0)
             .await
             .unwrap();
         let ctx = SessionContext::new();
@@ -2782,7 +2786,7 @@ mod tests {
         // The block-list is unconditional and cannot be disabled via
         // overfetch_factor; invalid sub-1.0 values are rejected instead.
         let err = planner
-            .plan_search(&query, 1, 1, None, false, 0.0)
+            .plan_search(&query, 1, 1, None, None, false, 0.0)
             .await
             .unwrap_err();
         assert!(
@@ -2910,7 +2914,7 @@ mod tests {
         let query = create_query_vector();
         // Over-fetch (2.5x) so the post-filter can backfill the all-stale top-k.
         let plan = planner
-            .plan_search(&query, 3, 1, None, false, 2.5)
+            .plan_search(&query, 3, 1, None, None, false, 2.5)
             .await
             .unwrap();
         let ctx = SessionContext::new();
@@ -2988,7 +2992,7 @@ mod tests {
 
         let query = create_query_vector();
         let plan = planner
-            .plan_search(&query, 1, 1, None, false, 1.0)
+            .plan_search(&query, 1, 1, None, None, false, 1.0)
             .await
             .unwrap();
         let ctx = SessionContext::new();
@@ -3113,7 +3117,7 @@ mod tests {
 
         let query = create_query_vector();
         let plan = planner
-            .plan_search(&query, 1, 1, None, false, 1.0)
+            .plan_search(&query, 1, 1, None, None, false, 1.0)
             .await
             .unwrap();
         let ctx = SessionContext::new();
@@ -3247,7 +3251,7 @@ mod tests {
 
         let query = create_query_vector();
         let plan = planner
-            .plan_search(&query, 10, 1, None, false, 1.0)
+            .plan_search(&query, 10, 1, None, None, false, 1.0)
             .await
             .unwrap();
         let stream = plan.execute(0, SessionContext::new().task_ctx()).unwrap();
@@ -3351,7 +3355,7 @@ mod tests {
 
         let query = create_query_vector();
         let plan = planner
-            .plan_search(&query, 5, 1, None, false, 1.0)
+            .plan_search(&query, 5, 1, None, None, false, 1.0)
             .await
             .unwrap();
         let ctx = SessionContext::new();
