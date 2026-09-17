@@ -389,3 +389,74 @@ async fn a_pipeline_runs_itself() {
     assert_eq!(hot, 2, "both hot sensors reached the last tier unaided");
     unsafe { std::env::remove_var("WALLEYE_VIEW_IDLE_SECONDS") };
 }
+
+/// A worker's heap is part of the machine's memory, not extra to it. A view
+/// that asks for more than the node has left is refused before the worker
+/// runs, and its batch stays where it was.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_worker_larger_than_the_budget_is_refused_before_it_runs() {
+    let d = tempfile::tempdir().unwrap();
+    let app = seeded(d.path(), &["a"], &[1.0]).await;
+    defined(
+        &app,
+        "greedy",
+        json!({
+            "source": "raw",
+            "target": "never",
+            "worker": "export default rows => rows",
+            // More than the whole node, let alone what is left of it.
+            "worker_heap_mb": 4096
+        }),
+    )
+    .await;
+    let (status, body) = post(&app, "/v1/view/greedy/refresh/", JSON, b"{}".to_vec()).await;
+    assert_ne!(status, StatusCode::OK, "the node cannot afford this worker");
+    let said = body.to_string();
+    assert!(
+        said.contains("worker greedy") || said.to_lowercase().contains("resources"),
+        "names the borrower and the budget, got {said}"
+    );
+
+    let described = post(&app, "/v1/view/greedy/describe/", JSON, b"{}".to_vec()).await;
+    assert_eq!(
+        described.1["cursor"].as_u64().unwrap(),
+        0,
+        "the batch was not consumed: {}",
+        described.1
+    );
+    assert_eq!(
+        described.1["worker_heap_mb"], 4096,
+        "the view keeps its own sizing"
+    );
+}
+
+/// A view sizes its own worker, and a modest one runs inside a budget that
+/// refuses a large one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_view_sizes_its_own_worker() {
+    let d = tempfile::tempdir().unwrap();
+    let app = seeded(d.path(), &["a", "b"], &[1.0, 2.0]).await;
+    defined(
+        &app,
+        "modest",
+        json!({
+            "source": "raw",
+            "target": "doubled",
+            "worker": "export default rows => rows.map(r => ({ sensor: r.sensor, \
+                       twice: r.celsius * 2 }))",
+            "worker_heap_mb": 32,
+            "worker_seconds": 5
+        }),
+    )
+    .await;
+    let progress = refresh(&app, "modest").await;
+    assert_eq!(progress["written"], 2, "{progress}");
+    let rows = sql(&app, "SELECT twice FROM doubled ORDER BY twice").await;
+    let doubled: Vec<f64> = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["twice"].as_f64().unwrap())
+        .collect();
+    assert_eq!(doubled, vec![2.0, 4.0], "{rows}");
+}

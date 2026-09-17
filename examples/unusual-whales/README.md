@@ -1,0 +1,108 @@
+# A medallion pipeline over live option flow
+
+Four tiers, declared once, driven by the node. Nothing here calls refresh.
+
+```
+bronze   what the provider sent, strings and all
+silver   a JavaScript worker turns those strings into numbers and writes
+         one sentence describing each print
+gold     every print is labelled: direction, conviction, urgency, and how
+         sure the model is about each
+desk     the few worth interrupting somebody for, posted to an endpoint
+```
+
+## Running it
+
+```sh
+export UNUSUAL_WHALES_API_KEY=...     # option flow
+export TYPESAFE_API_KEY=...           # the labelling model
+export WALLEYE_TOKEN=flow-demo-token-000
+
+walleye-node &                        # WALLEYE_ROOT_URI, WALLEYE_DIR as usual
+./pipeline.sh 100
+```
+
+## What each tier is
+
+**bronze** is a plain stream. Premium, strike and ratios arrive as text because
+that is how the provider sends them, and bronze is supposed to be what actually
+arrived. It is keyed on the provider's own alert id, so pulling the same window
+twice does not duplicate anything.
+
+**silver** is a worker. Converting a dozen string fields to numbers and
+composing a sentence is the kind of work that is tedious in SQL and ordinary in
+JavaScript:
+
+```js
+export default (rows) => rows.map((r) => {
+  const premium = Number(r.premium);
+  const side = Number(r.ask_side_premium) > Number(r.bid_side_premium) ? 'ask' : 'bid';
+  return {
+    ticker: r.ticker, kind: r.kind, strike: r.strike, premium, side,
+    summary: `${r.ticker} ${r.kind} $${r.strike} expiring ${r.expiry}: ` +
+             `$${Math.round(premium).toLocaleString('en-US')} of premium, ` +
+             `filled on the ${side} side, ...`
+  };
+});
+```
+
+**gold** labels each print with one call. The service answers every question
+about a row in parallel, so asking three things costs about what asking one
+costs. Asking them as three separate function calls would cost three times as
+much, which is why this uses `decide`:
+
+```sql
+SELECT ticker, premium, summary,
+       d['stance']['label']      AS stance,
+       d['stance']['confidence'] AS stance_sure,
+       d['conviction']['label']  AS conviction,
+       d['urgent']['value']      AS urgency
+  FROM (SELECT ticker, premium, summary, decide(summary, '<question set>') AS d
+          FROM silver_flow)
+```
+
+**desk** writes nothing. It filters on confidence and posts what is left:
+
+```json
+{"source": "gold_labelled",
+ "sql": "SELECT ... FROM gold_labelled WHERE stance_sure >= 0.7 AND urgency >= 0.5 AND premium >= 500000",
+ "alert": {"url": "https://example.test/desk"}}
+```
+
+## What came out
+
+From one hundred live prints:
+
+| stance | conviction | prints |
+|---|---|---|
+| bullish | notable | 29 |
+| bearish | aggressive | 22 |
+| bearish | notable | 22 |
+| neutral | notable | 14 |
+| bullish | aggressive | 12 |
+| bullish | routine | 1 |
+
+Three cleared the desk threshold and were delivered:
+
+```json
+{"ticker":"SPX","stance":"bullish","conviction":"notable","premium":525600,
+ "summary":"SPX put $7450 expiring 2026-09-18: $525,600 of premium, filled on the bid side, ..."}
+{"ticker":"SPY","stance":"bearish","conviction":"aggressive","premium":604420,
+ "summary":"SPY put $716 expiring 2026-10-16: $604,420 of premium, filled on the ask side, volume is 6.81 of open interest, ..."}
+{"ticker":"IWM","stance":"bearish","conviction":"notable","premium":882504,
+ "summary":"IWM put $275 expiring 2026-09-30: $882,504 of premium, filled on the ask side, ..."}
+```
+
+A put sold on the bid came back bullish and a put bought on the ask came back
+bearish, which is the right way round. Index spreads came back neutral with low
+confidence, which is also right: they are genuinely ambiguous, and the
+confidence says so rather than guessing.
+
+## Things worth knowing
+
+Each tier keeps a cursor, so a second run only processes what arrived since.
+Delivery happens before the cursor moves, so an endpoint that was down is
+offered the same rows again rather than never.
+
+Labelling costs one call per row. That is why it happens here, once, where the
+row is written, and not in the query somebody runs later.

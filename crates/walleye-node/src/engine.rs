@@ -269,6 +269,9 @@ impl StreamDefinition {
                 if c.name.is_empty() || !seen.insert(&c.name) {
                     return Err("invalid or duplicate column".into());
                 }
+                if c.name.starts_with('_') {
+                    return Err(format!("column {} uses a reserved name", c.name).into());
+                }
                 let t = match c.kind.as_str() {
                     "string" => DataType::Utf8,
                     "int64" => DataType::Int64,
@@ -292,6 +295,10 @@ impl StreamDefinition {
         {
             return Err("columns and distinct primary keys are required".into());
         }
+        // Every stream carries arrival order, however it was declared. A
+        // consumer's cursor is useless on a stream that does not have it.
+        let mut fields = fields;
+        fields.push(Field::new(HIDDEN_SEQ, DataType::UInt64, false));
         Ok(TableConfig::new(
             &self.name,
             format!("{}/data/{}", root.trim_end_matches('/'), self.name),
@@ -832,10 +839,41 @@ impl Engine {
             serde_json::to_writer(&mut ndjson, &row)?;
             ndjson.push(b'\n');
         }
-        let batches = arrow_json::ReaderBuilder::new(stream.config.schema.clone())
+        // Decode against the columns a client declared, then let the shared
+        // path add what the node maintains. Decoding against the full schema
+        // would leave the arrival order null, and it is not nullable.
+        let declared = Arc::new(Schema::new(
+            stream
+                .config
+                .schema
+                .fields()
+                .iter()
+                .filter(|field| !hidden(field.name()))
+                .cloned()
+                .collect::<Vec<_>>(),
+        ));
+        let decoded = arrow_json::ReaderBuilder::new(declared)
             .with_batch_size(1024)
             .build(Cursor::new(ndjson))?
             .collect::<Result<Vec<RecordBatch>, _>>()?;
+        let mut next = self
+            .reserve_seq(
+                name,
+                &stream,
+                decoded.iter().map(|b| b.num_rows() as u64).sum(),
+            )
+            .await?;
+        let mut batches = Vec::with_capacity(decoded.len());
+        for batch in decoded {
+            let rows = batch.num_rows() as u64;
+            batches.push(conform_batch(
+                &stream.definition,
+                &stream.config.schema,
+                batch,
+                next,
+            )?);
+            next = next.saturating_add(rows);
+        }
         self.append_prepared(&stream, batches).await?;
         stream.version.fetch_add(1, Ordering::AcqRel);
         Ok(count)
@@ -1303,8 +1341,14 @@ impl Engine {
             .collect();
         let result =
             walleye_lance::query_with_gathered(&self.cache.storage, &tables, gathered, sql).await?;
+        // The columns the node maintains are its own business. A query that
+        // names one gets it; `SELECT *` does not hand it out.
+        let shown = result
+            .iter()
+            .map(strip_hidden)
+            .collect::<Result<Vec<_>, _>>()?;
         let mut writer = arrow_json::ArrayWriter::new(BoundedOutput(Vec::new()));
-        writer.write_batches(&result.iter().collect::<Vec<_>>())?;
+        writer.write_batches(&shown.iter().collect::<Vec<_>>())?;
         writer.finish()?;
         Ok(writer.into_inner().0)
     }
@@ -1972,6 +2016,40 @@ pub struct ViewDefinition {
     pub alert: Option<Alert>,
     #[serde(default = "default_batch_rows")]
     pub batch_rows: usize,
+    /// Heap the worker may use, in MiB. Taken from the node's one budget
+    /// like everything else that allocates, so a worker cannot be sized
+    /// beyond what the machine has left.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_heap_mb: Option<usize>,
+    /// Wall clock one batch may take, in seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_seconds: Option<u64>,
+}
+impl ViewDefinition {
+    /// What this view's worker may spend. A deployment sizes its own
+    /// workers; the node only decides whether it can afford them.
+    fn limits(&self) -> walleye_v8::Limits {
+        let fallback = |name: &str, default: u64| {
+            std::env::var(name)
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .filter(|value| *value > 0)
+                .unwrap_or(default)
+        };
+        walleye_v8::Limits {
+            heap_bytes: self
+                .worker_heap_mb
+                .map(|mb| mb as u64)
+                .unwrap_or_else(|| fallback("WALLEYE_WORKER_HEAP_MB", 128))
+                as usize
+                * 1024
+                * 1024,
+            deadline: std::time::Duration::from_secs(
+                self.worker_seconds
+                    .unwrap_or_else(|| fallback("WALLEYE_WORKER_SECONDS", 15)),
+            ),
+        }
+    }
 }
 /// Where a view sends what it found.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -2159,11 +2237,28 @@ impl Engine {
         if let Some(worker) = &view.worker
             && !worker.trim().is_empty()
         {
+            let limits = view.limits();
+            // A worker's heap is part of the machine's memory, not extra to
+            // it. Reserving it here means a worker too large for what is
+            // left is refused before it runs, and that the cache gives up
+            // the room while it does run.
+            let _heap = self
+                .cache
+                .resources
+                .reserve_memory(&format!("worker {}", view.name), limits.heap_bytes)
+                .map_err(|error| -> Error { Box::new(error) })?;
+            let expected = match &view.target {
+                Some(target) => self.definition(target).await.ok().map(|stream| {
+                    Arc::new(stream.definition.user_schema(stream.config.schema.as_ref()))
+                }),
+                None => None,
+            };
             let worker = worker.clone();
             let handed = produced;
-            produced = tokio::task::spawn_blocking(move || run_worker(&worker, &handed))
-                .await
-                .map_err(|error| -> Error { error.to_string().into() })??;
+            produced =
+                tokio::task::spawn_blocking(move || run_worker(&worker, &handed, limits, expected))
+                    .await
+                    .map_err(|error| -> Error { error.to_string().into() })??;
         }
         let made: usize = produced.iter().map(RecordBatch::num_rows).sum();
 
@@ -2369,13 +2464,18 @@ fn highest_in(batches: &[RecordBatch]) -> Result<Option<u64>, Error> {
 /// The returned shape is whatever the worker produced. It is read back by
 /// inference rather than forced into the source's schema, because a transform
 /// that could not change the shape of a row would not be much of a transform.
-fn run_worker(worker: &str, batches: &[RecordBatch]) -> Result<Vec<RecordBatch>, Error> {
+fn run_worker(
+    worker: &str,
+    batches: &[RecordBatch],
+    limits: walleye_v8::Limits,
+    expected: Option<Arc<Schema>>,
+) -> Result<Vec<RecordBatch>, Error> {
     let mut writer = arrow_json::ArrayWriter::new(Vec::new());
     writer.write_batches(&batches.iter().collect::<Vec<_>>())?;
     writer.finish()?;
     let rows = String::from_utf8(writer.into_inner())?;
 
-    let produced = walleye_v8::run(worker, &rows, worker_limits())?;
+    let produced = walleye_v8::run(worker, &rows, limits)?;
     let values: Vec<serde_json::Value> = serde_json::from_str(&produced)?;
     if values.is_empty() {
         return Ok(Vec::new());
@@ -2385,30 +2485,21 @@ fn run_worker(worker: &str, batches: &[RecordBatch]) -> Result<Vec<RecordBatch>,
             format!("worker returned a row that is not an object at position {index}").into(),
         );
     }
-    let schema = Arc::new(arrow_json::reader::infer_json_schema_from_iterator(
-        values
-            .iter()
-            .map(Ok::<&serde_json::Value, arrow_schema::ArrowError>),
-    )?);
+    // Once a target exists its schema is the authority. Inferring afresh from
+    // each batch would let a column that happened to be whole numbers in the
+    // first batch reject a fractional one in the second.
+    let schema = match expected {
+        Some(schema) => schema,
+        None => Arc::new(arrow_json::reader::infer_json_schema_from_iterator(
+            values
+                .iter()
+                .map(Ok::<&serde_json::Value, arrow_schema::ArrowError>),
+        )?),
+    };
     if schema.fields().iter().any(|f| hidden(f.name())) {
         return Err("worker returned a column using a reserved name".into());
     }
     let mut decoder = arrow_json::ReaderBuilder::new(schema).build_decoder()?;
     decoder.serialize(&values)?;
     Ok(decoder.flush()?.into_iter().collect())
-}
-/// What one worker batch may spend. Both are declared before the worker runs,
-/// because a limit discovered afterwards is not a limit.
-fn worker_limits() -> walleye_v8::Limits {
-    let number = |name: &str, fallback: u64| {
-        std::env::var(name)
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(fallback)
-    };
-    walleye_v8::Limits {
-        heap_bytes: number("WALLEYE_WORKER_HEAP_MB", 128) as usize * 1024 * 1024,
-        deadline: std::time::Duration::from_secs(number("WALLEYE_WORKER_SECONDS", 15)),
-    }
 }

@@ -436,9 +436,12 @@ async fn a_fenced_writer_is_replaced_on_the_next_use() {
     // Another writer claims the shard, which fences the one the engine holds.
     // On a cluster this is what a takeover looks like; a WAL persistence
     // failure fences a writer the same way, from the writer's own side.
+    // The same shape the node keeps, arrival order included: a writer whose
+    // schema differs is not a takeover, it is a different table.
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
         Field::new("value", DataType::Int64, false),
+        Field::new("_walleye_seq", DataType::UInt64, false),
     ]));
     let interloper = TableConfig::new(
         "events",

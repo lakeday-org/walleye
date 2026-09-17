@@ -1,0 +1,7 @@
+{
+  "source": "gold_labelled",
+  "sql": "SELECT ticker, stance, conviction, premium, summary FROM gold_labelled WHERE stance_sure >= 0.7 AND urgency >= 0.5 AND premium >= 500000",
+  "alert": {
+    "url": "http://127.0.0.1:8099/desk"
+  }
+}
