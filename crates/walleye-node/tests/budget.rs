@@ -282,3 +282,74 @@ async fn every_allocation_borrows_from_the_one_budget_and_fails_closed() {
     service.close().await;
     small.close().await;
 }
+
+/// The JSON ingestion path borrows from the same budget as the Arrow one.
+/// Parsing a body into values and copying them into Arrow costs several times
+/// the bytes received, and that expansion used to happen outside the budget
+/// entirely, so a large insert could exceed a budget the server had promised
+/// to keep.
+#[tokio::test]
+async fn json_ingestion_is_bounded_by_the_budget() {
+    let d = tempfile::tempdir().unwrap();
+    // 160 MiB: 80 MiB of floor, 80 MiB of budget, and one open table holds
+    // 48 MiB of it.
+    let service = Service::open(config(d.path(), 160 * MIB)).await.unwrap();
+    let app = router(service.clone());
+    let (status, body) = send(
+        &app,
+        "POST",
+        "/v1/streams",
+        "application/json",
+        serde_json::json!({"name":"events","columns":[{"name":"id","type":"int64"}],
+                           "primary_key":["id"]})
+        .to_string()
+        .into_bytes(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // A small insert fits.
+    let rows: Vec<_> = (0..64).map(|id| serde_json::json!({"id": id})).collect();
+    let (status, body) = send(
+        &app,
+        "POST",
+        "/v1/streams/events/events",
+        "application/json",
+        serde_json::json!({"rows": rows}).to_string().into_bytes(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // One whose expansion the remaining budget cannot cover is refused, and
+    // says so, rather than being parsed and hoped for.
+    let rows: Vec<_> = (0..350_000)
+        .map(|id| serde_json::json!({"id": id}))
+        .collect();
+    let big = serde_json::json!({"rows": rows}).to_string().into_bytes();
+    assert!(big.len() > 3 * MIB, "a body worth refusing: {}", big.len());
+    let (status, body) = send(
+        &app,
+        "POST",
+        "/v1/streams/events/events",
+        "application/json",
+        big,
+    )
+    .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+    assert!(body.contains("memory budget"), "{body}");
+
+    // The stream is untouched by the refusal.
+    let (status, body) = send(
+        &app,
+        "POST",
+        "/v1/query",
+        "application/json",
+        serde_json::json!({"sql":"SELECT count(*) AS n FROM events"})
+            .to_string()
+            .into_bytes(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("\"n\":64"), "{body}");
+    service.close().await;
+}

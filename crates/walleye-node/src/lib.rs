@@ -169,9 +169,10 @@ impl Budget {
         Self {
             cache_memory: config.memory_bytes.saturating_sub(memory_floor).max(1),
             cache_disk,
-            // The log may take the whole disk budget while the cache is
-            // squeezed down to its working floor.
-            bitr_log_max: cache_disk,
+            // Half, not all: compacting the log writes a replacement beside
+            // it and renames, so a log allowed to fill the budget could not
+            // be compacted without overrunning the volume.
+            bitr_log_max: cache_disk / 2,
         }
     }
 }
@@ -351,95 +352,79 @@ impl Service {
                 serde_json::json!({"ready": true})
             }),
         });
-        if let Some(engine) = &service.engine
-            && service.config.bitr
-        {
-            // The Bitr log lives beside the cache file; report its size so the
-            // cache's disk ceiling tracks it.
-            let resources = engine.resources().clone();
-            let data_dir = std::env::var("LAKEDAY_REPLICA_DATA_DIR")
-                .ok()
-                .filter(|v| !v.trim().is_empty())
-                .unwrap_or_else(|| "/data".into());
-            // The cache usually lives on the same volume; counting it as
-            // "elsewhere" would charge it twice and starve its own ceiling.
-            let cache_dir = service.config.directory.clone();
-            tokio::spawn(async move {
-                loop {
-                    let dir = data_dir.clone();
-                    let cache_dir = cache_dir.clone();
-                    let used =
-                        tokio::task::spawn_blocking(move || directory_bytes(&dir, &cache_dir))
-                            .await
-                            .unwrap_or(0);
-                    if let Err(error) = resources.set_disk_usage("bitr", used).await {
-                        eprintln!("walleye.budget stage=disk_sample outcome=error error={error}");
-                    }
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        // Three things run for the life of the node: the disk the Bitr log
+        // takes is reported so the cache's ceiling tracks it, tables nobody
+        // is using are closed so their memory returns to the budget, and
+        // readiness is established and then kept current.
+        service.clone().spawn_disk_sampler();
+        service.clone().spawn_idle_sweeper();
+        service.clone().spawn_readiness();
+        Ok(service)
+    }
+
+    /// Report the disk the Bitr log occupies beside the cache file, so the
+    /// cache's ceiling is the budget minus what the log holds.
+    fn spawn_disk_sampler(self: Arc<Self>) {
+        let Some(engine) = self.engine.as_ref().filter(|_| self.config.bitr) else {
+            return;
+        };
+        let resources = engine.resources().clone();
+        let data_dir = std::env::var("LAKEDAY_REPLICA_DATA_DIR")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| "/data".into());
+        // The cache usually lives on the same volume; counting it as
+        // "elsewhere" would charge it twice and starve its own ceiling.
+        let cache_dir = self.config.directory.clone();
+        tokio::spawn(async move {
+            loop {
+                let dir = data_dir.clone();
+                let cache_dir = cache_dir.clone();
+                let used = tokio::task::spawn_blocking(move || directory_bytes(&dir, &cache_dir))
+                    .await
+                    .unwrap_or(0);
+                if let Err(error) = resources.set_disk_usage("bitr", used).await {
+                    eprintln!("walleye.budget stage=disk_sample outcome=error error={error}");
                 }
-            });
-        }
-        // Return the memory of tables nobody is using, so a node whose
-        // budget is full can still open a new table.
-        let sweeping = service.clone();
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+        });
+    }
+
+    /// Return the memory of tables nobody is using, so a node whose budget is
+    /// full can still open a new one.
+    fn spawn_idle_sweeper(self: Arc<Self>) {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-                if let Some(engine) = &sweeping.engine {
+                if let Some(engine) = &self.engine {
                     engine.close_idle(IDLE_TABLE_TIMEOUT).await;
                 }
             }
         });
-        // Serve immediately; owned streams open and warm in the background so
-        // the first request does not pay for it.
-        let warming = service.clone();
+    }
+
+    /// Wait until writes can be durable, say so, warm the streams this node
+    /// owns, then keep readiness current for as long as the node runs.
+    fn spawn_readiness(self: Arc<Self>) {
         tokio::spawn(async move {
-            let gateway = warming
+            let gateway = self
                 .config
                 .api
                 .as_ref()
                 .and_then(|api| api.bitr_url.clone());
             if let Some(gateway) = &gateway {
-                // The embedded daemon seeds archived prefixes and reaches its
-                // replica quorum before it reports ready. A writer opened
-                // before then fails recovery ("replica quorum unavailable"),
-                // so wait rather than open a table that cannot be durable.
-                // There is no deadline: a node that never reaches a quorum
-                // cannot write, and saying otherwise would only move the
-                // failure to the first request.
-                let client = reqwest::Client::new();
-                let started = std::time::Instant::now();
-                let mut polls = 0_u32;
-                loop {
-                    let (ready, detail) = quorum_state(&client, gateway).await;
-                    *warming.readiness() = detail.clone();
-                    if ready {
-                        eprintln!(
-                            "walleye.ready stage=quorum outcome=ready elapsed_ms={}",
-                            started.elapsed().as_millis()
-                        );
-                        break;
-                    }
-                    // Every 15s while waiting, so a stuck boot is diagnosable.
-                    if polls.is_multiple_of(60) {
-                        eprintln!(
-                            "walleye.ready stage=quorum outcome=waiting elapsed_ms={} detail={detail}",
-                            started.elapsed().as_millis()
-                        );
-                    }
-                    polls += 1;
-                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                }
+                self.await_quorum(gateway).await;
             }
             // Ready once writes can be durable. Warming opens owned streams
             // ahead of their first request, which is an optimization: holding
             // readiness until it finishes would keep a restarted node out of
             // rotation for as long as it takes to open every table it owns,
             // and a stream that is not warm yet simply opens on use.
-            warming.write_ready.store(true, Ordering::Release);
-            warming.served.store(true, Ordering::Release);
-            *warming.readiness() = serde_json::json!({"ready": true});
-            if let Some(engine) = &warming.engine {
+            self.write_ready.store(true, Ordering::Release);
+            self.served.store(true, Ordering::Release);
+            *self.readiness() = serde_json::json!({"ready": true});
+            if let Some(engine) = &self.engine {
                 engine.warm().await;
             }
             // Keep write readiness current: a quorum lost later stops this
@@ -450,15 +435,46 @@ impl Service {
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                     let (ready, detail) = quorum_state(&client, &gateway).await;
-                    *warming.readiness() = detail.clone();
-                    if warming.write_ready.swap(ready, Ordering::AcqRel) != ready {
+                    *self.readiness() = detail.clone();
+                    if self.write_ready.swap(ready, Ordering::AcqRel) != ready {
                         eprintln!("walleye.ready stage=quorum write_ready={ready} detail={detail}");
                     }
                 }
             }
         });
-        Ok(service)
     }
+
+    /// Block until the local Bitr gateway reports a reachable quorum. The
+    /// embedded daemon seeds archived prefixes and reaches its quorum before
+    /// it reports ready, and a writer opened before then fails recovery.
+    /// There is no deadline: a node that never reaches a quorum cannot write,
+    /// and saying otherwise would only move the failure to the first request.
+    async fn await_quorum(&self, gateway: &str) {
+        let client = reqwest::Client::new();
+        let started = std::time::Instant::now();
+        let mut polls = 0_u32;
+        loop {
+            let (ready, detail) = quorum_state(&client, gateway).await;
+            *self.readiness() = detail.clone();
+            if ready {
+                eprintln!(
+                    "walleye.ready stage=quorum outcome=ready elapsed_ms={}",
+                    started.elapsed().as_millis()
+                );
+                return;
+            }
+            // Every 15s while waiting, so a stuck boot is diagnosable.
+            if polls.is_multiple_of(60) {
+                eprintln!(
+                    "walleye.ready stage=quorum outcome=waiting elapsed_ms={} detail={detail}",
+                    started.elapsed().as_millis()
+                );
+            }
+            polls += 1;
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+    }
+
     /// Follow Kubernetes cache endpoints. Failure preserves the last good ring;
     /// missing peers fall back to the query process's normal origin loading.
     pub async fn discover(&self) -> Result<(), Box<dyn std::error::Error>> {
@@ -746,9 +762,23 @@ async fn ingest(
     State(s): State<Arc<Service>>,
     Path(name): Path<String>,
     h: HeaderMap,
-    Json(input): Json<Ingest>,
+    body: Bytes,
 ) -> Result<Response, ApiError> {
     let engine = writable(&s, &h)?;
+    // Parsing JSON into values costs several times the bytes it came from,
+    // and the rows are copied again on the way into Arrow. Lease that before
+    // paying it, as the Arrow path does, so a large insert is refused rather
+    // than allowed to exceed the budget.
+    let _lease = engine
+        .resources()
+        .reserve_memory("ingest body", body.len().saturating_mul(8))
+        .map_err(|error| {
+            (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(serde_json::json!({"error": error.to_string()})),
+            )
+        })?;
+    let input: Ingest = serde_json::from_slice(&body).map_err(failure)?;
     let mut revision = s.revision.lock().await;
     if let Some(expected) = h.get("if-match") {
         if expected.to_str().ok() != Some(revision.as_str()) {
