@@ -1,4 +1,5 @@
 //! Single-deployment stream API, Foyer peer service, and Bitr node composition.
+pub mod assist;
 pub mod cluster;
 pub mod cron;
 mod engine;

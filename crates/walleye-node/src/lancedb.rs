@@ -44,6 +44,7 @@ pub fn routes() -> Router<Arc<Service>> {
         .route("/v1/view/{name}/describe/", post(describe_view))
         .route("/v1/view/{name}/drop/", post(drop_view))
         .route("/v1/view/{name}/refresh/", post(refresh_view))
+        .route("/v1/assist/query/", post(assist_query))
         .route(
             "/v1/worker/{name}/",
             get(worker_request)
@@ -692,4 +693,27 @@ async fn worker_request(
         }
     }
     Ok(response)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Phrase {
+    text: String,
+}
+
+/// Read a phrase as a query over this node's own catalog.
+///
+/// The statement comes back rather than its results, with how sure each
+/// decision was, so a caller can show it, run it, or wait for more typing.
+async fn assist_query(
+    State(s): State<Arc<Service>>,
+    h: HeaderMap,
+    Json(body): Json<Phrase>,
+) -> Reply {
+    let engine = engine(&s, &h)?;
+    let reading = engine
+        .read_query(&body.text)
+        .await
+        .map_err(|e| error(e.as_ref()))?;
+    Ok(Json(serde_json::to_value(reading).map_err(|e| bad(e.to_string()))?).into_response())
 }

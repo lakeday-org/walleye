@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 rustls.workspace = true
 tokio-tungstenite.workspace = true
+walleye-typesafe = { path = "../walleye-typesafe" }
 walleye-v8 = { path = "../walleye-v8" }
 async-trait.workspace = true
 walleye-cache.workspace = true
