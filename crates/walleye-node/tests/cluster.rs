@@ -293,3 +293,61 @@ async fn every_member_serves_every_stream_with_one_owner() {
         member.service.close().await;
     }
 }
+
+/// A write that reaches the wrong node is not the caller's mistake: the same
+/// call to the owner works. It has to be answerable by retrying against the
+/// owner, so it is a 409 rather than a 400, which nothing retries.
+///
+/// This is the status any handover protocol would be built on, and it used to
+/// differ between the two write surfaces.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_write_to_a_non_owner_is_a_conflict_rather_than_a_bad_request() {
+    let d = tempfile::tempdir().unwrap();
+    let members = start(d.path(), 3).await;
+    let ring = Ring::new(
+        members
+            .iter()
+            .map(|m| Node::new(&m.id, &m.base, 1.0).unwrap())
+            .collect(),
+    )
+    .unwrap();
+
+    // Define through the owner, so the stream exists everywhere.
+    let owner = ring.owner(b"journal").id.clone();
+    let owning = members.iter().find(|m| m.id == owner).unwrap();
+    let defined = reqwest::Client::new()
+        .post(format!("{}/v1/streams", owning.base))
+        .header("authorization", format!("Bearer {TOKEN}"))
+        .json(&serde_json::json!({
+            "name": "journal",
+            "primary_key": ["id"],
+            "columns": [{"name":"id","type":"int64"},{"name":"node","type":"string"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(defined.status(), reqwest::StatusCode::OK);
+
+    // Ask a non-owner directly, with the forwarding middleware told this
+    // request was already forwarded once so it refuses to hop again. That is
+    // the path where the engine's own not-owner answer reaches the client.
+    let other = members.iter().find(|m| m.id != owner).unwrap();
+    let answered = reqwest::Client::new()
+        .post(format!("{}/v1/streams/journal/events", other.base))
+        .header("authorization", format!("Bearer {TOKEN}"))
+        .header("x-walleye-forwarded", "1")
+        .json(&serde_json::json!({"rows":[{"id":1,"node":"x"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        answered.status(),
+        reqwest::StatusCode::CONFLICT,
+        "a caller sent to the wrong node should retry, not give up: {}",
+        answered.text().await.unwrap_or_default()
+    );
+
+    for m in members {
+        m.service.close().await;
+    }
+}
