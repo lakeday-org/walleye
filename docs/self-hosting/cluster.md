@@ -2,7 +2,8 @@
 
 Three nodes, each running the API and an embedded replica daemon. A write is
 acknowledged once a quorum of replicas holds it, so losing one node loses
-nothing and stops nothing.
+nothing that was acknowledged. It does cost service to the tables that node
+owned until it comes back, which [losing a node](#losing-a-node) is about.
 
 ## What each node runs
 
