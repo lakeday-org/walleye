@@ -64,3 +64,6 @@ opt-level = 3
 
 [profile.release]
 debug = 0
+# The image is pulled before a node can start, and paged in before it can
+# serve, so the binary's size is part of how long an upgrade takes.
+strip = true
