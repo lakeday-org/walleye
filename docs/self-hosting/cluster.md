@@ -91,9 +91,13 @@ route around it.
 
 Ownership does move when membership itself changes, which today means
 Kubernetes EndpointSlice discovery rather than the static list: the ring is
-rebuilt as endpoints come and go, with a warming window during which the
-previous owner still serves. That path is not configured by the environment
-variables above.
+rebuilt as endpoints come and go. That path is not configured by the
+environment variables above.
+
+When it does move, it moves at once. There is a warming window after a
+membership change, but it applies to cached reads, which fall back to the
+previous owner on a miss. Stream ownership has no such grace: the new owner
+owns it from the moment the ring changes.
 
 Restoring a node that lost its disk is the seeding path above: it reads the
 archive, catches up from its peers, and rejoins as the owner of the same
