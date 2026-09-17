@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/walleye-workload", "crates/walleye-node", "crates/walleye-ring", "crates/walleye-bitr", "crates/walleye-bitr-server", "crates/walleye-cache", "crates/walleye-lance"]
+members = ["crates/walleye-typesafe", "crates/walleye-workload", "crates/walleye-node", "crates/walleye-ring", "crates/walleye-bitr", "crates/walleye-bitr-server", "crates/walleye-cache", "crates/walleye-lance"]
 exclude = ["vendor/lance", "vendor/datafusion-execution"]
 
 [workspace.package]
@@ -12,6 +12,7 @@ publish = false
 
 [workspace.dependencies]
 arrow-array = "58"
+arrow-cast = "58"
 arrow-ipc = "58"
 arrow-schema = "58"
 uuid = { version = "1.18", features = ["serde", "v4", "v5", "v7"] }

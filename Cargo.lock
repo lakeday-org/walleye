@@ -6331,6 +6331,7 @@ name = "walleye-lance"
 version = "0.1.0"
 dependencies = [
  "arrow-array",
+ "arrow-cast",
  "arrow-data",
  "arrow-ipc",
  "arrow-schema",
@@ -6353,6 +6354,7 @@ dependencies = [
  "uuid",
  "walleye-bitr",
  "walleye-cache",
+ "walleye-typesafe",
 ]
 
 [[package]]
@@ -6397,6 +6399,17 @@ dependencies = [
  "serde",
  "thiserror",
  "xxhash-rust",
+]
+
+[[package]]
+name = "walleye-typesafe"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
