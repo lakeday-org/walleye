@@ -9,7 +9,10 @@ otherwise read as a surprise.
 A table opens when something touches it, and stays open while it is being used.
 Open costs memory — see [cache tiers](cache-tiers.md) — so a table that has
 gone five minutes without a query or an insert is checkpointed to object
-storage, closed, and its memory returned. The next use reopens it.
+storage, closed, and its memory returned. The next use reopens it. A sweeper
+does the closing once a minute and skips any table that is busy, so the idle
+timeout is five minutes and the close lands five to six minutes after the last
+use.
 
 Nothing is lost in that. A checkpoint is durable before the close, and a reopen
 reads it back. The only cost is the reopen itself, paid by whichever request
@@ -21,12 +24,17 @@ nothing is ever released.
 
 ## Flushes and compaction
 
-Rows arrive into a memtable and are flushed as a generation. Once eight
-generations exist they are merged in the background, keeping the newest row per
-key and rebuilding the indexes, so query fan-out stays bounded.
+Rows arrive into a memtable and are flushed as a generation. Every append
+checks, and once eight generations exist they are merged in the background —
+keeping the newest row per key and rebuilding the indexes — so query fan-out
+stays bounded. The merge runs detached from the append that noticed it, and at
+most once every ten seconds per table.
 
 That is the whole schedule. There is no compaction you have to run and no
-maintenance window, although you can force either now:
+maintenance window. You can force a flush now, and you can force a merge now,
+but forcing a merge is not the same operation the background schedule runs:
+`compact_lsm/` merges from two generations, not eight, so it will do work the
+schedule would have left alone.
 
 ```sh
 curl -sX POST localhost:8080/v1/table/clicks/flush_lsm/ \
@@ -51,9 +59,15 @@ Because the cache is disposable and every acknowledged write is already
 durable, a stop followed by a start on a different machine size loses nothing.
 That is all a resize is.
 
-In a cluster, roll one node at a time and watch `/readyz`. A quorum of two of
-three means the other two keep serving while one is away, and the tables it
-owned move to their next winner and move back when it returns.
+In a cluster, roll one node at a time and watch `/readyz?require=all`. A quorum
+of two of three means the other two go on acknowledging writes while one is
+away — but ownership does not move, so the node you are restarting stops
+answering for its own tables until it is back. A restart inside the
+fifteen-second forward-retry budget is invisible to a client; one slower than
+that is a 502 on that node's tables. Waiting for every member to be serving
+again before taking the next node out is what keeps that to one node's share at
+a time. [Losing a node](shapes.md#losing-a-node) is the same mechanism without
+the plan.
 
 ## Rotating the token
 
@@ -65,10 +79,13 @@ rather than treat it as a bad token.
 
 ## Deleting
 
-Dropping a table deletes the table and everything it owned in object storage.
-It is not recoverable and there is no undo, because there is no backup that
-Walleye keeps for you — [what you own](../self-hosting/operating.md) says so
-plainly.
+Dropping a table deletes its catalog entry and its Lance data. It is not
+recoverable and there is no undo, because there is no backup that Walleye keeps
+for you — [what you own](../self-hosting/operating.md) says so plainly.
+
+In a cluster the replication log's archive is a separate prefix in its own
+bucket, and a drop does not touch it. Those segments are yours to age out with
+the bucket's own lifecycle rules.
 
 ## On the managed service
 

@@ -24,8 +24,9 @@ await table.countRows();
 ```
 
 `create_table` on a name that exists is an error; `open_table` opens it.
-`list_tables` lists them and `drop_table` removes one, along with everything it
-owned in object storage.
+`list_tables` lists them and `drop_table` removes one, along with its data in
+object storage. A table name may hold only `[A-Za-z0-9_-]`, and a column name
+may not begin with `_`; both are refused rather than rewritten.
 
 Each table is its own memshard: an independent writer, its own log sequence and
 its own manifest. Two tables ingest in parallel and never wait on each other.
@@ -75,6 +76,11 @@ memory are held in a graph, each flush writes an index for that generation, and
 compaction rebuilds them. `create_index` exists to choose the metric — `l2`,
 `cosine` or `dot` — and it rewrites what is already flushed before it returns,
 so a query never reads a stale index.
+
+That one layout is the only one there is. `Index.btree()`, `Index.bitmap()`
+and `Index.labelList()` are refused, so there is no index to build over a
+scalar column: `where` on one is a scan, which is correct and costs what a scan
+costs. [Refusals](../sdk/http.md#refusals) has the rest.
 
 A table can have several vector columns. Each one costs memory for as long as
 the table is open, which is what [cache tiers](../concepts/cache-tiers.md) is

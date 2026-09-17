@@ -55,10 +55,11 @@ curl -s localhost:8080/healthz -H "authorization: Bearer $WALLEYE_TOKEN"
 curl -s localhost:8080/readyz  -H "authorization: Bearer $WALLEYE_TOKEN"
 ```
 
-`/healthz` answers once the process can route. `/readyz` answers whether
-writes can be made durable right now. On one node they say the same thing; in
-[a cluster](../self-hosting/cluster.md) they do not, which is why there are
-two.
+`/healthz` answers once the process can route. `/readyz` answers whether writes
+can be made durable. On one node they say the same thing — `/readyz` is a
+literal `{"ready": true}`, it names no members, and `?require=all` is ignored
+rather than refused. In [a cluster](../self-hosting/cluster.md) they come apart,
+which is why there are two.
 
 ## What to set next
 

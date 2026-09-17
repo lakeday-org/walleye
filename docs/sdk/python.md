@@ -72,6 +72,17 @@ chooses the metric — `l2`, `cosine` or `dot` — and rewrites the flushed
 generations before it returns. Queries use the index's metric; asking a query
 for a different one is an error.
 
+**Scalar indexes are refused.** `Index.btree()`, `Index.bitmap()` and
+`Index.labelList()` all fail: the node accepts only index types beginning
+`IVF` or `HNSW`, because it maintains one layout.
+
+```
+index type BTREE is not supported; vector columns use IVF_HNSW_SQ
+```
+
+Filtering a scalar column still works — `where` is evaluated as a scan, so it
+is correct, and the cost is the scan.
+
 ## SQL
 
 The client has no SQL call, so post to the node:
@@ -86,15 +97,32 @@ rows = requests.post(
 ).json()
 ```
 
-Read-only DataFusion SQL across every table on the node, sixty second deadline.
+Read-only DataFusion SQL, sixty second deadline, 8 MiB of JSON back. On one
+node it reads every table on the node; in a cluster it also gathers the tables
+this node does not own from their owners, so a `SELECT` spans the cluster.
 [The HTTP surface](http.md) has the rest of the routes.
 
 ## What raises
 
-- `update`, `delete` and `merge_insert` are not implemented
-- full-text search is not implemented
-- `order_by` on a search is not implemented; use SQL
-- column expressions in `select` are not implemented; use SQL
-- namespaces are accepted and ignored — every namespace lists the one root
+`update`, `delete` and `merge_insert` are not implemented, and they are not a
+refusal with a reason either: there is no route, so the node answers **404 with
+an empty body**. Whatever the client raises for that is what you will see. Write
+a row with the same key instead — the newest one wins.
 
-Each returns a 400 with a plain reason rather than a wrong answer.
+Everything else here is a 400 with the reason as the body:
+
+- `Index.btree()`, `Index.bitmap()` and `Index.labelList()` — only `IVF*` and
+  `HNSW*` index types are accepted
+- full-text search and `Index.fts()`
+- `order_by` on a search; use SQL
+- column expressions in `select`; use SQL
+- `add(..., mode="overwrite")`; drop and recreate instead
+- a column named with a leading `_`, or a table name outside `[A-Za-z0-9_-]`
+- searching a table with more than one vector column without naming
+  `vector_column`, and a multivector query
+- `exist_ok=True` against a table whose schema has changed
+
+Namespaces are the exception that is neither: they are accepted and ignored, and
+every namespace id lists the one root. A malformed JSON body is a 422 rather
+than a 400. [The HTTP surface](http.md#refusals) has the message each one
+returns.

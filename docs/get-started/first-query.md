@@ -48,14 +48,16 @@ curl -s localhost:8080/v1/query \
 [{"city": "seattle", "n": 2}, {"city": "portland", "n": 1}, {"city": "boise", "n": 1}]
 ```
 
-It is DataFusion SQL across every table on the node, read-only, with a sixty
-second deadline and a 64 KiB limit on the statement itself. There is no DDL and
-no DML: tables are created and written through the LanceDB calls above, and a
-`SELECT` sees the rows in memory as well as the rows on disk.
+It is read-only DataFusion SQL with a sixty second deadline, a 64 KiB limit on
+the statement and an 8 MiB limit on the JSON it returns. There is no DDL and no
+DML: tables are created and written through the LanceDB calls above, and a
+`SELECT` sees the rows in memory as well as the rows on disk. On one node it
+reads every table on the node; on three it also gathers the tables this node
+does not own from their owners.
 
 Sorting is the common reason to reach for it. `order_by` is not part of the
-LanceDB search surface here, and asking for it returns a 400 that points at
-`/v1/query`.
+LanceDB search surface here, and asking for it returns
+`order_by is not supported; use SQL via /v1/query`.
 
 On [three nodes](../concepts/shapes.md) a statement spanning tables with
 different owners still works, with one limit worth knowing about before you
@@ -63,13 +65,22 @@ write it.
 
 ## What is not there
 
-Saying this here saves you finding out from a 400:
+Saying this here saves you finding it out from an error:
 
-- no full-text search and no full-text indexes
-- no `update`, `delete` or `merge_insert` — write a row with the same key
-  instead, and the newest one wins
+- **no scalar indexes.** `Index.btree()`, `Index.bitmap()` and
+  `Index.labelList()` are all a 400 — `index type BTREE is not supported;
+  vector columns use IVF_HNSW_SQ`. Only `IVF*` and `HNSW*` are accepted, and
+  vector columns are indexed for you anyway. Filtering a scalar column still
+  works; it is a scan
+- no full-text search and no full-text indexes, each with its own 400
+- no `update`, `delete` or `merge_insert`. These have no route at all, so they
+  are a 404 with an empty body rather than a reason — write a row with the same
+  key instead, and the newest one wins
+- no ordering on a search and no column expressions in `select`: both are a 400
+  pointing at `/v1/query`
 - namespaces are accepted and ignored: every namespace id lists the one root
 
-[What you own](../self-hosting/operating.md) keeps that list, for the managed
-service as much as for a node you run. Nothing on this list is a managed
-feature held back.
+[Refusals](../sdk/http.md#refusals) is the full list with the message each one
+returns. [What you own](../self-hosting/operating.md) keeps the same list for
+the managed service as for a node you run. Nothing on it is a managed feature
+held back.
