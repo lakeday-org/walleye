@@ -19,7 +19,8 @@ is a different problem and the reason to run more than one.
 Each node runs a replica of the log on its own disk. A write is acknowledged
 once a quorum of replicas holds it, and committed segments are archived to
 object storage behind that. Two of three is the default quorum, so one node can
-be down without stopping writes or losing anything.
+be down without losing anything acknowledged. What it costs is service to the
+tables that node owns, which is the paragraph after next.
 
 The trade is latency: a local quorum acknowledges faster than a bucket does.
 

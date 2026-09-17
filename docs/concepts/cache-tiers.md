@@ -1,6 +1,6 @@
 # Cache tiers
 
-A node has memory and it has a local disk, and both of them are cache. What
+A node has memory and a local disk, and the cache lives in both. What
 sets them is a tier: two numbers on a node you run yourself, a named size on
 the managed service. They buy the same thing.
 
