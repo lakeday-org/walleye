@@ -68,9 +68,13 @@ cursor writes nothing for the rows you already have.
 ## What it does not cover
 
 Durability is not backup. The bucket holds everything needed to rebuild a
-node, and nothing holds the bucket: lifecycle rules, versioning and retention
-are yours, and dropping a table deletes what it owned. See
-[what you own](../self-hosting/operating.md).
+node, and nothing holds the bucket: versioning and access are yours, and
+dropping a table deletes what it owned.
+
+One rule has no exceptions, because breaking it loses acknowledged rows with
+no error: never expire or age out anything under the tables' prefix. The
+write-ahead log lives there, and it is the log rather than old copies of it.
+[What you own](../self-hosting/operating.md) explains what happens if you do.
 
 Durability is also not availability, on either shape. A write in flight while
 its owner is replaced fails and should be retried; everything already

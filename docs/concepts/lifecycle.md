@@ -87,6 +87,12 @@ In a cluster the replication log's archive is a separate prefix in its own
 bucket, and a drop does not touch it. Those segments are yours to age out with
 the bucket's own lifecycle rules.
 
+That archive is the **only** thing a lifecycle rule may touch. The tables'
+own prefix contains the write-ahead log, and expiring any of it destroys
+acknowledged rows without reporting anything.
+[What you own](../self-hosting/operating.md) explains what happens and why the
+rule admits no exceptions.
+
 ## On the managed service
 
 The same clocks, with the node half driven through an API instead of a process

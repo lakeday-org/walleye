@@ -5,9 +5,38 @@ around it. This page is the honest list.
 
 ## Yours
 
-**The bucket.** Lifecycle rules, versioning, retention, and the bill. Walleye
-writes its log and its data there and does not clean up after you beyond
-deleting what a dropped table owned.
+**The bucket.** Versioning, access, and the bill. Walleye writes its log and
+its data there and does not clean up after you beyond deleting what a dropped
+table owned.
+
+> **Never apply a lifecycle, expiration or retention rule to the table
+> prefix.** It will destroy acknowledged data, silently.
+>
+> The write-ahead log lives inside each table's own prefix, at
+> `<root>/data/<table>/_mem_wal/<shard>/wal/`. Those objects are not old
+> copies or garbage awaiting collection: they are the log, and nothing ever
+> deletes one. A rule that expires objects by age deletes the oldest, which
+> are the lowest positions in the log.
+>
+> Recovery reads the log forward and stops at the first position that is
+> missing. Everything above a deleted range is therefore dropped, with no
+> error and no warning. Those rows are unreachable at first and then genuinely
+> lost, because the next flush records that recovery may start above them. The
+> vacated positions are then reused, so a later restart can replay new entries
+> interleaved with surviving old ones and bring deleted rows back.
+>
+> What an operator sees is nothing: no failure, no log line, no metric. Just a
+> row count that drops after a restart, and possibly old rows returning after
+> a later one. A partially completed bucket restore, or a cross-region
+> replication that catches up out of order, does the same thing.
+>
+> The engine does not currently detect this, which is why the rule is absolute
+> rather than a matter of tuning. The only prefix a retention rule belongs on
+> is the replication log's archive, which lives in its own bucket and prefix.
+
+Versioning and deletion protection are worth having. They do not interfere
+with anything Walleye writes, and they are what turns an accidental rule into
+something recoverable.
 
 **Backups.** There is no backup command. The bucket holds everything needed to
 rebuild a node, so backing up Walleye means backing up that prefix, with
