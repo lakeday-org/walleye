@@ -75,9 +75,10 @@ Saying this here saves you finding it out from an error:
 - no full-text search and no full-text indexes, each with its own 400
 - no `update`, `delete` or `merge_insert`. These have no route at all, so they
   are a 404 with an empty body rather than a reason — write a row with the same
-  key instead, and the newest one wins
-- no ordering on a search and no column expressions in `select`: both are a 400
-  pointing at `/v1/query`
+  key instead, and the newest one wins. So are `add_columns`, `restore`, the
+  version and tag calls, and per-index stats
+- no ordering — on a search or on a plain scan — and no column expressions in
+  `select`: both are a 400 pointing at `/v1/query`
 - namespaces are accepted and ignored: every namespace id lists the one root
 
 [Refusals](../sdk/http.md#refusals) is the full list with the message each one

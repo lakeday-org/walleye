@@ -109,6 +109,10 @@ refusal with a reason either: there is no route, so the node answers **404 with
 an empty body**. Whatever the client raises for that is what you will see. Write
 a row with the same key instead — the newest one wins.
 
+The same is true of `add_columns`, `alter_columns`, `drop_columns`,
+`list_versions`, `restore`, the tag calls and per-index stats: no route, 404,
+no reason.
+
 Everything else here is a 400 with the reason as the body:
 
 - `Index.btree()`, `Index.bitmap()` and `Index.labelList()` — only `IVF*` and
@@ -119,10 +123,14 @@ Everything else here is a 400 with the reason as the body:
 - `add(..., mode="overwrite")`; drop and recreate instead
 - a column named with a leading `_`, or a table name outside `[A-Za-z0-9_-]`
 - searching a table with more than one vector column without naming
-  `vector_column`, and a multivector query
-- `exist_ok=True` against a table whose schema has changed
+  `vector_column`
+- creating a table that already exists with a different schema, whatever
+  `mode` you asked for
+
+`order_by` is refused on a plain scan as well as on a search, and the metric
+check is a string compare against the index's own spelling, so asking a query
+for `euclidean` against an `l2` index is an error rather than a synonym.
 
 Namespaces are the exception that is neither: they are accepted and ignored, and
-every namespace id lists the one root. A malformed JSON body is a 422 rather
-than a 400. [The HTTP surface](http.md#refusals) has the message each one
-returns.
+every namespace id lists the one root. [The HTTP surface](http.md#refusals) has
+the message each one returns, and what the extractor does with a bad JSON body.

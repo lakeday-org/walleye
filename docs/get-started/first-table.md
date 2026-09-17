@@ -75,7 +75,9 @@ first row. There is no training step and nothing to schedule: the rows in
 memory are held in a graph, each flush writes an index for that generation, and
 compaction rebuilds them. `create_index` exists to choose the metric — `l2`,
 `cosine` or `dot` — and it rewrites what is already flushed before it returns,
-so a query never reads a stale index.
+so a query never reads a stale index. Ask a query for the metric the index
+carries, spelled the same way: the check is a string compare, so `euclidean`
+against an `l2` index is an error rather than a synonym.
 
 That one layout is the only one there is. `Index.btree()`, `Index.bitmap()`
 and `Index.labelList()` are refused, so there is no index to build over a

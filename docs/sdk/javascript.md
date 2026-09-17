@@ -68,7 +68,9 @@ error.
 
 **Scalar indexes are refused.** `Index.btree()`, `Index.bitmap()` and
 `Index.labelList()` all reject: the node accepts only index types beginning
-`IVF` or `HNSW`, because it maintains one layout.
+`IVF` or `HNSW`, and there is one layout behind all of them, so `ivfPq`,
+`ivfFlat`, `hnswSq` and the rest are accepted and then built the same way.
+`listIndices` reports `IVF_HNSW_SQ` whichever you asked for.
 
 ```
 index type BTREE is not supported; vector columns use IVF_HNSW_SQ
@@ -100,7 +102,8 @@ const rows = await fetch(`${process.env.WALLEYE_URL}/v1/query`, {
 `update`, `delete` and `mergeInsert` are not implemented, and they are not a
 rejection with a reason either: there is no route, so the node answers **404
 with an empty body**. Write a row with the same key instead — the newest one
-wins.
+wins. The same goes for `addColumns`, `alterColumns`, `dropColumns`,
+`listVersions`, `restore`, the tag calls and per-index stats.
 
 Everything else here is a 400 with the reason as the body:
 
@@ -112,9 +115,14 @@ Everything else here is a 400 with the reason as the body:
 - `add` with `mode: "overwrite"`; drop and recreate instead
 - a column named with a leading `_`, or a table name outside `[A-Za-z0-9_-]`
 - searching a table with more than one vector column without naming
-  `vectorColumn`, and a multivector query
-- creating a table that already exists with a different schema
+  `vectorColumn`
+- creating a table that already exists with a different schema, whatever mode
+  you asked for
 
-Namespaces are the exception that is neither: they are accepted and ignored. A
-malformed JSON body is a 422 rather than a 400.
-[The HTTP surface](http.md#refusals) has the message each one returns.
+Ordering is refused on a plain query as well as on a search, and the metric
+check is a string compare against the index's own spelling, so asking for
+`euclidean` against an `l2` index is an error rather than a synonym.
+
+Namespaces are the exception that is neither: they are accepted and ignored.
+[The HTTP surface](http.md#refusals) has the message each one returns, and what
+the extractor does with a bad JSON body.

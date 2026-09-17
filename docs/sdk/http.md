@@ -6,8 +6,7 @@ else is JSON.
 
 Something the node understands but will not do answers 400 with a plain reason
 rather than a wrong answer, and [refusals](#refusals) is the list. A call it has
-no route for is a 404 with an empty body, and a malformed JSON body is a 422
-from the extractor.
+no route for is a 404 with an empty body.
 
 ## Authentication
 
@@ -176,24 +175,41 @@ The rest:
 | `Index.btree()`, `Index.bitmap()`, `Index.labelList()` | `index type BTREE is not supported; vector columns use IVF_HNSW_SQ` |
 | `Index.fts()` | `full-text indexes are not supported yet` |
 | A full-text query | `full-text search is not supported yet` |
-| `order_by` on a search | `order_by is not supported; use SQL via /v1/query` |
+| `order_by` on any query, search or scan | `order_by is not supported; use SQL via /v1/query` |
 | An expression in `select` | `column expressions are not supported; use SQL via /v1/query` |
 | `insert` with `mode=overwrite` | `insert mode=overwrite is not supported; drop and recreate the table` |
 | A create `mode` other than `create`, `exist_ok` or `overwrite` | `unknown create mode <mode>` |
 | A column named with a leading `_` | `column _x uses a reserved name` |
 | A table name outside `[A-Za-z0-9_-]` | `invalid table name` |
-| A list of vectors in one query | `multivector queries are not supported` |
+| A nested array in `vector` | `multivector queries are not supported` |
 | Searching a table with two vector columns | `table has several vector columns; set vector_column` |
 | Searching a table with none | `table has no vector column` |
 | `vector_column` naming a column that is not `FixedSizeList<Float32>` | `<column> is not a FixedSizeList<Float32> column` |
 | A query metric that differs from the index's | `column <c> is indexed with metric <m>; create_index with metric_type=<q> to change it` |
-| A SQL result over 8 MiB | `JSON result exceeds 8 MiB; use a SQL LIMIT` |
+| A body that does not fit into memory twice over | 413, `request body needs <n> MiB but only <m> MiB … can be held` |
+| A SQL result over 8 MiB | `Io error: JSON result exceeds 8 MiB; use a SQL LIMIT` |
 | A cross-member gather of a table over a million rows | `stream <name> has more than 1000000 rows; query it on its owner rather than joining it across members` |
 
-Two that are not 400s and so are easy to misread. `update`, `delete` and
-`merge_insert` have no route at all, so they are a **404 with an empty body**
-rather than a refusal with a reason. And a malformed JSON body is a **422**
-from the extractor before any handler sees it.
+The metric comparison is a string compare, not a distance-type one, and a
+column is indexed with `l2` from the first row. So asking a query for
+`euclidean` — which LanceDB treats as the same thing — is refused too. Use the
+spelling the index has.
+
+**What is not a refusal at all.** Several LanceDB calls have no route here, so
+they are a **404 with an empty body**: no status to match on beyond the 404, no
+reason to read. `update`, `delete` and `merge_insert` are the ones a client will
+reach for; `add_columns`, `alter_columns`, `drop_columns`, `version/list`,
+`restore`, the tag calls, per-index stats and multipart write are also absent.
+The supported set is the two route tables above.
+
+**Bad JSON is three different answers**, from the extractor, before any handler
+sees the request. A body that is not valid JSON is a **400**, `Failed to parse
+the request body as JSON: …`. A body that is valid JSON of the wrong shape — a
+missing `column` on `create_index`, an unknown key on `/v1/query` or
+`/v1/streams` — is a **422**. A request without `Content-Type: application/json`
+is a **415**. The routes that take a free-form JSON body — `query/`,
+`count_rows/` and view creation — never answer 422, because anything valid
+deserializes.
 
 `exist_ok` means "this table, as described", not "whatever is there": a create
 naming an existing table with a different schema is refused whichever mode you
