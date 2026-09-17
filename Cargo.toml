@@ -34,6 +34,7 @@ hex = "0.4.3"
 tempfile = "3.20.0"
 thiserror = "2.0.18"
 chrono = "0.4.44"
+tokio-tungstenite = { version = "0.28", default-features = false, features = ["rustls-tls-webpki-roots", "connect", "handshake"] }
 tokio = { version = "1.49.0", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 xxhash-rust = { version = "0.8.16", features = ["xxh3"] }
 tracing = "0.1.44"

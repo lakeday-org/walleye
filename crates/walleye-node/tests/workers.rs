@@ -700,3 +700,287 @@ async fn a_worker_may_not_call_a_host_nobody_allowed() {
         "it names how to allow it: {rows}"
     );
 }
+
+/// A webhook. The request reaches a worker, the worker writes what arrived,
+/// and the answer only goes out once those rows are durable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_worker_answers_an_inbound_request_and_stores_what_it_was_sent() {
+    let d = tempfile::tempdir().unwrap();
+    let app = router(
+        Service::open(sized(d.path(), 2048 * 1024 * 1024))
+            .await
+            .unwrap(),
+    );
+    defined(
+        &app,
+        "hook",
+        json!({
+            "every_seconds": 3600,
+            "target": "ignored",
+            "worker": "export default { fetch(request, ctx) {\
+                 const event = JSON.parse(request.body);\
+                 ctx.write('events', { kind: event.kind, at: request.headers['x-sent-at'] ?? '' });\
+                 return { status: 202, headers: { 'x-handled-by': 'hook' }, body: 'stored' };\
+               } }"
+        }),
+    )
+    .await;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/worker/hook/")
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .header("content-type", "application/json")
+                .header("x-sent-at", "noon")
+                .body(Body::from(json!({"kind":"ping"}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::ACCEPTED,
+        "the worker chose 202"
+    );
+    assert_eq!(
+        response.headers().get("x-handled-by").unwrap(),
+        "hook",
+        "and its own header"
+    );
+    let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+    assert_eq!(String::from_utf8_lossy(&bytes), "stored");
+
+    // The rows were durable before the answer went out.
+    let rows = sql(&app, "SELECT kind, at FROM events").await;
+    let row = &rows.as_array().unwrap()[0];
+    assert_eq!(row["kind"], "ping", "{rows}");
+    assert_eq!(row["at"], "noon", "it saw the header: {rows}");
+}
+
+/// The deployment token is the node's business. A worker that could read it
+/// could use it, so it never sees it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_inbound_request_does_not_carry_the_token_into_the_worker() {
+    let d = tempfile::tempdir().unwrap();
+    let app = router(
+        Service::open(sized(d.path(), 2048 * 1024 * 1024))
+            .await
+            .unwrap(),
+    );
+    defined(
+        &app,
+        "peek",
+        json!({
+            "every_seconds": 3600,
+            "target": "ignored",
+            "worker": "export default { fetch(request) {\
+                 return { status: 200, body: JSON.stringify(Object.keys(request.headers)) };\
+               } }"
+        }),
+    )
+    .await;
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/worker/peek/")
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+    let seen = String::from_utf8_lossy(&bytes).to_lowercase();
+    assert!(
+        !seen.contains("authorization"),
+        "the token stayed out: {seen}"
+    );
+    assert!(
+        seen.contains("content-type"),
+        "ordinary headers got through: {seen}"
+    );
+}
+
+/// A cron schedule is accepted and refused on its own terms.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_view_may_run_on_a_cron() {
+    let d = tempfile::tempdir().unwrap();
+    let app = seeded(d.path(), &["a"], &[1.0]).await;
+    defined(
+        &app,
+        "hourly",
+        json!({
+            "cron": "0 * * * *",
+            "target": "hourly_rows",
+            "worker": "export default () => [{ ran: 1 }]"
+        }),
+    )
+    .await;
+    let described = post(&app, "/v1/view/hourly/describe/", JSON, b"{}".to_vec()).await;
+    assert_eq!(described.1["cron"], "0 * * * *", "{:?}", described.1);
+
+    // Declaring it does not fire it: the first run is at the next named time.
+    let progress = refresh(&app, "hourly").await;
+    assert_eq!(progress["written"], 0, "not due yet: {progress}");
+
+    let (status, body) = define(
+        &app,
+        "nonsense",
+        json!({"cron": "0 25 * * *", "target": "never", "worker": "export default () => []"}),
+    )
+    .await;
+    assert_ne!(status, StatusCode::OK, "there is no hour 25");
+    assert!(body.to_string().contains("hour"), "{body}");
+
+    let (status, body) = define(
+        &app,
+        "both",
+        json!({"cron": "0 * * * *", "every_seconds": 60, "target": "never",
+               "worker": "export default () => []"}),
+    )
+    .await;
+    assert_ne!(status, StatusCode::OK, "one clock or the other");
+    assert!(body.to_string().contains("not both"), "{body}");
+}
+
+/// A socket the node holds open. Frames arrive, a worker reads them in
+/// bounded batches, and what it writes lands. The connection outlives any one
+/// worker turn, which is the point: an isolate is a turn, a stream is not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_worker_reads_a_socket_the_node_holds_open() {
+    use futures::SinkExt;
+    // A server that greets whoever subscribes, then sends three ticks.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((socket, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let Ok(mut stream) = tokio_tungstenite::accept_async(socket).await else {
+                    return;
+                };
+                use futures::StreamExt;
+                // Wait for the subscription before sending anything.
+                let opening = stream.next().await;
+                let subscribed = matches!(
+                    opening,
+                    Some(Ok(tokio_tungstenite::tungstenite::Message::Text(ref t)))
+                        if t.contains("ticks")
+                );
+                if !subscribed {
+                    return;
+                }
+                for n in 0..3 {
+                    let frame = json!({"seq": n, "px": 100.0 + n as f64}).to_string();
+                    if stream
+                        .send(tokio_tungstenite::tungstenite::Message::Text(frame.into()))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            });
+        }
+    });
+
+    let d = tempfile::tempdir().unwrap();
+    let app = router(
+        Service::open(sized(d.path(), 2048 * 1024 * 1024))
+            .await
+            .unwrap(),
+    );
+    defined(
+        &app,
+        "feed",
+        json!({
+            "websocket": {
+                "url": format!("ws://{address}/"),
+                "subscribe": "{\"channel\":\"ticks\"}",
+                "frames": 8,
+                "window_ms": 300
+            },
+            "target": "ticks",
+            "worker": "export default (rows) => rows.map(r => {\
+                 const frame = JSON.parse(r.data);\
+                 return { seq: frame.seq, px: frame.px };\
+               })"
+        }),
+    )
+    .await;
+
+    // The node connects on its own, so all the test does is wait for rows.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(40);
+    let mut got = 0u64;
+    while std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        let counted = post(
+            &app,
+            "/v1/query",
+            JSON,
+            json!({"sql": "SELECT count(*) AS n FROM ticks"})
+                .to_string()
+                .into_bytes(),
+        )
+        .await;
+        if counted.0 == StatusCode::OK
+            && let Some(row) = counted.1.as_array().and_then(|rows| rows.first())
+            && let Some(n) = row["n"].as_u64()
+        {
+            got = n;
+            if got >= 3 {
+                break;
+            }
+        }
+    }
+    assert_eq!(got, 3, "every frame reached the stream");
+
+    let rows = sql(&app, "SELECT seq, px FROM ticks ORDER BY seq").await;
+    let seqs: Vec<i64> = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["seq"].as_i64().unwrap())
+        .collect();
+    assert_eq!(
+        seqs,
+        vec![0, 1, 2],
+        "in order, parsed by the worker: {rows}"
+    );
+}
+
+/// A socket view is its own source, and says so rather than accepting a
+/// definition that cannot mean anything.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_socket_view_is_checked_when_it_is_declared() {
+    let d = tempfile::tempdir().unwrap();
+    let app = seeded(d.path(), &["a"], &[1.0]).await;
+    for (bad, wanted) in [
+        (
+            json!({"websocket": {"url": "https://example.test/"}, "target": "x",
+                   "worker": "export default r => r"}),
+            "ws or wss",
+        ),
+        (
+            json!({"websocket": {"url": "wss://example.test/"}, "source": "raw", "target": "x",
+                   "worker": "export default r => r"}),
+            "no source",
+        ),
+        (
+            json!({"websocket": {"url": "wss://example.test/"}, "target": "x",
+                   "sql": "SELECT 1"}),
+            "needs a worker",
+        ),
+    ] {
+        let (status, body) = define(&app, "bad", bad).await;
+        assert_ne!(status, StatusCode::OK, "{wanted}");
+        assert!(body.to_string().contains(wanted), "{wanted}: {body}");
+    }
+}

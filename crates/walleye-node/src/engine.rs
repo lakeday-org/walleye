@@ -2039,6 +2039,43 @@ pub struct ViewDefinition {
     /// when its source has rows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub every_seconds: Option<u64>,
+    /// When a sourceless worker runs, as five cron fields. An alternative to
+    /// `every_seconds` for work that belongs at a time rather than at an
+    /// interval, such as once an hour on the hour.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cron: Option<String>,
+    /// A socket the node holds open, handing what arrives to the worker.
+    ///
+    /// The connection lives in the node, not in the isolate. A worker is
+    /// still a bounded turn over a batch of frames, which is what keeps it
+    /// stoppable and replaceable while the stream stays connected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub websocket: Option<Socket>,
+}
+/// Where to connect, and what to say on connecting.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Socket {
+    pub url: String,
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub headers: std::collections::HashMap<String, String>,
+    /// Sent once the socket opens, usually a subscription. `{{env:NAME}}` is
+    /// filled in by the node, so a key never has to live in the definition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscribe: Option<String>,
+    /// Frames to gather before handing them to the worker.
+    #[serde(default = "default_frames")]
+    pub frames: usize,
+    /// How long to wait for that many, in milliseconds, before handing over
+    /// whatever has arrived.
+    #[serde(default = "default_window_ms")]
+    pub window_ms: u64,
+}
+fn default_frames() -> usize {
+    256
+}
+fn default_window_ms() -> u64 {
+    1000
 }
 impl ViewDefinition {
     /// What this view's worker may spend. A deployment sizes its own
@@ -2136,18 +2173,43 @@ impl Engine {
         if view.target.is_some() && view.target == view.source {
             return Err("a view cannot write back into its own source".into());
         }
-        match (&view.source, view.every_seconds) {
-            (None, None) => {
+        if let Some(socket) = &view.websocket {
+            let url = reqwest::Url::parse(&socket.url)
+                .map_err(|error| -> Error { format!("websocket url: {error}").into() })?;
+            if !matches!(url.scheme(), "ws" | "wss") {
+                return Err("a websocket url must be ws or wss".into());
+            }
+            if !filled(&view.worker) {
+                return Err("a websocket view needs a worker to read its frames".into());
+            }
+            if view.source.is_some() {
+                return Err("a websocket view has no source: the socket is its source".into());
+            }
+            if socket.frames == 0 || socket.frames > 10_000 {
+                return Err("frames must be between 1 and 10000".into());
+            }
+        }
+        if let Some(expression) = &view.cron {
+            crate::cron::Schedule::parse(expression)
+                .map_err(|reason| -> Error { reason.into() })?;
+            if view.every_seconds.is_some() {
+                return Err("a view runs on a cron or on an interval, not both".into());
+            }
+        }
+        if view.source.is_none() && view.websocket.is_none() {
+            if view.cron.is_none() && view.every_seconds.is_none() {
                 return Err(
-                    "a view with no source needs every_seconds: it runs on a clock, not on rows"
+                    "a view with no source needs a cron or every_seconds: it runs on a clock, \
+                     not on rows"
                         .into(),
                 );
             }
-            (None, Some(0)) => return Err("every_seconds must be at least one".into()),
-            (None, Some(_)) if !filled(&view.worker) => {
+            if view.every_seconds == Some(0) {
+                return Err("every_seconds must be at least one".into());
+            }
+            if !filled(&view.worker) {
                 return Err("a view with no source needs a worker to go and get its rows".into());
             }
-            _ => {}
         }
         if let Some(alert) = &view.alert {
             let url = reqwest::Url::parse(&alert.url).map_err(|e| format!("alert url: {e}"))?;
@@ -2218,9 +2280,17 @@ impl Engine {
         let view = self.view(name).await?;
         let consumer = format!("view:{name}");
         let cursor = self.cursor(&consumer).await?;
-        match &view.source {
-            Some(source) => self.advance_from(&view, source, &consumer, cursor).await,
-            None => self.run_on_schedule(&view, &consumer, cursor).await,
+        match (&view.source, &view.websocket) {
+            // A socket view is driven by what arrives on its socket.
+            (_, Some(_)) => Ok(Progress {
+                rows: 0,
+                written: 0,
+                delivered: 0,
+                through: cursor,
+                caught_up: true,
+            }),
+            (Some(source), None) => self.advance_from(&view, source, &consumer, cursor).await,
+            (None, None) => self.run_on_schedule(&view, &consumer, cursor).await,
         }
     }
 
@@ -2234,10 +2304,34 @@ impl Engine {
         consumer: &str,
         last_run: u64,
     ) -> Result<Progress, Error> {
-        let every = view.every_seconds.unwrap_or(60).max(1);
         let now = now_micros();
-        let due = last_run.saturating_add(every.saturating_mul(1_000_000));
+        let due = match &view.cron {
+            Some(expression) => {
+                let schedule = crate::cron::Schedule::parse(expression)
+                    .map_err(|reason| -> Error { reason.into() })?;
+                // A view that has never run is due at its next named time, so
+                // declaring one does not fire it immediately.
+                let from = if last_run == 0 {
+                    (now / 1_000_000) as i64
+                } else {
+                    (last_run / 1_000_000) as i64
+                };
+                match schedule.next_after(from) {
+                    Some(next) => (next as u64).saturating_mul(1_000_000),
+                    None => u64::MAX,
+                }
+            }
+            None => {
+                let every = view.every_seconds.unwrap_or(60).max(1);
+                last_run.saturating_add(every.saturating_mul(1_000_000))
+            }
+        };
         if now < due {
+            if last_run == 0 {
+                // Remember when it was declared, so the first run lands at
+                // the next named time rather than never.
+                self.set_cursor(consumer, now).await?;
+            }
             return Ok(Progress {
                 rows: 0,
                 written: 0,
@@ -2472,6 +2566,97 @@ impl Engine {
             }
         }
         Ok(total)
+    }
+
+    /// Hand a batch of socket frames to a view's worker.
+    ///
+    /// Each frame becomes one row with a `data` column holding the text as it
+    /// arrived. Parsing it is the worker's job, because only the worker knows
+    /// what the other end sends.
+    pub async fn handle_frames(&self, name: &str, frames: Vec<String>) -> Result<usize, Error> {
+        if frames.is_empty() {
+            return Ok(0);
+        }
+        let view = self.view(name).await?;
+        let Some(worker) = view.worker.as_deref().filter(|w| !w.trim().is_empty()) else {
+            return Err(format!("{name} has no worker to read its frames").into());
+        };
+        let rows: Vec<serde_json::Value> = frames
+            .into_iter()
+            .map(|data| serde_json::json!({ "data": data }))
+            .collect();
+        let batch = rows_to_batches(rows, None)?;
+        let (produced, elsewhere) = self.invoke_worker(&view, worker, &batch).await?;
+        let mut written = self.land(&view, elsewhere).await?;
+        let made: usize = produced.iter().map(RecordBatch::num_rows).sum();
+        if let Some(alert) = &view.alert
+            && made > 0
+        {
+            self.deliver(alert, &produced).await?;
+        }
+        if let Some(target) = &view.target
+            && made > 0
+        {
+            self.ensure_target(target, &produced).await?;
+            self.append(target, produced).await?;
+            written += made;
+        }
+        Ok(written)
+    }
+
+    /// Hand one request to a view's worker and take back its answer.
+    ///
+    /// Whatever the worker wrote lands before the answer goes out, so a
+    /// caller that got a 200 can rely on the rows being durable. A worker
+    /// that throws answers nothing and writes nothing.
+    pub async fn handle_request(
+        &self,
+        name: &str,
+        request: serde_json::Value,
+    ) -> Result<serde_json::Value, Error> {
+        let view = self.view(name).await?;
+        let Some(worker) = view.worker.as_deref().filter(|w| !w.trim().is_empty()) else {
+            return Err(format!("{name} has no worker to answer with").into());
+        };
+        let limits = view.limits();
+        let _heap = self
+            .cache
+            .resources
+            .reserve_memory(&format!("worker {}", view.name), limits.heap_bytes)
+            .map_err(|error| -> Error { Box::new(error) })?;
+        let host = self.reach.clone();
+        let body = serde_json::to_string(&request)?;
+        let source = worker.to_owned();
+        let outcome = tokio::task::spawn_blocking(move || {
+            walleye_v8::run_request(&source, &body, limits, host)
+        })
+        .await
+        .map_err(|error| -> Error { error.to_string().into() })??;
+
+        let mut landed = Vec::new();
+        for (stream, written) in outcome.writes {
+            if !valid_name(&stream) {
+                return Err(format!("a worker wrote to an invalid stream name: {stream}").into());
+            }
+            let value: serde_json::Value = serde_json::from_str(&written)?;
+            let rows = match value {
+                serde_json::Value::Array(rows) => rows,
+                row => vec![row],
+            };
+            landed.push((stream, rows));
+        }
+        for (stream, rows) in landed {
+            let batches = rows_to_batches(rows, None)?;
+            if batches.is_empty() {
+                continue;
+            }
+            self.ensure_target(&stream, &batches).await?;
+            self.append(&stream, batches).await?;
+        }
+        if outcome.returned.is_empty() {
+            return Ok(serde_json::json!({ "status": 204 }));
+        }
+        Ok(serde_json::from_str(&outcome.returned)?)
     }
 
     /// Drive every view this node owns until none of them can make progress.

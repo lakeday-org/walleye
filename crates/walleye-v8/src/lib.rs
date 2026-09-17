@@ -201,6 +201,28 @@ pub fn run_with_host(
     limits: Limits,
     host: std::sync::Arc<dyn Host>,
 ) -> Result<Outcome, Error> {
+    run_entry(worker, rows, limits, host, Entry::Batch)
+}
+
+/// Answer one request with a worker's `fetch` handler. The request and the
+/// response are JSON; anything the worker wrote is in the outcome, and the
+/// host is expected to land it before it answers.
+pub fn run_request(
+    worker: &str,
+    request: &str,
+    limits: Limits,
+    host: std::sync::Arc<dyn Host>,
+) -> Result<Outcome, Error> {
+    run_entry(worker, request, limits, host, Entry::Fetch)
+}
+
+fn run_entry(
+    worker: &str,
+    rows: &str,
+    limits: Limits,
+    host: std::sync::Arc<dyn Host>,
+    entry: Entry,
+) -> Result<Outcome, Error> {
     start();
     let heap = limits.heap_bytes.max(8 * 1024 * 1024);
     let mut isolate = v8::Isolate::new(v8::CreateParams::default().heap_limits(0, heap));
@@ -219,7 +241,7 @@ pub fn run_with_host(
     );
 
     let deadline = Deadline::arm(isolate.thread_safe_handle(), limits.deadline);
-    let outcome = evaluate(&mut isolate, worker, rows);
+    let outcome = evaluate(&mut isolate, worker, rows, entry);
     let stopped_late = deadline.fired();
     let stopped_big = over.load(std::sync::atomic::Ordering::Acquire);
     drop(deadline);
@@ -336,7 +358,66 @@ fn call_callback(
     }
 }
 
-fn evaluate(isolate: &mut v8::Isolate, worker: &str, rows: &str) -> Result<Outcome, Error> {
+/// The function to call for this kind of turn.
+///
+/// A worker may default-export a function, which is the whole of it, or an
+/// object of named handlers in the shape the reference runtime uses:
+/// `export default { fetch, batch }`. A plain function is `batch`, because a
+/// worker that only transforms rows should not have to write a wrapper.
+fn handler<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    default: v8::Local<'s, v8::Value>,
+    entry: Entry,
+) -> Result<v8::Local<'s, v8::Function>, Error> {
+    if let Ok(function) = v8::Local::<v8::Function>::try_from(default) {
+        return match entry {
+            Entry::Batch => Ok(function),
+            Entry::Fetch => Err(Error::Invalid(
+                "it default-exports a plain function, so it has no fetch handler; \
+                 export default { fetch } to answer requests"
+                    .into(),
+            )),
+        };
+    }
+    let Some(object) = default.to_object(scope) else {
+        return Err(Error::Invalid(
+            "its default export is neither a function nor an object of handlers".into(),
+        ));
+    };
+    let name = entry.name();
+    let key = v8::String::new(scope, name).expect("a short name");
+    let found = object
+        .get(scope, key.into())
+        .filter(|value| !value.is_null_or_undefined())
+        .ok_or_else(|| Error::Invalid(format!("it has no {name} handler")))?;
+    v8::Local::<v8::Function>::try_from(found)
+        .map_err(|_| Error::Invalid(format!("its {name} handler is not a function")))
+}
+
+/// Which handler a turn is asking for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Entry {
+    /// A batch of rows to transform. The default export may be the function
+    /// itself.
+    Batch,
+    /// One request to answer.
+    Fetch,
+}
+impl Entry {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Batch => "batch",
+            Self::Fetch => "fetch",
+        }
+    }
+}
+
+fn evaluate(
+    isolate: &mut v8::Isolate,
+    worker: &str,
+    rows: &str,
+    entry: Entry,
+) -> Result<Outcome, Error> {
     v8::scope!(let scope, isolate);
     let context = v8::Context::new(scope, Default::default());
     let scope = &mut v8::ContextScope::new(scope, context);
@@ -385,9 +466,7 @@ fn evaluate(isolate: &mut v8::Isolate, worker: &str, rows: &str) -> Result<Outco
     let default = namespace
         .get(scope, key.into())
         .ok_or_else(|| Error::Invalid("it has no default export".into()))?;
-    let transform: v8::Local<v8::Function> = default.try_into().map_err(|_| {
-        Error::Invalid("its default export is not a function taking a batch of rows".into())
-    })?;
+    let transform = handler(scope, default, entry)?;
 
     let input =
         v8::String::new(scope, rows).ok_or_else(|| Error::Invalid("batch too large".into()))?;
@@ -445,6 +524,14 @@ fn evaluate(isolate: &mut v8::Isolate, worker: &str, rows: &str) -> Result<Outco
         .and_then(|written| written.0.lock().ok().map(|held| held.clone()))
         .unwrap_or_default();
 
+    if entry == Entry::Fetch {
+        let response = v8::json::stringify(scope, returned)
+            .ok_or_else(|| Error::Returned("a response that cannot be read".into()))?;
+        return Ok(Outcome {
+            returned: response.to_rust_string_lossy(scope),
+            writes,
+        });
+    }
     // A worker that wrote its rows need not also return them. One that did
     // neither has done nothing, and saying so beats a silent empty tier.
     if returned.is_null_or_undefined() {
@@ -689,5 +776,97 @@ mod tests {
             r#"[{"n":1}]"#,
             "a second batch starts clean"
         );
+    }
+}
+
+#[cfg(test)]
+mod request_tests {
+    use super::*;
+
+    fn answer(worker: &str, request: &str) -> Outcome {
+        run_request(
+            worker,
+            request,
+            Limits::default(),
+            std::sync::Arc::new(Sealed),
+        )
+        .expect("worker answered")
+    }
+
+    #[test]
+    fn a_worker_answers_a_request_with_its_fetch_handler() {
+        let outcome = answer(
+            "export default { fetch(request) { \
+               return { status: 200, body: 'hello ' + JSON.parse(request.body).name }; \
+             } }",
+            r#"{"method":"POST","path":"/hook","headers":{},"body":"{\"name\":\"world\"}"}"#,
+        );
+        assert!(
+            outcome.returned.contains("hello world"),
+            "{}",
+            outcome.returned
+        );
+        assert!(outcome.returned.contains("200"), "{}", outcome.returned);
+    }
+
+    #[test]
+    fn a_request_handler_may_write_rows_as_well_as_answer() {
+        let outcome = answer(
+            "export default { fetch(request, ctx) { \
+               const event = JSON.parse(request.body); \
+               ctx.write('events', event); \
+               return { status: 202, body: 'queued' }; \
+             } }",
+            r#"{"method":"POST","path":"/hook","headers":{},"body":"{\"kind\":\"ping\"}"}"#,
+        );
+        assert_eq!(outcome.writes.len(), 1);
+        assert_eq!(outcome.writes[0].0, "events");
+        assert!(
+            outcome.writes[0].1.contains("ping"),
+            "{:?}",
+            outcome.writes[0]
+        );
+        assert!(outcome.returned.contains("202"), "{}", outcome.returned);
+    }
+
+    #[test]
+    fn a_worker_with_only_a_batch_handler_cannot_answer_requests() {
+        let error = run_request(
+            "export default rows => rows",
+            "{}",
+            Limits::default(),
+            std::sync::Arc::new(Sealed),
+        )
+        .expect_err("it transforms rows, it does not answer");
+        assert!(
+            matches!(error, Error::Invalid(ref detail) if detail.contains("fetch")),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_named_batch_handler_works_as_well_as_a_bare_function() {
+        let outcome = run(
+            "export default { batch(rows) { return rows.map(r => ({ n: r.n + 1 })) } }",
+            r#"[{"n":1}]"#,
+            Limits::default(),
+        )
+        .expect("worker ran");
+        assert_eq!(outcome.returned, r#"[{"n":2}]"#);
+    }
+
+    #[test]
+    fn a_request_handler_is_held_to_the_same_deadline() {
+        let error = run_request(
+            "export default { fetch() { while (true) {} } }",
+            "{}",
+            Limits {
+                heap_bytes: DEFAULT_HEAP_BYTES,
+                deadline: Duration::from_millis(300),
+            },
+            std::sync::Arc::new(Sealed),
+        )
+        .expect_err("it never returns");
+        assert!(matches!(error, Error::Stopped(_)), "{error}");
     }
 }

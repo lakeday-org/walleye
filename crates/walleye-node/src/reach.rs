@@ -63,7 +63,7 @@ fn get() -> String {
 /// A missing one is refused rather than sent as the literal text, because a
 /// request that quietly carries `{{env:TOKEN}}` as its credential fails
 /// somewhere far away from the mistake.
-fn substitute(value: &str) -> Result<String, String> {
+pub(crate) fn substitute(value: &str) -> Result<String, String> {
     let mut out = String::with_capacity(value.len());
     let mut rest = value;
     while let Some(start) = rest.find("{{env:") {
@@ -83,6 +83,12 @@ fn substitute(value: &str) -> Result<String, String> {
     }
     out.push_str(rest);
     Ok(out)
+}
+
+/// The same substitution, for anything outside a worker request that also
+/// needs a secret the node holds.
+pub fn substitute_public(value: &str) -> Result<String, String> {
+    substitute(value)
 }
 
 #[derive(serde::Serialize)]
