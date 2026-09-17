@@ -50,9 +50,10 @@ cluster for the remaining third. Bring the node back rather than waiting for
 the cluster to route around it.
 
 Ownership does move when membership itself changes, which today means
-Kubernetes endpoint discovery rather than the static list, with a warming
-window during which the previous owner still serves. `WALLEYE_MEMBERS` does not
-turn that on. [A cluster](../self-hosting/cluster.md) is where that lives.
+Kubernetes endpoint discovery rather than the static list. `WALLEYE_MEMBERS`
+does not turn that on. A membership change moves stream ownership at once; the
+warming window that follows one applies to cached reads, not to which node
+owns a table. [A cluster](../self-hosting/cluster.md) is where that lives.
 
 ## Fencing
 
