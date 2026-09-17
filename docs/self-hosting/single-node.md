@@ -37,7 +37,15 @@ The LanceDB client is the primary way in and needs no adapter:
 ```python
 import lancedb
 
-db = lancedb.connect("http://127.0.0.1:8080", api_key=TOKEN, region="auto")
+# The address goes in host_override. The name after db:// is a label the
+# client wants and the node ignores, and region is required by the client
+# and ignored by the node.
+db = lancedb.connect(
+    "db://walleye",
+    api_key=TOKEN,
+    host_override="http://127.0.0.1:8080",
+    region="local",
+)
 table = db.create_table("docs", data=[
     {"id": "a", "text": "first", "vector": [0.1, 0.2, 0.3]},
 ])

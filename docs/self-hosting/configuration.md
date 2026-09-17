@@ -58,7 +58,8 @@ list, so the same list on every node means ownership never moves on restart.
 
 ## Workers
 
-Only relevant if you write [workers](../examples/). All optional.
+Only relevant if you write workers, which the
+[examples](../../examples/) use. All optional.
 
 | Variable | Default | Meaning |
 |---|---|---|
