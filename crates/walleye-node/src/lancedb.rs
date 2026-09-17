@@ -39,6 +39,11 @@ pub fn routes() -> Router<Arc<Service>> {
         .route("/v1/table/{name}/compact_lsm/", post(compact_lsm))
         .route("/v1/table/{name}/flush_lsm/", post(flush_lsm))
         .route("/v1/table/{name}/get_lsm_stats/", post(lsm_stats))
+        .route("/v1/view/", get(list_views))
+        .route("/v1/view/{name}/create/", post(create_view))
+        .route("/v1/view/{name}/describe/", post(describe_view))
+        .route("/v1/view/{name}/drop/", post(drop_view))
+        .route("/v1/view/{name}/refresh/", post(refresh_view))
         .layer(DefaultBodyLimit::max(512 * 1024 * 1024))
 }
 
@@ -519,4 +524,89 @@ async fn lsm_stats(State(s): State<Arc<Service>>, Path(name): Path<String>, h: H
         .await
         .map_err(|e| error(e.as_ref()))?;
     Ok(Json(serde_json::to_value(stats).map_err(|e| bad(e.to_string()))?).into_response())
+}
+
+/// How far to drive a view in one request. A refresh does bounded work so a
+/// call cannot run away; a caller that wants a tier fully caught up asks
+/// again until it reports nothing left.
+#[derive(Deserialize)]
+struct Passes {
+    #[serde(default)]
+    passes: Option<usize>,
+}
+
+async fn list_views(State(s): State<Arc<Service>>, h: HeaderMap) -> Reply {
+    let engine = engine(&s, &h)?;
+    let names = engine.view_names().await.map_err(|e| error(e.as_ref()))?;
+    Ok(Json(serde_json::json!({ "views": names })).into_response())
+}
+
+async fn create_view(
+    State(s): State<Arc<Service>>,
+    Path(name): Path<String>,
+    h: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Reply {
+    let engine = writable_engine(&s, &h)?;
+    let mut view: engine::ViewDefinition = serde_json::from_value(
+        // The name lives in the path, so a body that repeats it is accepted
+        // and a body that omits it is too.
+        match body {
+            serde_json::Value::Object(mut fields) => {
+                fields.insert("name".into(), serde_json::Value::String(name.clone()));
+                serde_json::Value::Object(fields)
+            }
+            other => other,
+        },
+    )
+    .map_err(|e| bad(e.to_string()))?;
+    view.name = name;
+    engine
+        .define_view(view)
+        .await
+        .map_err(|e| error(e.as_ref()))?;
+    Ok(Json(serde_json::json!({ "created": true })).into_response())
+}
+
+async fn describe_view(
+    State(s): State<Arc<Service>>,
+    Path(name): Path<String>,
+    h: HeaderMap,
+) -> Reply {
+    let engine = engine(&s, &h)?;
+    let view = engine.view(&name).await.map_err(|e| error(e.as_ref()))?;
+    let cursor = engine
+        .cursor(&format!("view:{name}"))
+        .await
+        .map_err(|e| error(e.as_ref()))?;
+    let mut described = serde_json::to_value(&view).map_err(|e| bad(e.to_string()))?;
+    if let Some(fields) = described.as_object_mut() {
+        fields.insert("cursor".into(), serde_json::json!(cursor));
+    }
+    Ok(Json(described).into_response())
+}
+
+async fn drop_view(State(s): State<Arc<Service>>, Path(name): Path<String>, h: HeaderMap) -> Reply {
+    let engine = writable_engine(&s, &h)?;
+    engine
+        .drop_view(&name)
+        .await
+        .map_err(|e| error(e.as_ref()))?;
+    Ok(Json(serde_json::json!({ "dropped": true })).into_response())
+}
+
+async fn refresh_view(
+    State(s): State<Arc<Service>>,
+    Path(name): Path<String>,
+    h: HeaderMap,
+    passes: Query<Passes>,
+) -> Reply {
+    let engine = writable_engine(&s, &h)?;
+    let progress = engine
+        .drain_view(&name, passes.passes.unwrap_or(1))
+        .await
+        .map_err(|e| write_error(e.as_ref()))?;
+    let mut revision = s.revision.lock().await;
+    *revision = format!("\"{}\"", uuid::Uuid::new_v4());
+    Ok(Json(serde_json::to_value(progress).map_err(|e| bad(e.to_string()))?).into_response())
 }

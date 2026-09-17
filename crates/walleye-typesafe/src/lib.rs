@@ -55,8 +55,8 @@ impl std::error::Error for Error {}
 /// One typed question. The service answers every question in a request at
 /// once, so a caller should ask everything it might want about a row here
 /// rather than in a second call.
-#[derive(Clone, Debug, Serialize)]
-#[serde(tag = "type", rename_all = "lowercase")]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
 pub enum Question {
     /// Pick one option. `criteria` maps each option to what it means.
     Choice {
@@ -424,6 +424,30 @@ fn cache_key(state: &str, questions: &BTreeMap<String, Question>, model: &str) -
         }
     }
     hasher.finish()
+}
+
+/// Parse a whole question set, written in the same shape the service takes:
+/// a map from the name a caller chooses to the question asked under it.
+///
+/// This is the form that matters for cost. Every question in one set is
+/// answered by one call, so a tier that wants five things about a row should
+/// write them here rather than as five separate function calls.
+pub fn parse_spec(json: &str) -> Result<BTreeMap<String, Question>, Error> {
+    let questions: BTreeMap<String, Question> =
+        serde_json::from_str(json).map_err(|error| Error::Rejected {
+            status: 422,
+            message: format!("could not read the question set: {error}"),
+        })?;
+    if questions.is_empty() {
+        return Err(Error::Rejected {
+            status: 422,
+            message: "ask at least one question".into(),
+        });
+    }
+    for question in questions.values() {
+        question.validate()?;
+    }
+    Ok(questions)
 }
 
 /// Parse `option=meaning; other=meaning` into choice criteria, which is how a

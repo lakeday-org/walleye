@@ -269,3 +269,82 @@ async fn repeated_text_is_asked_about_once() {
         "identical rows collapsed to one question, took {elapsed:?}"
     );
 }
+
+/// A tier asks a row several things at once. The service evaluates a whole
+/// question set in parallel within one call, so this is the form that keeps a
+/// wide tier affordable: one call per row, not one per question.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_call_answers_a_whole_question_set() {
+    if !keyed() {
+        eprintln!("skipping: no decision service key configured");
+        return;
+    }
+    let d = tempfile::tempdir().unwrap();
+    let app = seeded(
+        d.path(),
+        &["I was charged twice for the same order and I want a refund."],
+    )
+    .await;
+
+    let spec = json!({
+        "team": {
+            "type": "choice",
+            "instructions": "Which team should handle this?",
+            "criteria": {
+                "returns": "Exchanges, refunds, wrong or damaged items",
+                "shipping": "Delivery status, delays, lost packages",
+                "billing": "Charges, invoices, payment problems"
+            }
+        },
+        "refund": {"type": "noul", "instructions": "The customer is asking for money back"},
+        "severity": {
+            "type": "score",
+            "instructions": "How severe is this for the customer",
+            "criteria": ["minor", "moderate", "severe"]
+        }
+    })
+    .to_string()
+    .replace('\'', "''");
+
+    let (status, body) = sql(
+        &app,
+        &format!(
+            "SELECT d['team']['label'] AS team, \
+                    d['team']['confidence'] AS sure, \
+                    d['refund']['value'] AS refund, \
+                    d['severity']['label'] AS severity \
+             FROM (SELECT decide(body, '{spec}') AS d FROM tickets)"
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let row = &body.as_array().expect("rows")[0];
+    assert_eq!(row["team"], "billing", "{body}");
+    assert!(row["sure"].as_f64().expect("confidence") > 0.5, "{body}");
+    assert!(
+        row["refund"].as_f64().expect("probability") > 0.5,
+        "an explicit refund request, got {body}"
+    );
+    assert!(
+        row["severity"].is_string(),
+        "a score names its level, got {body}"
+    );
+}
+
+/// The result's columns are named by the questions, so a question set that is
+/// not a literal cannot be planned and must say so rather than fail obscurely.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_question_set_that_is_not_a_literal_is_refused_while_planning() {
+    let d = tempfile::tempdir().unwrap();
+    let app = seeded(d.path(), &["anything at all"]).await;
+    let (status, body) = sql(&app, "SELECT decide(body, body) AS d FROM tickets").await;
+    assert_ne!(
+        status,
+        StatusCode::OK,
+        "the shape of the result is unknowable"
+    );
+    assert!(
+        body.to_string().contains("literal"),
+        "names the reason, got {body}"
+    );
+}

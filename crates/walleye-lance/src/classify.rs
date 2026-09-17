@@ -11,17 +11,20 @@
 //! taxonomy. Asking the same question of the same text twice inside one query
 //! costs one call, because identical questions about identical state share an
 //! answer.
-use arrow_array::{Array, Float64Array, StringArray, builder::StringBuilder};
-use arrow_schema::DataType;
+use arrow_array::{
+    Array, ArrayRef, Float64Array, StringArray, StructArray, builder::StringBuilder,
+};
+use arrow_schema::{DataType, Field, FieldRef, Fields};
 use lance::deps::datafusion::{
     common::{DataFusionError, Result as DfResult, ScalarValue},
     logical_expr::{
-        ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
+        ColumnarValue, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature,
+        Volatility,
     },
     prelude::SessionContext,
 };
 use std::{collections::BTreeMap, sync::Arc, sync::OnceLock};
-use walleye_typesafe::{Answer, Client, Question, parse_criteria, parse_levels};
+use walleye_typesafe::{Answer, Client, Question, parse_criteria, parse_levels, parse_spec};
 
 /// The question key used for every single-question call. The service keys
 /// answers by the name the caller chose, and these functions ask one thing.
@@ -106,13 +109,29 @@ fn answers_for(
     function: &str,
 ) -> DfResult<Vec<Option<Answer>>> {
     question.validate().map_err(execution)?;
+    let questions: BTreeMap<String, Question> = [(KEY.to_owned(), question)].into();
+    Ok(decisions_for(states, &questions, function)?
+        .into_iter()
+        .map(|decision| decision.and_then(|d| d.answers.get(KEY).cloned()))
+        .collect())
+}
+
+/// Ask a whole question set of every distinct non-null row.
+///
+/// One call carries every question, which is the difference that matters:
+/// the service evaluates them in parallel, so a row asked five things costs
+/// about what a row asked one thing costs. Five separate function calls
+/// would cost five times as much.
+fn decisions_for(
+    states: &StringArray,
+    questions: &BTreeMap<String, Question>,
+    function: &str,
+) -> DfResult<Vec<Option<std::sync::Arc<walleye_typesafe::Decision>>>> {
     let Some(client) = client() else {
         return Err(execution(format!(
             "{function} needs a decision service: set WALLEYE_TYPESAFE_API_KEY"
         )));
     };
-    let questions: BTreeMap<String, Question> = [(KEY.to_owned(), question)].into();
-
     let mut distinct: Vec<String> = Vec::new();
     let mut seen: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
     let mut slot: Vec<Option<usize>> = Vec::with_capacity(states.len());
@@ -129,12 +148,13 @@ fn answers_for(
         slot.push(Some(at));
     }
 
-    let decided = wait(client.ask_many(&distinct, &questions));
-    let mut resolved: Vec<Option<Answer>> = Vec::with_capacity(decided.len());
+    let decided = wait(client.ask_many(&distinct, questions));
+    let mut resolved: Vec<Option<std::sync::Arc<walleye_typesafe::Decision>>> =
+        Vec::with_capacity(decided.len());
     let mut refusal: Option<String> = None;
     for outcome in decided {
         match outcome {
-            Ok(decision) => resolved.push(decision.answers.get(KEY).cloned()),
+            Ok(decision) => resolved.push(Some(decision)),
             Err(error) => {
                 // A rejected question is the caller's mistake and every row
                 // will repeat it, so report it rather than return a column of
@@ -258,6 +278,149 @@ impl ScalarUDFImpl for Decide {
     }
 }
 
+/// One answer rendered as three columns, so every question kind reads the
+/// same way regardless of what it asked.
+fn answer_fields() -> Fields {
+    Fields::from(vec![
+        Field::new("label", DataType::Utf8, true),
+        Field::new("value", DataType::Float64, true),
+        Field::new("confidence", DataType::Float64, true),
+    ])
+}
+
+/// Read the question set from the second argument, which must be a literal so
+/// the shape of the result is known while the query is still being planned.
+fn spec_of(scalar: Option<&ScalarValue>) -> DfResult<BTreeMap<String, Question>> {
+    let json = match scalar {
+        Some(ScalarValue::Utf8(Some(text)))
+        | Some(ScalarValue::LargeUtf8(Some(text)))
+        | Some(ScalarValue::Utf8View(Some(text))) => text.clone(),
+        _ => {
+            return Err(execution(
+                "decide needs its question set as a literal string, because the \
+                 columns it returns are named by the questions it asks",
+            ));
+        }
+    };
+    parse_spec(&json).map_err(execution)
+}
+
+/// Ask a whole set of questions about a row in one call.
+///
+/// The set is written in the same shape the service takes, and each question
+/// becomes a field of the returned struct:
+///
+/// ```sql
+/// SELECT decide(body, '{"team":{"type":"choice","instructions":"Which team?",
+///                                "criteria":{"returns":"...","billing":"..."}},
+///                       "refund":{"type":"noul","instructions":"Wants money back"}}')
+/// ```
+///
+/// This is the form to prefer whenever a row is asked more than one thing.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct DecideAll {
+    signature: Signature,
+}
+impl DecideAll {
+    fn new() -> Self {
+        Self {
+            signature: Signature::any(2, Volatility::Volatile),
+        }
+    }
+    fn struct_type(questions: &BTreeMap<String, Question>) -> DataType {
+        DataType::Struct(Fields::from(
+            questions
+                .keys()
+                .map(|name| Field::new(name, DataType::Struct(answer_fields()), true))
+                .collect::<Vec<_>>(),
+        ))
+    }
+}
+impl ScalarUDFImpl for DecideAll {
+    fn name(&self) -> &str {
+        "decide"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _arguments: &[DataType]) -> DfResult<DataType> {
+        Err(execution(
+            "decide needs its question set as a literal string",
+        ))
+    }
+    fn return_field_from_args(&self, arguments: ReturnFieldArgs) -> DfResult<FieldRef> {
+        let questions = spec_of(arguments.scalar_arguments.get(1).copied().flatten())?;
+        Ok(std::sync::Arc::new(Field::new(
+            "decide",
+            Self::struct_type(&questions),
+            true,
+        )))
+    }
+    fn invoke_with_args(&self, arguments: ScalarFunctionArgs) -> DfResult<ColumnarValue> {
+        let rows = arguments.number_rows;
+        let states = match &arguments.args[0] {
+            ColumnarValue::Array(array) => to_strings(array, "decide")?,
+            ColumnarValue::Scalar(scalar) => {
+                let array = scalar.to_array_of_size(rows).map_err(execution)?;
+                to_strings(&array, "decide")?
+            }
+        };
+        let json = constant(&arguments.args[1], "question set", "decide")?;
+        let questions = parse_spec(&json).map_err(execution)?;
+        let decided = decisions_for(&states, &questions, "decide")?;
+
+        let mut columns: Vec<(FieldRef, ArrayRef)> = Vec::with_capacity(questions.len());
+        for name in questions.keys() {
+            let answers: Vec<Option<Answer>> = decided
+                .iter()
+                .map(|decision| {
+                    decision
+                        .as_ref()
+                        .and_then(|decision| decision.answers.get(name).cloned())
+                })
+                .collect();
+            let mut labels = StringBuilder::with_capacity(answers.len(), answers.len() * 16);
+            for answer in &answers {
+                match answer.as_ref().and_then(Answer::label) {
+                    Some(label) => labels.append_value(label),
+                    None => labels.append_null(),
+                }
+            }
+            let inner: Vec<(FieldRef, ArrayRef)> = vec![
+                (
+                    std::sync::Arc::new(Field::new("label", DataType::Utf8, true)),
+                    std::sync::Arc::new(labels.finish()) as ArrayRef,
+                ),
+                (
+                    std::sync::Arc::new(Field::new("value", DataType::Float64, true)),
+                    std::sync::Arc::new(Float64Array::from(
+                        answers
+                            .iter()
+                            .map(|answer| answer.as_ref().and_then(Answer::value))
+                            .collect::<Vec<_>>(),
+                    )) as ArrayRef,
+                ),
+                (
+                    std::sync::Arc::new(Field::new("confidence", DataType::Float64, true)),
+                    std::sync::Arc::new(Float64Array::from(
+                        answers
+                            .iter()
+                            .map(|answer| answer.as_ref().map(Answer::confidence))
+                            .collect::<Vec<_>>(),
+                    )) as ArrayRef,
+                ),
+            ];
+            columns.push((
+                std::sync::Arc::new(Field::new(name, DataType::Struct(answer_fields()), true)),
+                std::sync::Arc::new(StructArray::from(inner)) as ArrayRef,
+            ));
+        }
+        Ok(ColumnarValue::Array(std::sync::Arc::new(
+            StructArray::from(columns),
+        )))
+    }
+}
+
 /// Add the decision functions to a session.
 ///
 /// They are registered whether or not a key is configured, so a query that
@@ -275,6 +438,7 @@ pub fn register(context: &SessionContext) {
     ] {
         context.register_udf(ScalarUDF::new_from_impl(function));
     }
+    context.register_udf(ScalarUDF::new_from_impl(DecideAll::new()));
 }
 
 /// Whether a decision service is configured, which decides whether the

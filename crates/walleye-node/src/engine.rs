@@ -43,6 +43,10 @@ type Error = Box<dyn std::error::Error + Send + Sync>;
 /// hash of the row's full contents, so an identical row (including a retried
 /// insert) collapses to one visible row and every memshard stays idempotent.
 pub const HIDDEN_PK: &str = "_walleye_pk";
+/// Every row's arrival order within its stream, assigned on append and never
+/// reused. A consumer remembers the last one it processed, which is what lets
+/// a tier be rebuilt from where it stopped instead of from the beginning.
+pub const HIDDEN_SEQ: &str = "_walleye_seq";
 /// Field metadata that marks a user-supplied primary key column.
 pub const PK_METADATA_KEY: &str = "lance-schema:unenforced-primary-key";
 
@@ -143,6 +147,16 @@ pub struct StreamDefinition {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub vector_indexes: Vec<VectorIndexSpec>,
 }
+/// Columns the node maintains and clients neither write nor see.
+pub fn hidden(column: &str) -> bool {
+    column == HIDDEN_PK || column == HIDDEN_SEQ
+}
+fn now_micros() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_micros() as u64)
+        .unwrap_or(0)
+}
 fn valid_name(name: &str) -> bool {
     !name.is_empty()
         && name
@@ -178,6 +192,9 @@ impl StreamDefinition {
             fields.push(Field::new(HIDDEN_PK, DataType::UInt64, false));
             primary_key.push(HIDDEN_PK.into());
         }
+        // Last, so the arrival order is never part of a row's identity: two
+        // appends of the same content must still collapse on the key.
+        fields.push(Field::new(HIDDEN_SEQ, DataType::UInt64, false));
         let schema = Schema::new(fields);
         // Every vector column gets an HNSW index from the first row; the
         // metric can be changed later through create_index.
@@ -225,7 +242,7 @@ impl StreamDefinition {
         Schema::new(
             full.fields()
                 .iter()
-                .filter(|f| f.name() != HIDDEN_PK)
+                .filter(|f| !hidden(f.name()))
                 .cloned()
                 .collect::<Vec<_>>(),
         )
@@ -303,6 +320,9 @@ struct Stream {
     /// One automatic compaction in flight at a time, spaced by COMPACT_INTERVAL.
     compacting: std::sync::atomic::AtomicBool,
     last_compaction: Mutex<Option<Instant>>,
+    /// Next arrival number to hand out, once the stream's high-water mark is
+    /// known. Unset until the first append after opening.
+    seq: Mutex<Option<u64>>,
 }
 impl Stream {
     /// Bytes this stream's writer may hold in memory: the memtable size and
@@ -447,6 +467,7 @@ pub struct Engine {
     cache: CachedStorage,
     catalog: Arc<ObjectStore>,
     catalog_path: Path,
+    views_path: Path,
     data_path: Path,
     streams: Mutex<BTreeMap<String, Arc<Stream>>>,
     // Names whose drop is still in flight. A catalog load that read the
@@ -508,6 +529,7 @@ impl Engine {
             cache,
             catalog,
             catalog_path: prefix.clone().join("streams"),
+            views_path: prefix.clone().join("views"),
             data_path: prefix.join("data"),
             streams: Mutex::new(BTreeMap::new()),
             dropping: Mutex::new(BTreeSet::new()),
@@ -540,6 +562,7 @@ impl Engine {
                 resources: self.cache.resources.clone(),
                 lease: Mutex::new(None),
                 last_compaction: Mutex::new(None),
+                seq: Mutex::new(None),
             })
         });
         Ok(stream.clone())
@@ -825,12 +848,16 @@ impl Engine {
         }
         let stream = self.stream(name).await?;
         let full = stream.config.schema.clone();
+        let rows: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
+        let mut next = self.reserve_seq(name, &stream, rows).await?;
         let mut prepared = Vec::with_capacity(batches.len());
         for batch in batches {
             if batch.num_rows() == 0 {
                 continue;
             }
-            prepared.push(conform_batch(&stream.definition, &full, batch)?);
+            let rows = batch.num_rows() as u64;
+            prepared.push(conform_batch(&stream.definition, &full, batch, next)?);
+            next = next.saturating_add(rows);
         }
         if prepared.is_empty() {
             return Ok(stream.version.load(Ordering::Acquire));
@@ -838,6 +865,40 @@ impl Engine {
         self.append_prepared(&stream, prepared).await?;
         self.maybe_compact(&stream).await;
         Ok(stream.version.fetch_add(1, Ordering::AcqRel) + 1)
+    }
+    /// Claim `rows` consecutive arrival numbers for a stream.
+    ///
+    /// The first claim after opening has to learn where the stream left off,
+    /// because the counter lives in memory and the rows outlive the process.
+    /// It takes the larger of the stored high-water mark and the current
+    /// clock, so a clock that steps backwards can still not hand out a number
+    /// a consumer has already passed. Handing out a number below a cursor
+    /// would hide those rows from it for good.
+    async fn reserve_seq(&self, name: &str, stream: &Arc<Stream>, rows: u64) -> Result<u64, Error> {
+        let mut seq = stream.seq.lock().await;
+        let next = match *seq {
+            Some(next) => next,
+            None => self.highest_seq(name).await?.max(now_micros()),
+        };
+        *seq = Some(next.saturating_add(rows.max(1)));
+        Ok(next)
+    }
+    /// The largest arrival number the stream already holds, or zero when it
+    /// holds none. Paid once per stream per process.
+    async fn highest_seq(&self, name: &str) -> Result<u64, Error> {
+        let sql = format!("SELECT max({HIDDEN_SEQ}) AS high FROM \"{name}\"");
+        let bytes = match self.query_loaded(&sql, &[]).await {
+            Ok(bytes) => bytes,
+            // A stream with no rows yet, or one whose writer is not open,
+            // simply has no mark to beat.
+            Err(_) => return Ok(0),
+        };
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap_or_default();
+        Ok(rows
+            .first()
+            .and_then(|row| row.get("high"))
+            .and_then(serde_json::Value::as_u64)
+            .map_or(0, |high| high.saturating_add(1)))
     }
     /// Append, reopening once if the writer turns out to be fenced. Lance
     /// fences a writer whose WAL append failed or whose epoch a peer took;
@@ -1021,7 +1082,14 @@ impl Engine {
     }
     pub async fn table_names(&self) -> Result<Vec<String>, Error> {
         self.refresh_catalog().await?;
-        Ok(self.streams.lock().await.keys().cloned().collect())
+        Ok(self
+            .streams
+            .lock()
+            .await
+            .keys()
+            .filter(|name| !name.starts_with('_'))
+            .cloned()
+            .collect())
     }
     /// Current version and client-visible schema.
     pub async fn describe(&self, name: &str) -> Result<(u64, Schema), Error> {
@@ -1043,7 +1111,7 @@ impl Engine {
         let stream = self.stream(name).await?;
         let snapshot = SnapshotSource::snapshot(stream.as_ref()).await?;
         let result = snapshot.search(&self.cache.storage, request).await?;
-        result.iter().map(strip_hidden_pk).collect()
+        result.iter().map(strip_hidden).collect()
     }
     pub async fn count(&self, name: &str, filter: Option<&str>) -> Result<u64, Error> {
         let stream = self.stream(name).await?;
@@ -1207,6 +1275,24 @@ impl Engine {
             result.iter().cloned().collect(),
         ))
     }
+    /// Run SQL and keep the Arrow result, which is what a view needs: its
+    /// output is written on, not rendered. The result carries the memory it
+    /// was admitted under, so the caller holds it for as long as it reads the
+    /// batches rather than taking them out from under the accounting.
+    async fn query_batches(
+        &self,
+        sql: &str,
+        gathered: &[GatheredTable],
+    ) -> Result<walleye_lance::ScanResult, Error> {
+        let tables: Vec<_> = self
+            .streams
+            .lock()
+            .await
+            .iter()
+            .map(|(name, s)| (name.clone(), s.clone() as Arc<dyn SnapshotSource>))
+            .collect();
+        Ok(walleye_lance::query_with_gathered(&self.cache.storage, &tables, gathered, sql).await?)
+    }
     async fn query_loaded(&self, sql: &str, gathered: &[GatheredTable]) -> Result<Vec<u8>, Error> {
         let tables: Vec<_> = self
             .streams
@@ -1339,10 +1425,11 @@ fn conform_batch(
     definition: &StreamDefinition,
     full: &Arc<Schema>,
     batch: RecordBatch,
+    first_seq: u64,
 ) -> Result<RecordBatch, Error> {
     let mut columns = Vec::with_capacity(full.fields().len());
     for field in full.fields() {
-        if field.name() == HIDDEN_PK {
+        if hidden(field.name()) {
             continue;
         }
         let index = batch
@@ -1370,6 +1457,10 @@ fn conform_batch(
     if definition.hidden_pk() {
         columns.push(Arc::new(content_hash(&columns)?));
     }
+    let rows = batch.num_rows() as u64;
+    columns.push(Arc::new(UInt64Array::from_iter_values(
+        first_seq..first_seq.saturating_add(rows),
+    )));
     Ok(RecordBatch::try_new(full.clone(), columns)?)
 }
 /// xxh3 of each row's Arrow row-format encoding across all user columns.
@@ -1388,10 +1479,10 @@ fn content_hash(columns: &[Arc<dyn Array>]) -> Result<UInt64Array, Error> {
             .map(|row| xxhash_rust::xxh3::xxh3_64(row.as_ref())),
     ))
 }
-fn strip_hidden_pk(batch: &RecordBatch) -> Result<RecordBatch, Error> {
+fn strip_hidden(batch: &RecordBatch) -> Result<RecordBatch, Error> {
     let schema = batch.schema();
     let keep: Vec<usize> = (0..schema.fields().len())
-        .filter(|&i| schema.field(i).name() != HIDDEN_PK)
+        .filter(|&i| !hidden(schema.field(i).name()))
         .collect();
     if keep.len() == schema.fields().len() {
         return Ok(batch.clone());
@@ -1848,4 +1939,266 @@ mod tests {
         e.close().await;
         e.cache.backend.close().await.unwrap();
     }
+}
+
+/// Where a tier's rows come from, what turns them into the next tier, and
+/// where they land. A view is maintained forward from where it stopped: it
+/// reads the rows that arrived after its cursor, runs its query over only
+/// those, writes the result, and remembers how far it reached.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ViewDefinition {
+    pub name: String,
+    /// The stream this view reads. Inside the query this name means the rows
+    /// that are new, not the whole stream.
+    pub source: String,
+    /// The query that turns source rows into target rows.
+    pub sql: String,
+    /// Where the result is written. Created from the query's own output
+    /// shape the first time the view produces rows.
+    pub target: String,
+    #[serde(default = "default_batch_rows")]
+    pub batch_rows: usize,
+}
+fn default_batch_rows() -> usize {
+    512
+}
+/// What one pass over a view did.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct Progress {
+    /// Source rows read.
+    pub rows: usize,
+    /// Rows written to the target.
+    pub written: usize,
+    /// Arrival number the view has now consumed through.
+    pub through: u64,
+    /// Whether the source had nothing further at the end of the pass.
+    pub caught_up: bool,
+}
+
+/// Where each consumer stopped. One row per consumer, superseded in place,
+/// so the newest row for a name is its position.
+pub const CURSORS: &str = "_walleye_cursors";
+
+fn cursor_schema() -> Schema {
+    let mut consumer = Field::new("consumer", DataType::Utf8, false);
+    consumer.set_metadata(
+        [(PK_METADATA_KEY.to_owned(), "true".to_owned())]
+            .into_iter()
+            .collect(),
+    );
+    Schema::new(vec![
+        consumer,
+        Field::new("position", DataType::UInt64, true),
+        Field::new("updated_at", DataType::Int64, true),
+    ])
+}
+
+impl Engine {
+    /// Register a view. The source must exist; the target is created when the
+    /// view first produces rows, from the shape its own query returns.
+    pub async fn define_view(&self, view: ViewDefinition) -> Result<(), Error> {
+        for name in [&view.name, &view.source, &view.target] {
+            if !valid_name(name) {
+                return Err(format!("invalid name {name}").into());
+            }
+        }
+        if view.sql.trim().is_empty() {
+            return Err("a view needs a query".into());
+        }
+        if view.batch_rows == 0 || view.batch_rows > 100_000 {
+            return Err("batch_rows must be between 1 and 100000".into());
+        }
+        if view.target == view.source {
+            return Err("a view cannot write back into its own source".into());
+        }
+        // Fail here rather than at the first refresh, when nobody is watching.
+        self.definition(&view.source).await?;
+        let path = self.views_path.clone().join(format!("{}.json", view.name));
+        let bytes = serde_json::to_vec(&view)?;
+        self.catalog.inner.put(&path, bytes.into()).await?;
+        Ok(())
+    }
+    pub async fn view(&self, name: &str) -> Result<ViewDefinition, Error> {
+        if !valid_name(name) {
+            return Err("invalid view name".into());
+        }
+        let path = self.views_path.clone().join(format!("{name}.json"));
+        let data = match self.catalog.inner.get(&path).await {
+            Ok(data) => data.bytes().await?,
+            Err(object_store::Error::NotFound { .. }) => {
+                return Err(Box::new(TableNotFound(name.into())));
+            }
+            Err(error) => return Err(error.into()),
+        };
+        Ok(serde_json::from_slice(&data)?)
+    }
+    pub async fn view_names(&self) -> Result<Vec<String>, Error> {
+        let objects: Vec<_> = self
+            .catalog
+            .inner
+            .list(Some(&self.views_path))
+            .try_collect()
+            .await?;
+        let mut names: Vec<String> = objects
+            .iter()
+            .filter(|object| object.location.extension() == Some("json"))
+            .filter_map(|object| object.location.filename())
+            .filter_map(|file| file.strip_suffix(".json"))
+            .map(str::to_owned)
+            .collect();
+        names.sort();
+        Ok(names)
+    }
+    pub async fn drop_view(&self, name: &str) -> Result<(), Error> {
+        let view = self.view(name).await?;
+        let path = self.views_path.clone().join(format!("{name}.json"));
+        match self.catalog.inner.delete(&path).await {
+            Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
+            Err(error) => return Err(error.into()),
+        }
+        // Leave the target and its rows: dropping a definition is not a
+        // licence to delete data somebody may still be reading.
+        let _ = view;
+        Ok(())
+    }
+
+    /// Advance a view by at most one batch.
+    ///
+    /// The pass is safe to repeat. Rows are written before the cursor moves,
+    /// so a crash in between replays the same source rows; the target's
+    /// content key collapses the identical output rows that result. That
+    /// holds only while the query is a deterministic function of its input,
+    /// which is the contract a view signs.
+    pub async fn refresh_view(&self, name: &str) -> Result<Progress, Error> {
+        let view = self.view(name).await?;
+        let consumer = format!("view:{name}");
+        let cursor = self.cursor(&consumer).await?;
+        let pick = format!(
+            "SELECT * FROM \"{}\" WHERE {HIDDEN_SEQ} > {cursor} ORDER BY {HIDDEN_SEQ} LIMIT {}",
+            view.source, view.batch_rows
+        );
+        let fresh = self.query_batches(&pick, &[]).await?;
+        let rows: usize = fresh.iter().map(RecordBatch::num_rows).sum();
+        if rows == 0 {
+            return Ok(Progress {
+                rows: 0,
+                written: 0,
+                through: cursor,
+                caught_up: true,
+            });
+        }
+        let through = highest_in(&fresh)?.unwrap_or(cursor);
+        // Inside the view's query the source name means these rows only,
+        // which is what makes the pass incremental without the query having
+        // to know about cursors at all.
+        let schema = fresh[0].schema();
+        let gathered = vec![(view.source.clone(), schema, fresh.to_vec())];
+        let produced = self.query_batches(&view.sql, &gathered).await?;
+        let produced = produced
+            .iter()
+            .map(strip_hidden)
+            .collect::<Result<Vec<_>, _>>()?;
+        let written: usize = produced.iter().map(RecordBatch::num_rows).sum();
+        if written > 0 {
+            if self.definition(&view.target).await.is_err() {
+                let definition = StreamDefinition::from_arrow(&view.target, &produced[0].schema())?;
+                self.define_with(definition, true).await?;
+            }
+            self.append(&view.target, produced).await?;
+        }
+        self.set_cursor(&consumer, through).await?;
+        Ok(Progress {
+            rows,
+            written,
+            through,
+            caught_up: rows < view.batch_rows,
+        })
+    }
+    /// Advance a view until its source has nothing further, or until `passes`
+    /// batches have been done. Bounded so one call cannot run forever.
+    pub async fn drain_view(&self, name: &str, passes: usize) -> Result<Progress, Error> {
+        let mut total = Progress {
+            rows: 0,
+            written: 0,
+            through: 0,
+            caught_up: false,
+        };
+        for _ in 0..passes.clamp(1, 1000) {
+            let pass = self.refresh_view(name).await?;
+            total.rows += pass.rows;
+            total.written += pass.written;
+            total.through = pass.through;
+            total.caught_up = pass.caught_up;
+            if pass.caught_up {
+                break;
+            }
+        }
+        Ok(total)
+    }
+
+    /// Where a consumer stopped, or zero when it has never run.
+    pub async fn cursor(&self, consumer: &str) -> Result<u64, Error> {
+        if self.definition(CURSORS).await.is_err() {
+            return Ok(0);
+        }
+        let sql = format!(
+            "SELECT position FROM \"{CURSORS}\" WHERE consumer = '{}'",
+            consumer.replace('\'', "''")
+        );
+        let batches = self.query_batches(&sql, &[]).await?;
+        for batch in batches.iter() {
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            if let Some(column) = batch.column(0).as_any().downcast_ref::<UInt64Array>()
+                && !column.is_null(0)
+            {
+                return Ok(column.value(0));
+            }
+        }
+        Ok(0)
+    }
+    /// Record where a consumer reached. The newest row for a consumer wins,
+    /// so this supersedes rather than accumulates.
+    pub async fn set_cursor(&self, consumer: &str, position: u64) -> Result<(), Error> {
+        self.define_with(
+            StreamDefinition::from_arrow(CURSORS, &cursor_schema())?,
+            true,
+        )
+        .await?;
+        let schema = Arc::new(cursor_schema());
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(arrow_array::StringArray::from(vec![consumer.to_owned()])),
+                Arc::new(UInt64Array::from(vec![position])),
+                Arc::new(arrow_array::Int64Array::from(vec![now_micros() as i64])),
+            ],
+        )?;
+        self.append(CURSORS, vec![batch]).await?;
+        Ok(())
+    }
+}
+
+/// The largest arrival number in a set of batches.
+fn highest_in(batches: &[RecordBatch]) -> Result<Option<u64>, Error> {
+    let mut highest: Option<u64> = None;
+    for batch in batches {
+        let Ok(index) = batch.schema().index_of(HIDDEN_SEQ) else {
+            return Err("source rows carry no arrival order".into());
+        };
+        let column = batch
+            .column(index)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .ok_or("arrival order is not a number")?;
+        for row in 0..column.len() {
+            if !column.is_null(row) {
+                highest =
+                    Some(highest.map_or(column.value(row), |seen| seen.max(column.value(row))));
+            }
+        }
+    }
+    Ok(highest)
 }
