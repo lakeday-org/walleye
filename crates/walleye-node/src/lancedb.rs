@@ -45,7 +45,6 @@ pub fn routes() -> Router<Arc<Service>> {
         .route("/v1/view/{name}/drop/", post(drop_view))
         .route("/v1/view/{name}/refresh/", post(refresh_view))
         .route("/v1/assist/query/", post(assist_query))
-        .route("/v1/assist/answer/", post(assist_answer))
         .route(
             "/v1/worker/{name}/",
             get(worker_request)
@@ -700,87 +699,6 @@ async fn worker_request(
 #[serde(deny_unknown_fields)]
 struct Phrase {
     text: String,
-}
-
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Ask {
-    text: String,
-    /// Rows to return at most. A phrase that states no limit must still not
-    /// return a whole table down an HTTP response.
-    #[serde(default)]
-    limit: Option<usize>,
-}
-
-/// The largest answer this endpoint will return, and its default.
-const ROW_CAP: usize = 1000;
-const ROW_DEFAULT: usize = 200;
-
-/// Answer a phrase with rows.
-///
-/// Drafting the statement takes tens of seconds and reads only the catalog,
-/// which every member has, so it is spread across members by the phrase rather
-/// than sent to the table's owner. Running the statement does have a home, and
-/// goes to it. The statement comes back with the rows: it is how the answer is
-/// checked, corrected, or saved as a view.
-async fn assist_answer(
-    State(s): State<Arc<Service>>,
-    h: HeaderMap,
-    Json(body): Json<Ask>,
-) -> Reply {
-    let engine = engine(&s, &h)?;
-    let cap = body.limit.unwrap_or(ROW_DEFAULT).clamp(1, ROW_CAP);
-    let forwarded = h.contains_key(crate::cluster::FORWARDED_HEADER);
-    let phrase = body.text.clone();
-    let relay = move |target: walleye_ring::Node, cluster: crate::cluster::Cluster| async move {
-        let payload = serde_json::json!({"text": phrase, "limit": cap});
-        cluster
-            .forward(
-                &target,
-                axum::http::Method::POST,
-                "/v1/assist/answer/",
-                Some("application/json"),
-                bytes::Bytes::from(payload.to_string()),
-            )
-            .await
-    };
-
-    // A request that has already been forwarded once stays here, so a full
-    // cluster cannot bounce it around.
-    if let Some(cluster) = engine.cluster().cloned()
-        && !forwarded
-        && let Some(chosen) = cluster.drafter(&body.text)
-    {
-        return Ok(relay(chosen, cluster).await);
-    }
-
-    // Held until this handler returns, which is what bounds drafts in flight.
-    // (`drop` here is this module's table-drop handler, not `mem::drop`.)
-    let _permit = match crate::assist::draft_slot() {
-        Some(permit) => permit,
-        None => {
-            // Full here. Shed to a peer rather than queue behind ourselves
-            // while it idles; if there is nowhere to shed to, say so plainly
-            // with a retry rather than time out.
-            if let Some(cluster) = engine.cluster().cloned()
-                && !forwarded
-                && let Some(next) = cluster.next_drafter(&body.text, &cluster.node_id)
-            {
-                return Ok(relay(next, cluster).await);
-            }
-            return Err((
-                StatusCode::SERVICE_UNAVAILABLE,
-                [("retry-after", "2")],
-                "this node is drafting as many answers as it will at once; retry",
-            )
-                .into_response());
-        }
-    };
-    let answered = engine
-        .answer(&body.text, cap)
-        .await
-        .map_err(|e| error(e.as_ref()))?;
-    Ok(Json(serde_json::to_value(answered).map_err(|e| bad(e.to_string()))?).into_response())
 }
 
 /// Read a phrase as a query over this node's own catalog.

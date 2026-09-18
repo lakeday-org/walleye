@@ -1055,10 +1055,17 @@ async fn ingest(
     )
         .into_response())
 }
+/// A query is a statement or a question. Both return rows.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Query {
-    sql: String,
+    #[serde(default)]
+    sql: Option<String>,
+    /// A question in plain language. A model writes the statement, the planner
+    /// checks it, and it runs like any other. The statement it wrote comes
+    /// back with the rows.
+    #[serde(default)]
+    text: Option<String>,
 }
 async fn query(
     State(s): State<Arc<Service>>,
@@ -1067,15 +1074,23 @@ async fn query(
 ) -> Result<Response, ApiError> {
     let engine = api(&s, &h)?;
     let revision = s.revision.lock().await;
-    let bytes = engine.query(&input.sql).await.map_err(failure)?;
-    Ok((
-        [
-            ("content-type", "application/json"),
-            ("etag", revision.as_str()),
-        ],
-        bytes,
-    )
-        .into_response())
+    let headers = [
+        ("content-type", "application/json"),
+        ("etag", revision.as_str()),
+    ];
+    match (input.sql, input.text) {
+        (Some(sql), None) => {
+            let bytes = engine.query(&sql).await.map_err(failure)?;
+            Ok((headers, bytes).into_response())
+        }
+        (None, Some(text)) => {
+            let answered = engine.answer(&text).await.map_err(failure)?;
+            let body = serde_json::to_vec(&answered).map_err(failure)?;
+            Ok((headers, body).into_response())
+        }
+        (Some(_), Some(_)) => Err(failure("give a statement or a question, not both")),
+        (None, None) => Err(failure("give a statement in `sql` or a question in `text`")),
+    }
 }
 
 #[cfg(test)]

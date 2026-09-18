@@ -93,28 +93,6 @@ impl Cluster {
         (chosen.id != self.node_id).then(|| chosen.clone())
     }
 
-    /// The member after `from` on the ring for `phrase`, for shedding a draft
-    /// when the chosen member is already full. `None` when there is nowhere
-    /// else to send it.
-    pub fn next_drafter(&self, phrase: &str, from: &str) -> Option<Node> {
-        let ring = self.ring.snapshot();
-        let members = ring.members();
-        if members.len() < 2 {
-            return None;
-        }
-        let key = phrase.trim().to_lowercase();
-        let start = xxhash_rust::xxh3::xxh3_64(key.as_bytes()) as usize;
-        let mut ordered: Vec<&Node> = members.iter().collect();
-        ordered.sort_by(|a, b| a.id.cmp(&b.id));
-        for step in 1..=ordered.len() {
-            let candidate = ordered[(start + step) % ordered.len()];
-            if candidate.id != from && candidate.id != self.node_id {
-                return Some(candidate.clone());
-            }
-        }
-        None
-    }
-
     /// Run one statement on the member that owns the table it reads, and take
     /// its rows.
     ///
@@ -340,30 +318,51 @@ pub async fn route_to_owner(
             .ok()
             .and_then(|v| v.get("name").and_then(|n| n.as_str()).map(str::to_string)),
         ["v1", "query"] => {
-            let sql = serde_json::from_slice::<serde_json::Value>(&bytes)
-                .ok()
-                .and_then(|v| v.get("sql").and_then(|q| q.as_str()).map(str::to_string));
-            match sql.map(|q| walleye_lance::sql_table_names(&q)) {
-                Some(Ok(tables)) => {
-                    let mut owners: Vec<Option<Node>> =
-                        tables.iter().map(|t| cluster.owner(t)).collect();
-                    owners
-                        .sort_by(|a, b| a.as_ref().map(|n| &n.id).cmp(&b.as_ref().map(|n| &n.id)));
-                    owners.dedup_by(|a, b| a.as_ref().map(|n| &n.id) == b.as_ref().map(|n| &n.id));
-                    match owners.as_slice() {
-                        // Every referenced table is owned here, or the query
-                        // names none: run it locally.
-                        [] | [None] => None,
-                        [Some(owner)] => Some(format!("\u{0}{}", owner.id)),
-                        // Tables spread across members: this node runs the
-                        // query and gathers the rows it does not own.
-                        _ => None,
+            let body = serde_json::from_slice::<serde_json::Value>(&bytes).ok();
+            // A question has no statement yet, so there is no table to route
+            // by. Writing one reads only the catalog, which every member has,
+            // so it goes to the member the phrase hashes to: that spreads the
+            // work instead of piling every question about a popular table onto
+            // its owner, and puts the same phrase on the same member, where the
+            // decision service's answer cache may already hold it. The
+            // statement it writes is routed to the owner from there.
+            if let Some(text) = body
+                .as_ref()
+                .and_then(|v| v.get("text"))
+                .and_then(|t| t.as_str())
+            {
+                match cluster.drafter(text) {
+                    Some(drafter) => Some(format!("\u{0}{}", drafter.id)),
+                    None => None,
+                }
+            } else {
+                let sql =
+                    body.and_then(|v| v.get("sql").and_then(|q| q.as_str()).map(str::to_string));
+                match sql.map(|q| walleye_lance::sql_table_names(&q)) {
+                    Some(Ok(tables)) => {
+                        let mut owners: Vec<Option<Node>> =
+                            tables.iter().map(|t| cluster.owner(t)).collect();
+                        owners.sort_by(|a, b| {
+                            a.as_ref().map(|n| &n.id).cmp(&b.as_ref().map(|n| &n.id))
+                        });
+                        owners.dedup_by(|a, b| {
+                            a.as_ref().map(|n| &n.id) == b.as_ref().map(|n| &n.id)
+                        });
+                        match owners.as_slice() {
+                            // Every referenced table is owned here, or the query
+                            // names none: run it locally.
+                            [] | [None] => None,
+                            [Some(owner)] => Some(format!("\u{0}{}", owner.id)),
+                            // Tables spread across members: this node runs the
+                            // query and gathers the rows it does not own.
+                            _ => None,
+                        }
                     }
+                    Some(Err(error)) => {
+                        return (StatusCode::BAD_REQUEST, error.to_string()).into_response();
+                    }
+                    None => None,
                 }
-                Some(Err(error)) => {
-                    return (StatusCode::BAD_REQUEST, error.to_string()).into_response();
-                }
-                None => None,
             }
         }
         _ => None,
@@ -464,25 +463,11 @@ mod tests {
         }
     }
 
-    /// Shedding must move the work. A node that sheds to itself, or back to
-    /// the member that just shed to it, has built a loop rather than a
-    /// balancer.
+    /// One member drafts everything itself rather than naming itself as
+    /// somewhere else to send the work.
     #[test]
-    fn shedding_never_returns_to_this_node_or_the_sender() {
-        let c = cluster("b", &["a", "b", "c", "d"]);
-        for phrase in ["revenue by city", "late shipments", "how many orders"] {
-            let next = c.next_drafter(phrase, "a").expect("somewhere to shed to");
-            assert_ne!(next.id, "b", "shed to itself for {phrase}");
-            assert_ne!(next.id, "a", "shed back to the sender for {phrase}");
-        }
-    }
-
-    /// One member has nowhere to shed to, and must say so rather than name
-    /// itself.
-    #[test]
-    fn a_single_member_sheds_nowhere() {
+    fn a_single_member_drafts_locally() {
         let c = cluster("a", &["a"]);
-        assert!(c.next_drafter("revenue by city", "a").is_none());
-        assert!(c.drafter("revenue by city").is_none(), "it drafts locally");
+        assert!(c.drafter("revenue by city").is_none());
     }
 }

@@ -1159,11 +1159,10 @@ mod name_tests {
 #[derive(Debug, serde::Serialize)]
 pub struct Answered {
     pub sql: String,
-    /// The rows, as records. Capped; see `truncated`.
+    /// The rows, as records. Not capped: a question answers with as much as
+    /// the same statement would have answered with through `sql`.
     pub rows: serde_json::Value,
     pub row_count: usize,
-    /// True when the cap cut the answer short and there were more rows.
-    pub truncated: bool,
     /// What the model asked the decision service along the way, and how sure
     /// each answer was. Empty when it asked nothing.
     pub decisions: Vec<crate::model::Decision>,
@@ -1184,29 +1183,6 @@ pub struct Usage {
     pub output_tokens: u64,
     pub reasoning_tokens: u64,
     pub decisions: usize,
-}
-
-/// Drafts in flight on this node.
-///
-/// A draft holds a model connection for tens of seconds while using almost no
-/// local resource, so the limit is about not queueing behind ourselves when a
-/// peer is idle: past the limit the request is shed to another member rather
-/// than waited on.
-fn slots() -> &'static tokio::sync::Semaphore {
-    static SLOTS: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
-    SLOTS.get_or_init(|| {
-        let permits = std::env::var("WALLEYE_ASSIST_CONCURRENCY")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|n| *n > 0)
-            .unwrap_or(4);
-        tokio::sync::Semaphore::new(permits)
-    })
-}
-
-/// Whether this node can start another draft right now.
-pub fn draft_slot() -> Option<tokio::sync::SemaphorePermit<'static>> {
-    slots().try_acquire().ok()
 }
 
 impl Engine {
@@ -1241,7 +1217,7 @@ impl Engine {
     /// tool; the planner checks the statement before it runs; and the rows come
     /// from the member that owns the table rather than from dragging the table
     /// here.
-    pub async fn answer(&self, phrase: &str, cap: usize) -> Result<Answered, Error> {
+    pub async fn answer(&self, phrase: &str) -> Result<Answered, Error> {
         /// One draft, then two more chances with the planner's objection in
         /// hand. Past that the phrase is handed back rather than paid for.
         const ATTEMPTS: usize = 3;
@@ -1317,14 +1293,11 @@ impl Engine {
             None => self.query(&draft.sql).await?.into(),
         };
 
-        let mut rows: Vec<serde_json::Value> = serde_json::from_slice(&bytes)?;
-        let truncated = rows.len() > cap;
-        rows.truncate(cap);
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(&bytes)?;
         Ok(Answered {
             sql: draft.sql,
             row_count: rows.len(),
             rows: serde_json::Value::Array(rows),
-            truncated,
             usage: Usage {
                 rounds: draft.rounds,
                 input_tokens: draft.input_tokens,
