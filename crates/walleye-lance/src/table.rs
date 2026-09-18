@@ -93,6 +93,9 @@ pub struct TableConfig {
     pub shard_id: Uuid,
     pub stream: String,
     pub vector_indexes: Vec<VectorIndexSpec>,
+    /// How long the writer's active memtable may hold rows before it rotates,
+    /// regardless of size. Defaults to [`Table::MEMTABLE_AGE`].
+    pub memtable_max_age: Duration,
 }
 impl TableConfig {
     pub fn new(
@@ -148,6 +151,7 @@ impl TableConfig {
             shard_id,
             stream,
             vector_indexes: Vec::new(),
+            memtable_max_age: Table::MEMTABLE_AGE,
         })
     }
     /// Smallest possible encoded row: fixed-width columns at their width,
@@ -164,6 +168,11 @@ impl TableConfig {
             })
             .sum::<usize>()
             .max(1)
+    }
+    /// Override how long the active memtable may hold rows before it rotates.
+    pub fn with_memtable_max_age(mut self, age: Duration) -> Self {
+        self.memtable_max_age = age;
+        self
     }
     pub fn with_vector_indexes(mut self, specs: Vec<VectorIndexSpec>) -> lance::Result<Self> {
         for spec in &specs {
@@ -255,6 +264,11 @@ impl Table {
     pub const MEMTABLE_ROWS: usize = 100_000;
     /// Largest single put; see `open` for why it is half the row capacity.
     pub const PUT_ROWS: usize = 50_000;
+    /// How long the active memtable may hold rows before it rotates regardless
+    /// of size. A walleye stream writing well under [`Self::MEMTABLE_BYTES`]
+    /// would otherwise never rotate, so its WAL would grow without bound and a
+    /// successor's open would replay all of it.
+    pub const MEMTABLE_AGE: Duration = Duration::from_secs(60);
     pub async fn open(
         config: TableConfig,
         storage: LanceStorageOptions,
@@ -363,7 +377,8 @@ impl Table {
             .with_max_wal_flush_interval(Duration::from_millis(10))
             .with_max_memtable_size(Self::MEMTABLE_BYTES)
             .with_max_memtable_rows(Self::MEMTABLE_ROWS)
-            .with_max_unflushed_memtable_bytes(32 * 1024 * 1024);
+            .with_max_unflushed_memtable_bytes(32 * 1024 * 1024)
+            .with_max_memtable_age(Some(config.memtable_max_age));
         if let LanceDurability::Bitr(backend) = &durability {
             if backend.stream() != config.stream
                 || backend.shard_id() != config.shard_id
