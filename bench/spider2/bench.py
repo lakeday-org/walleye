@@ -187,17 +187,25 @@ def generate(system, model, effort, schema, question, knowledge, tables, key, je
                         {"role": "user", "content": prompt}], key)
         usage = payload.get("usage", {})
         stats.update(
+            prompt_tokens=usage.get("prompt_tokens", 0),
+            cached_tokens=usage.get("prompt_tokens_details", {}).get("cached_tokens", 0),
             completion_tokens=usage.get("completion_tokens", 0),
             reasoning_tokens=usage.get("completion_tokens_details", {}).get("reasoning_tokens", 0),
-            jev_asked=asked)
+            rounds=1, jev_asked=asked)
         return strip_fences(payload["choices"][0]["message"].get("content") or ""), stats
 
+    prompt_total, cached_total, rounds = 0, 0, 0
     inputs = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": prompt}]
     state = json.dumps({"user_question": question,
                         "database_tables": {t: c[:30] for t, c in tables.items()}})
     for _round in range(10):
         payload = respond(model, effort, inputs, key, [JEV_TOOL])
         usage = payload.get("usage", {})
+        # Every round resends the conversation, so input is charged again each
+        # time. Summing it is the whole point of counting it.
+        prompt_total += usage.get("input_tokens", 0)
+        cached_total += usage.get("input_tokens_details", {}).get("cached_tokens", 0)
+        rounds += 1
         total += usage.get("output_tokens", 0)
         reasoning += usage.get("output_tokens_details", {}).get("reasoning_tokens", 0)
         calls = [o for o in payload.get("output", []) if o.get("type") == "function_call"]
@@ -207,7 +215,9 @@ def generate(system, model, effort, schema, question, knowledge, tables, key, je
                 for part in item.get("content", []) or []:
                     if part.get("type") == "output_text":
                         text.append(part.get("text", ""))
-            stats.update(completion_tokens=total, reasoning_tokens=reasoning, jev_asked=asked)
+            stats.update(prompt_tokens=prompt_total, cached_tokens=cached_total,
+                         completion_tokens=total, reasoning_tokens=reasoning,
+                         rounds=rounds, jev_asked=asked)
             return strip_fences("\n".join(text)), stats
 
         # Reasoning items must be carried forward with the calls they explain.
@@ -235,7 +245,9 @@ def generate(system, model, effort, schema, question, knowledge, tables, key, je
             inputs.append({"type": "function_call_output",
                            "call_id": call.get("call_id"),
                            "output": json.dumps(reply)})
-    stats.update(completion_tokens=total, reasoning_tokens=reasoning, jev_asked=asked)
+    stats.update(prompt_tokens=prompt_total, cached_tokens=cached_total,
+                 completion_tokens=total, reasoning_tokens=reasoning,
+                 rounds=rounds, jev_asked=asked)
     return "", stats
 
 
