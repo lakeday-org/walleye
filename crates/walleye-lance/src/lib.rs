@@ -36,8 +36,8 @@ pub use lance::dataset::mem_wal::{CompactionResult, Compactor};
 pub use sql::{SnapshotSource, TableSnapshot, query, query_with_gathered, sql_table_names};
 pub use storage_options::LanceStorageOptions;
 pub use table::{
-    LsmStats, ScanResult, SearchRequest, SsTableStats, Table, TableConfig, VectorIndexSpec,
-    VectorQuery, next_writer_epoch, prepare_bitr_takeover,
+    LsmStats, ScanResult, SearchRequest, SsTableStats, Table, TableConfig, TextIndexSpec,
+    TextQuery, VectorIndexSpec, VectorQuery, next_writer_epoch, prepare_bitr_takeover,
 };
 pub type Error = WalBackendError;
 pub type Result<T> = std::result::Result<T, WalBackendError>;

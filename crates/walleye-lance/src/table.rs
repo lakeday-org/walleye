@@ -14,7 +14,7 @@ use lance::{
     Dataset,
     dataset::mem_wal::{
         CompactionResult, Compactor, DatasetMemWalExt, ShardWriter, ShardWriterConfig,
-        index::MemIndexConfig,
+        index::{FtsIndexConfig, MemIndexConfig},
         scanner::{
             DatasetCache, FreshTierWatermark, InMemoryMemTables, LsmScanner, ShardSnapshot,
             SsTableCache,
@@ -22,6 +22,7 @@ use lance::{
     },
     index::DatasetIndexExt,
 };
+use lance_index::scalar::FullTextSearchQuery;
 use lance_linalg::distance::DistanceType;
 
 /// A vector index maintained by the table: an in-memory HNSW graph over the
@@ -34,6 +35,15 @@ pub struct VectorIndexSpec {
     pub column: String,
     /// `l2`, `cosine`, or `dot`.
     pub metric: String,
+}
+/// A full-text index maintained by the table: an inverted index over the
+/// memtable, flushed with every generation and rebuilt by compaction, exactly
+/// as the vector index is. Term matching, not substring matching: searching
+/// for "ship" finds the word "ship" and not the word "shipment".
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct TextIndexSpec {
+    pub name: String,
+    pub column: String,
 }
 /// Per-generation view of the LSM for diagnostics and tests.
 #[derive(Clone, Debug, serde::Serialize)]
@@ -57,6 +67,14 @@ pub struct SearchRequest {
     pub limit: Option<usize>,
     pub offset: Option<usize>,
     pub vector: Option<VectorQuery>,
+    pub text: Option<TextQuery>,
+}
+/// A full-text query: terms matched against an inverted index, not a
+/// substring scan. `columns` empty means every indexed text column.
+#[derive(Clone, Debug)]
+pub struct TextQuery {
+    pub query: String,
+    pub columns: Vec<String>,
 }
 #[derive(Clone, Debug)]
 pub struct VectorQuery {
@@ -93,6 +111,7 @@ pub struct TableConfig {
     pub shard_id: Uuid,
     pub stream: String,
     pub vector_indexes: Vec<VectorIndexSpec>,
+    pub text_indexes: Vec<TextIndexSpec>,
 }
 impl TableConfig {
     pub fn new(
@@ -148,6 +167,7 @@ impl TableConfig {
             shard_id,
             stream,
             vector_indexes: Vec::new(),
+            text_indexes: Vec::new(),
         })
     }
     /// Smallest possible encoded row: fixed-width columns at their width,
@@ -184,6 +204,27 @@ impl TableConfig {
             parse_metric(Some(&spec.metric))?;
         }
         self.vector_indexes = specs;
+        Ok(self)
+    }
+    pub fn with_text_indexes(mut self, specs: Vec<TextIndexSpec>) -> lance::Result<Self> {
+        for spec in &specs {
+            let field = self
+                .schema
+                .field_with_name(&spec.column)
+                .map_err(|e| lance::Error::invalid_input(e.to_string()))?;
+            if !matches!(
+                field.data_type(),
+                arrow_schema::DataType::Utf8 | arrow_schema::DataType::LargeUtf8
+            ) {
+                return Err(lance::Error::invalid_input(format!(
+                    "text index {} needs a text column, {} is {}",
+                    spec.name,
+                    spec.column,
+                    field.data_type()
+                )));
+            }
+        }
+        self.text_indexes = specs;
         Ok(self)
     }
 }
@@ -389,6 +430,18 @@ impl Table {
                 field_id,
                 spec.column.clone(),
                 parse_metric(Some(&spec.metric))?,
+            ));
+        }
+        for spec in &config.text_indexes {
+            let field_id = dataset
+                .schema()
+                .field(&spec.column)
+                .map(|f| f.id)
+                .ok_or_else(|| {
+                    lance::Error::invalid_input(format!("text column {} missing", spec.column))
+                })?;
+            writer_config = writer_config.with_index_config(MemIndexConfig::Fts(
+                FtsIndexConfig::new(spec.name.clone(), field_id, spec.column.clone()),
             ));
         }
         let writer_started = open_stage_start(&config, "mem_wal_writer");
@@ -766,6 +819,13 @@ impl crate::sql::SnapshotPlanSource for CapturedSnapshot {
                 request.limit.map(|l| l as i64),
                 request.offset.map(|o| o as i64),
             )?;
+        }
+        if let Some(text) = &request.text {
+            let mut query = FullTextSearchQuery::new(text.query.clone());
+            if !text.columns.is_empty() {
+                query = query.with_columns(&text.columns)?;
+            }
+            scanner = scanner.full_text_search(query)?;
         }
         if let Some(query) = &request.vector {
             let key = arrow_array::Float32Array::from(query.vector.clone());
