@@ -646,7 +646,7 @@ impl Engine {
         }
         self.register(definition).await
     }
-    async fn load_catalog(&self) -> Result<(), Error> {
+    pub(crate) async fn load_catalog(&self) -> Result<(), Error> {
         let mut loaded = self.catalog_loaded.lock().await;
         if *loaded {
             return Ok(());
@@ -656,7 +656,7 @@ impl Engine {
         Ok(())
     }
 
-    async fn refresh_catalog(&self) -> Result<(), Error> {
+    pub(crate) async fn refresh_catalog(&self) -> Result<(), Error> {
         let mut loaded = self.catalog_loaded.lock().await;
         self.load_catalog_objects().await?;
         *loaded = true;
@@ -1146,6 +1146,24 @@ impl Engine {
             .filter(|name| !name.starts_with('_'))
             .cloned()
             .collect())
+    }
+    /// Every table's client-visible schema, taken from the catalog.
+    ///
+    /// [`Self::describe`] goes through [`Self::stream`], which refuses a table
+    /// this node does not own. That is right for reading rows and wrong for
+    /// describing a schema: the catalog is shared, every member has it, and a
+    /// node that cannot say what columns a table has cannot answer a question
+    /// about it. In a cluster that turned into silently describing only the
+    /// tables this node happened to own.
+    pub async fn schemas(&self) -> Result<Vec<(String, Schema)>, Error> {
+        let mut out = Vec::new();
+        for name in self.table_names().await? {
+            if let Ok(stream) = self.definition(&name).await {
+                let schema = stream.definition.user_schema(&stream.config.schema);
+                out.push((name, schema));
+            }
+        }
+        Ok(out)
     }
     /// Current version and client-visible schema.
     pub async fn describe(&self, name: &str) -> Result<(u64, Schema), Error> {

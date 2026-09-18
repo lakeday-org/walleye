@@ -78,6 +78,76 @@ impl Cluster {
         let owner = ring.owner(stream.as_bytes());
         (owner.id != self.node_id).then(|| owner.clone())
     }
+    /// The member that should draft an answer for `phrase`, or `None` when
+    /// this node should.
+    ///
+    /// Drafting is slow and has no locality: it reads the catalog, which every
+    /// member has, and then waits on a model. Sending it to the table's owner
+    /// would pile every phrase about a popular table onto one node while its
+    /// peers idle. Hashing the phrase instead spreads the work evenly and puts
+    /// the same phrase on the same member, where the decision service's answer
+    /// cache can already have it.
+    pub fn drafter(&self, phrase: &str) -> Option<Node> {
+        let ring = self.ring.snapshot();
+        let chosen = ring.owner(phrase.trim().to_lowercase().as_bytes());
+        (chosen.id != self.node_id).then(|| chosen.clone())
+    }
+
+    /// The member after `from` on the ring for `phrase`, for shedding a draft
+    /// when the chosen member is already full. `None` when there is nowhere
+    /// else to send it.
+    pub fn next_drafter(&self, phrase: &str, from: &str) -> Option<Node> {
+        let ring = self.ring.snapshot();
+        let members = ring.members();
+        if members.len() < 2 {
+            return None;
+        }
+        let key = phrase.trim().to_lowercase();
+        let start = xxhash_rust::xxh3::xxh3_64(key.as_bytes()) as usize;
+        let mut ordered: Vec<&Node> = members.iter().collect();
+        ordered.sort_by(|a, b| a.id.cmp(&b.id));
+        for step in 1..=ordered.len() {
+            let candidate = ordered[(start + step) % ordered.len()];
+            if candidate.id != from && candidate.id != self.node_id {
+                return Some(candidate.clone());
+            }
+        }
+        None
+    }
+
+    /// Run one statement on the member that owns the table it reads, and take
+    /// its rows.
+    ///
+    /// The alternative is [`Self::fetch_snapshot`], which drags every row of
+    /// the table across the network so this node can filter it. For a
+    /// statement that names a single table, asking its owner to run the
+    /// statement moves the answer rather than the table.
+    pub async fn run_sql(&self, owner: &Node, sql: &str) -> Result<bytes::Bytes, String> {
+        let url = format!("{}/v1/query", owner.endpoint.trim_end_matches('/'));
+        let response = self
+            .client
+            .post(url)
+            .bearer_auth(&self.token)
+            .header(MEMBERS_HEADER, self.fingerprint())
+            .header(FORWARDED_HEADER, "1")
+            .json(&serde_json::json!({"sql": sql}))
+            .send()
+            .await
+            .map_err(|error| format!("owner {} is unreachable: {error}", owner.id))?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(format!(
+                "owner {} refused the query with {status}: {body}",
+                owner.id
+            ));
+        }
+        response
+            .bytes()
+            .await
+            .map_err(|error| format!("owner {} truncated the answer: {error}", owner.id))
+    }
+
     /// A stable digest of the member ids this node currently sees.
     pub fn fingerprint(&self) -> String {
         let ring = self.ring.snapshot();
@@ -336,4 +406,83 @@ pub async fn route_to_owner(
         response.headers_mut().insert(OWNER_HEADER, value);
     }
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use walleye_ring::Node;
+
+    fn cluster(me: &str, ids: &[&str]) -> Cluster {
+        let members = ids
+            .iter()
+            .map(|id| Node::new(*id, format!("http://{id}.test"), 1.0).unwrap())
+            .collect();
+        Cluster::new(
+            me.to_owned(),
+            Arc::new(Membership::new(members).unwrap()),
+            "t".into(),
+        )
+        .unwrap()
+    }
+
+    /// Drafting is spread by the phrase, not by the table, because a draft
+    /// reads only the catalog and every member has it. Sending every phrase
+    /// about a popular table to that table's owner would idle the rest.
+    #[test]
+    fn phrases_spread_across_members() {
+        let c = cluster("a", &["a", "b", "c"]);
+        let phrases = [
+            "how many orders",
+            "revenue by city",
+            "late shipments",
+            "who are our best customers",
+            "orders in seattle",
+            "average order value",
+            "carriers by lateness",
+            "pending orders",
+        ];
+        let chosen: std::collections::BTreeSet<String> = phrases
+            .iter()
+            .map(|p| c.drafter(p).map(|n| n.id).unwrap_or_else(|| "a".into()))
+            .collect();
+        assert!(
+            chosen.len() >= 2,
+            "eight phrases should not all land on one member: {chosen:?}"
+        );
+    }
+
+    /// The same phrase goes to the same member, so the decision service's
+    /// answer cache can already hold it. Spacing and case are not a different
+    /// question.
+    #[test]
+    fn the_same_phrase_goes_to_the_same_member() {
+        let c = cluster("a", &["a", "b", "c"]);
+        let once = c.drafter("Revenue By City").map(|n| n.id);
+        for spelling in ["revenue by city", "  revenue by city  ", "REVENUE BY CITY"] {
+            assert_eq!(c.drafter(spelling).map(|n| n.id), once, "{spelling}");
+        }
+    }
+
+    /// Shedding must move the work. A node that sheds to itself, or back to
+    /// the member that just shed to it, has built a loop rather than a
+    /// balancer.
+    #[test]
+    fn shedding_never_returns_to_this_node_or_the_sender() {
+        let c = cluster("b", &["a", "b", "c", "d"]);
+        for phrase in ["revenue by city", "late shipments", "how many orders"] {
+            let next = c.next_drafter(phrase, "a").expect("somewhere to shed to");
+            assert_ne!(next.id, "b", "shed to itself for {phrase}");
+            assert_ne!(next.id, "a", "shed back to the sender for {phrase}");
+        }
+    }
+
+    /// One member has nowhere to shed to, and must say so rather than name
+    /// itself.
+    #[test]
+    fn a_single_member_sheds_nowhere() {
+        let c = cluster("a", &["a"]);
+        assert!(c.next_drafter("revenue by city", "a").is_none());
+        assert!(c.drafter("revenue by city").is_none(), "it drafts locally");
+    }
 }
