@@ -1,0 +1,48 @@
+# Rules perch checks on a scan. Each one is a question put to a model about a method, so these are the things the
+# compiler cannot prove: whether a client is answered before its write is safe, whether a count of acknowledgements
+# means what its name says. A write path is the one place here where being nearly right is worth nothing, so the
+# invariants holding it up are written down rather than left in comments for the next reader to rediscover.
+
+- name: ack-only-when-durable
+  where: callers of append
+  each: method
+  min: 80
+  ensure: >
+    This method does not tell the client its write succeeded until that write is
+    durable. Answering while the rows are still only in memory breaks it, and so
+    does answering on the strength of a reply a replica sent before its own
+    write reached disk.
+
+- name: durability-is-not-deferred
+  where: callers of append
+  each: method
+  min: 75
+  ensure: >
+    This method does not hand the saving of a write to a background task and
+    then let the client be told it is done. Anything that runs after the client
+    has its answer must not be work that answer depended on.
+
+- name: no-shortcut-writes
+  where: "crates/**/*.rs"
+  ensure_absent: >
+    A call to a write that returns before the data reaches disk, such as the
+    no-wait variants of put and delete. The engine has never called one and must
+    not start.
+
+- name: quorum-counts-only-synced-replicas
+  where: mentions ACK_QUORUM
+  each: method
+  min: 80
+  ensure: >
+    A replica counts towards the write quorum only if it wrote the record to its
+    own disk before replying. A reply that came back before that sync finished
+    must not be counted.
+
+- name: quorum-is-two-of-three
+  where: mentions ACK_QUORUM
+  each: method
+  min: 80
+  ensure: >
+    Anything taking a write quorum requires exactly two and refuses any other
+    value rather than accepting it. Two of the three copies is the guarantee
+    this engine sells, so it is not a tunable.
