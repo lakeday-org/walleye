@@ -6736,6 +6736,7 @@ dependencies = [
  "walleye-cache",
  "walleye-lance",
  "walleye-ring",
+ "walleye-typesafe",
  "walleye-v8",
  "xxhash-rust",
 ]
