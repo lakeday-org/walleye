@@ -774,12 +774,7 @@ impl Engine {
             return Err("reading a phrase needs a decision service: set TYPESAFE_API_KEY".into());
         };
 
-        let mut tables = Vec::new();
-        for name in self.table_names().await? {
-            if let Ok((_, schema)) = self.describe(&name).await {
-                tables.push((name, schema));
-            }
-        }
+        let tables = self.schemas().await?;
         if tables.is_empty() {
             return Err("this node has no tables to ask about".into());
         }
@@ -1152,5 +1147,170 @@ mod name_tests {
         assert_eq!(got, ["countries", "republic"]);
         // A verb is never a value, so it never becomes a question either.
         assert!(literals("which templates do we have", &known).is_empty());
+    }
+}
+
+/// A phrase, the statement it was read as, and the rows that statement
+/// returned.
+///
+/// The statement is part of the answer rather than the whole of it. A caller
+/// asking a database a question wants the rows; the SQL is there so the answer
+/// can be checked, corrected, saved as a view, or run again unchanged.
+#[derive(Debug, serde::Serialize)]
+pub struct Answered {
+    pub sql: String,
+    /// The rows, as records. Not capped: a question answers with as much as
+    /// the same statement would have answered with through `sql`.
+    pub rows: serde_json::Value,
+    pub row_count: usize,
+    /// What the model asked the decision service along the way, and how sure
+    /// each answer was. Empty when it asked nothing.
+    pub decisions: Vec<crate::model::Decision>,
+    /// Statements the planner refused before this one was accepted.
+    pub corrected: Vec<Refusal>,
+    /// Which member drafted, and which ran it.
+    pub drafted_by: String,
+    pub ran_on: String,
+    pub milliseconds: u64,
+    pub usage: Usage,
+}
+
+#[derive(Debug, Default, serde::Serialize)]
+pub struct Usage {
+    pub rounds: u32,
+    pub input_tokens: u64,
+    pub cached_tokens: u64,
+    pub output_tokens: u64,
+    pub reasoning_tokens: u64,
+    pub decisions: usize,
+}
+
+impl Engine {
+    /// Every table this node knows, as DDL the model can read.
+    async fn schema_text(&self) -> Result<String, Error> {
+        let mut out = String::new();
+        for (name, schema) in self.schemas().await? {
+            let columns: Vec<String> = schema
+                .fields()
+                .iter()
+                .filter(|f| !crate::engine::hidden(f.name()))
+                .map(|f| format!("  {} {}", quote(f.name()), describe_type(f.data_type())))
+                .collect();
+            if columns.is_empty() {
+                continue;
+            }
+            out.push_str(&format!(
+                "CREATE TABLE {} (\n{}\n);\n",
+                quote(&name),
+                columns.join(",\n")
+            ));
+        }
+        if out.is_empty() {
+            return Err("this node has no tables to ask about".into());
+        }
+        Ok(out)
+    }
+
+    /// Read a phrase, then answer it.
+    ///
+    /// The model writes the statement with the decision service beside it as a
+    /// tool; the planner checks the statement before it runs; and the rows come
+    /// from the member that owns the table rather than from dragging the table
+    /// here.
+    pub async fn answer(&self, phrase: &str) -> Result<Answered, Error> {
+        /// One draft, then two more chances with the planner's objection in
+        /// hand. Past that the phrase is handed back rather than paid for.
+        const ATTEMPTS: usize = 3;
+
+        let started = std::time::Instant::now();
+        let phrase = phrase.trim();
+        if phrase.is_empty() {
+            return Err("say what you are looking for".into());
+        }
+        if phrase.len() > 2048 {
+            return Err("that is longer than a question".into());
+        }
+        let Some(model) = crate::model::Model::from_env() else {
+            return Err("answering a phrase needs a model: set WALLEYE_MODEL_KEY".into());
+        };
+        let jev = Client::from_env();
+        let schema = self.schema_text().await?;
+        let me = self
+            .cluster()
+            .map(|c| c.node_id.clone())
+            .unwrap_or_else(|| "local".to_owned());
+
+        let mut refused: Vec<Refusal> = Vec::new();
+        let mut draft = None;
+        for _attempt in 0..ATTEMPTS {
+            let pairs: Vec<(String, String)> = refused
+                .iter()
+                .map(|r| (r.sql.clone(), r.reason.clone()))
+                .collect();
+            let state = format!(
+                "A question asked of a SQL database.\n\nSchema:\n{schema}\nQuestion: {phrase}"
+            );
+            let attempt = model
+                .draft(&schema, phrase, &pairs, jev.as_ref(), &state)
+                .await?;
+            match self.rehearse(&attempt.sql).await {
+                Ok(()) => {
+                    draft = Some(attempt);
+                    break;
+                }
+                Err(reason) => refused.push(Refusal {
+                    sql: attempt.sql,
+                    reason,
+                }),
+            }
+        }
+        let Some(draft) = draft else {
+            let last = refused.last().expect("a failed attempt recorded a refusal");
+            return Err(format!(
+                "read that as `{}`, which this node will not plan: {}",
+                last.sql, last.reason
+            )
+            .into());
+        };
+
+        // A statement over a single table runs where that table lives. One
+        // spanning several runs here, gathering what it does not own.
+        let mut ran_on = me.clone();
+        let bytes = match self.cluster() {
+            Some(cluster) => {
+                let named = walleye_lance::sql_table_names(&draft.sql).unwrap_or_default();
+                match named.first().filter(|_| named.len() == 1) {
+                    Some(table) => match cluster.owner(table) {
+                        Some(owner) => {
+                            ran_on = owner.id.clone();
+                            cluster.run_sql(&owner, &draft.sql).await?
+                        }
+                        None => self.query(&draft.sql).await?.into(),
+                    },
+                    None => self.query(&draft.sql).await?.into(),
+                }
+            }
+            None => self.query(&draft.sql).await?.into(),
+        };
+
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(&bytes)?;
+        Ok(Answered {
+            sql: draft.sql,
+            row_count: rows.len(),
+            rows: serde_json::Value::Array(rows),
+            usage: Usage {
+                rounds: draft.rounds,
+                input_tokens: draft.input_tokens,
+                cached_tokens: draft.cached_tokens,
+                output_tokens: draft.output_tokens,
+                reasoning_tokens: draft.reasoning_tokens,
+                decisions: draft.decisions.len(),
+            },
+            decisions: draft.decisions,
+            corrected: refused,
+            drafted_by: me,
+            ran_on,
+            milliseconds: started.elapsed().as_millis() as u64,
+        })
     }
 }

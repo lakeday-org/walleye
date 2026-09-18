@@ -78,6 +78,54 @@ impl Cluster {
         let owner = ring.owner(stream.as_bytes());
         (owner.id != self.node_id).then(|| owner.clone())
     }
+    /// The member that should draft an answer for `phrase`, or `None` when
+    /// this node should.
+    ///
+    /// Drafting is slow and has no locality: it reads the catalog, which every
+    /// member has, and then waits on a model. Sending it to the table's owner
+    /// would pile every phrase about a popular table onto one node while its
+    /// peers idle. Hashing the phrase instead spreads the work evenly and puts
+    /// the same phrase on the same member, where the decision service's answer
+    /// cache can already have it.
+    pub fn drafter(&self, phrase: &str) -> Option<Node> {
+        let ring = self.ring.snapshot();
+        let chosen = ring.owner(phrase.trim().to_lowercase().as_bytes());
+        (chosen.id != self.node_id).then(|| chosen.clone())
+    }
+
+    /// Run one statement on the member that owns the table it reads, and take
+    /// its rows.
+    ///
+    /// The alternative is [`Self::fetch_snapshot`], which drags every row of
+    /// the table across the network so this node can filter it. For a
+    /// statement that names a single table, asking its owner to run the
+    /// statement moves the answer rather than the table.
+    pub async fn run_sql(&self, owner: &Node, sql: &str) -> Result<bytes::Bytes, String> {
+        let url = format!("{}/v1/query", owner.endpoint.trim_end_matches('/'));
+        let response = self
+            .client
+            .post(url)
+            .bearer_auth(&self.token)
+            .header(MEMBERS_HEADER, self.fingerprint())
+            .header(FORWARDED_HEADER, "1")
+            .json(&serde_json::json!({"sql": sql}))
+            .send()
+            .await
+            .map_err(|error| format!("owner {} is unreachable: {error}", owner.id))?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(format!(
+                "owner {} refused the query with {status}: {body}",
+                owner.id
+            ));
+        }
+        response
+            .bytes()
+            .await
+            .map_err(|error| format!("owner {} truncated the answer: {error}", owner.id))
+    }
+
     /// A stable digest of the member ids this node currently sees.
     pub fn fingerprint(&self) -> String {
         let ring = self.ring.snapshot();
@@ -270,30 +318,51 @@ pub async fn route_to_owner(
             .ok()
             .and_then(|v| v.get("name").and_then(|n| n.as_str()).map(str::to_string)),
         ["v1", "query"] => {
-            let sql = serde_json::from_slice::<serde_json::Value>(&bytes)
-                .ok()
-                .and_then(|v| v.get("sql").and_then(|q| q.as_str()).map(str::to_string));
-            match sql.map(|q| walleye_lance::sql_table_names(&q)) {
-                Some(Ok(tables)) => {
-                    let mut owners: Vec<Option<Node>> =
-                        tables.iter().map(|t| cluster.owner(t)).collect();
-                    owners
-                        .sort_by(|a, b| a.as_ref().map(|n| &n.id).cmp(&b.as_ref().map(|n| &n.id)));
-                    owners.dedup_by(|a, b| a.as_ref().map(|n| &n.id) == b.as_ref().map(|n| &n.id));
-                    match owners.as_slice() {
-                        // Every referenced table is owned here, or the query
-                        // names none: run it locally.
-                        [] | [None] => None,
-                        [Some(owner)] => Some(format!("\u{0}{}", owner.id)),
-                        // Tables spread across members: this node runs the
-                        // query and gathers the rows it does not own.
-                        _ => None,
+            let body = serde_json::from_slice::<serde_json::Value>(&bytes).ok();
+            // A question has no statement yet, so there is no table to route
+            // by. Writing one reads only the catalog, which every member has,
+            // so it goes to the member the phrase hashes to: that spreads the
+            // work instead of piling every question about a popular table onto
+            // its owner, and puts the same phrase on the same member, where the
+            // decision service's answer cache may already hold it. The
+            // statement it writes is routed to the owner from there.
+            if let Some(text) = body
+                .as_ref()
+                .and_then(|v| v.get("text"))
+                .and_then(|t| t.as_str())
+            {
+                match cluster.drafter(text) {
+                    Some(drafter) => Some(format!("\u{0}{}", drafter.id)),
+                    None => None,
+                }
+            } else {
+                let sql =
+                    body.and_then(|v| v.get("sql").and_then(|q| q.as_str()).map(str::to_string));
+                match sql.map(|q| walleye_lance::sql_table_names(&q)) {
+                    Some(Ok(tables)) => {
+                        let mut owners: Vec<Option<Node>> =
+                            tables.iter().map(|t| cluster.owner(t)).collect();
+                        owners.sort_by(|a, b| {
+                            a.as_ref().map(|n| &n.id).cmp(&b.as_ref().map(|n| &n.id))
+                        });
+                        owners.dedup_by(|a, b| {
+                            a.as_ref().map(|n| &n.id) == b.as_ref().map(|n| &n.id)
+                        });
+                        match owners.as_slice() {
+                            // Every referenced table is owned here, or the query
+                            // names none: run it locally.
+                            [] | [None] => None,
+                            [Some(owner)] => Some(format!("\u{0}{}", owner.id)),
+                            // Tables spread across members: this node runs the
+                            // query and gathers the rows it does not own.
+                            _ => None,
+                        }
                     }
+                    Some(Err(error)) => {
+                        return (StatusCode::BAD_REQUEST, error.to_string()).into_response();
+                    }
+                    None => None,
                 }
-                Some(Err(error)) => {
-                    return (StatusCode::BAD_REQUEST, error.to_string()).into_response();
-                }
-                None => None,
             }
         }
         _ => None,
@@ -336,4 +405,69 @@ pub async fn route_to_owner(
         response.headers_mut().insert(OWNER_HEADER, value);
     }
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use walleye_ring::Node;
+
+    fn cluster(me: &str, ids: &[&str]) -> Cluster {
+        let members = ids
+            .iter()
+            .map(|id| Node::new(*id, format!("http://{id}.test"), 1.0).unwrap())
+            .collect();
+        Cluster::new(
+            me.to_owned(),
+            Arc::new(Membership::new(members).unwrap()),
+            "t".into(),
+        )
+        .unwrap()
+    }
+
+    /// Drafting is spread by the phrase, not by the table, because a draft
+    /// reads only the catalog and every member has it. Sending every phrase
+    /// about a popular table to that table's owner would idle the rest.
+    #[test]
+    fn phrases_spread_across_members() {
+        let c = cluster("a", &["a", "b", "c"]);
+        let phrases = [
+            "how many orders",
+            "revenue by city",
+            "late shipments",
+            "who are our best customers",
+            "orders in seattle",
+            "average order value",
+            "carriers by lateness",
+            "pending orders",
+        ];
+        let chosen: std::collections::BTreeSet<String> = phrases
+            .iter()
+            .map(|p| c.drafter(p).map(|n| n.id).unwrap_or_else(|| "a".into()))
+            .collect();
+        assert!(
+            chosen.len() >= 2,
+            "eight phrases should not all land on one member: {chosen:?}"
+        );
+    }
+
+    /// The same phrase goes to the same member, so the decision service's
+    /// answer cache can already hold it. Spacing and case are not a different
+    /// question.
+    #[test]
+    fn the_same_phrase_goes_to_the_same_member() {
+        let c = cluster("a", &["a", "b", "c"]);
+        let once = c.drafter("Revenue By City").map(|n| n.id);
+        for spelling in ["revenue by city", "  revenue by city  ", "REVENUE BY CITY"] {
+            assert_eq!(c.drafter(spelling).map(|n| n.id), once, "{spelling}");
+        }
+    }
+
+    /// One member drafts everything itself rather than naming itself as
+    /// somewhere else to send the work.
+    #[test]
+    fn a_single_member_drafts_locally() {
+        let c = cluster("a", &["a"]);
+        assert!(c.drafter("revenue by city").is_none());
+    }
 }
