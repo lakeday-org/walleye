@@ -6,6 +6,7 @@ mod engine;
 mod lancedb;
 mod processor;
 pub mod reach;
+pub mod values;
 pub use processor::ProcessorConfig;
 pub mod kubernetes;
 use axum::{
