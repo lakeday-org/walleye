@@ -514,3 +514,90 @@ async fn a_large_insert_into_a_narrow_vector_table_rolls_memtables() {
     assert_eq!(ids(&rows(&bytes)), [149_999]);
     service.close().await;
 }
+
+/// A text column can be indexed and searched by term, and the index it built
+/// shows up in the listing.
+///
+/// Both halves used to answer "not supported yet", and the listing only ever
+/// read vector indexes, so a text index that did exist looked like one that
+/// did not.
+#[tokio::test]
+async fn a_text_column_is_indexed_searched_and_listed() {
+    let dir = tempfile::tempdir().unwrap();
+    let service = Service::open(config(dir.path())).await.unwrap();
+    let app = router(service.clone());
+
+    let text = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, true),
+        Field::new("body", DataType::Utf8, true),
+    ]));
+    let lines = [
+        (1_i64, "the package arrived late and the box was crushed"),
+        (2, "fast shipping, very happy with the product"),
+        (3, "refund requested, the item never shipped"),
+    ];
+    let batch = RecordBatch::try_new(
+        text.clone(),
+        vec![
+            Arc::new(Int64Array::from_iter_values(lines.iter().map(|r| r.0))) as ArrayRef,
+            Arc::new(StringArray::from_iter_values(lines.iter().map(|r| r.1))),
+        ],
+    )
+    .unwrap();
+    let mut body = Vec::new();
+    let mut writer = arrow_ipc::writer::StreamWriter::try_new(&mut body, &text).unwrap();
+    writer.write(&batch).unwrap();
+    writer.finish().unwrap();
+
+    let (status, _) = send(
+        &app,
+        "POST",
+        "/v1/table/reviews/create/?mode=create",
+        "application/vnd.apache.arrow.stream",
+        body,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, answer) = post_json(
+        &app,
+        "/v1/table/reviews/create_index/",
+        json!({"column": "body", "index_type": "FTS"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+
+    let (status, listed) = post_json(&app, "/v1/table/reviews/index/list/", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    let entries = listed["indexes"].as_array().expect("an indexes array");
+    assert_eq!(entries.len(), 1, "the text index is listed: {listed}");
+    assert_eq!(entries[0]["index_type"], "FTS", "{listed}");
+    assert_eq!(entries[0]["columns"][0], "body", "{listed}");
+
+    // Term matching, not substring matching: "ship" is a word of row 3 only
+    // through "shipped", and "crushed" belongs to row 1 alone.
+    for (query, expected) in [
+        ("refund", vec![3_i64]),
+        ("crushed", vec![1]),
+        ("zzz", vec![]),
+    ] {
+        let (status, bytes) = send(
+            &app,
+            "POST",
+            "/v1/table/reviews/query/",
+            "application/json",
+            json!({
+                "full_text_query": {"query": query, "columns": ["body"]},
+                "k": 10, "vector": [], "prefilter": true, "version": null
+            })
+            .to_string()
+            .into_bytes(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "searching {query}");
+        let mut got = ids(&rows(&bytes));
+        got.sort();
+        assert_eq!(got, expected, "searching {query}");
+    }
+    service.close().await;
+}

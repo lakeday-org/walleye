@@ -301,9 +301,6 @@ async fn query(
     Json(body): Json<serde_json::Value>,
 ) -> Reply {
     let engine = engine(&s, &h)?;
-    if body.get("full_text_query").is_some_and(|v| !v.is_null()) {
-        return Err(bad("full-text search is not supported yet"));
-    }
     if body.get("order_by").is_some_and(|v| !v.is_null()) {
         return Err(bad("order_by is not supported; use SQL via /v1/query"));
     }
@@ -319,6 +316,35 @@ async fn query(
             .map(|o| o as usize),
         ..Default::default()
     };
+    // The SDK sends either a bare string or {query, columns}. Both mean the
+    // same search against the inverted index.
+    match body.get("full_text_query") {
+        None | Some(serde_json::Value::Null) => {}
+        Some(serde_json::Value::String(query)) => {
+            request.text = Some(walleye_lance::TextQuery {
+                query: query.clone(),
+                columns: Vec::new(),
+            });
+        }
+        Some(serde_json::Value::Object(map)) => {
+            let query = map
+                .get("query")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| bad("full_text_query needs a query string"))?
+                .to_string();
+            let columns = match map.get("columns") {
+                None | Some(serde_json::Value::Null) => Vec::new(),
+                Some(serde_json::Value::Array(items)) => items
+                    .iter()
+                    .map(|v| v.as_str().map(str::to_string))
+                    .collect::<Option<Vec<_>>>()
+                    .ok_or_else(|| bad("full_text_query columns must be strings"))?,
+                Some(_) => return Err(bad("full_text_query columns must be an array")),
+            };
+            request.text = Some(walleye_lance::TextQuery { query, columns });
+        }
+        Some(_) => return Err(bad("full_text_query must be a string or an object")),
+    }
     match body.get("columns") {
         None | Some(serde_json::Value::Null) => {}
         Some(serde_json::Value::Array(items)) => {
@@ -459,7 +485,8 @@ struct CreateIndex {
     name: Option<String>,
 }
 /// Every vector index type maps to the one layout Walleye maintains: an HNSW
-/// graph on the memtable, IVF_HNSW_SQ on each generation.
+/// graph on the memtable, IVF_HNSW_SQ on each generation. `FTS` builds an
+/// inverted index on the same terms: memtable first, then every generation.
 async fn create_index(
     State(s): State<Arc<Service>>,
     Path(name): Path<String>,
@@ -471,39 +498,57 @@ async fn create_index(
         .index_type
         .unwrap_or_else(|| "IVF_PQ".into())
         .to_uppercase();
+    let index_name = body.name.unwrap_or_else(|| format!("{}_idx", body.column));
+    let mut revision = s.revision.lock().await;
+    *revision = format!("\"{}\"", uuid::Uuid::new_v4());
     match kind.as_str() {
-        "FTS" => return Err(bad("full-text indexes are not supported yet")),
-        k if k.starts_with("IVF") || k.starts_with("HNSW") => {}
+        "FTS" | "INVERTED" => {
+            engine
+                .configure_text_index(
+                    &name,
+                    walleye_lance::TextIndexSpec {
+                        name: index_name,
+                        column: body.column,
+                    },
+                )
+                .await
+                .map_err(|e| error(e.as_ref()))?;
+        }
+        k if k.starts_with("IVF") || k.starts_with("HNSW") => {
+            engine
+                .configure_vector_index(
+                    &name,
+                    VectorIndexSpec {
+                        name: index_name,
+                        column: body.column,
+                        metric: body
+                            .metric_type
+                            .unwrap_or_else(|| "l2".into())
+                            .to_lowercase(),
+                    },
+                )
+                .await
+                .map_err(|e| error(e.as_ref()))?;
+        }
         other => {
             return Err(bad(format!(
-                "index type {other} is not supported; vector columns use IVF_HNSW_SQ"
+                "index type {other} is not supported; vector columns use IVF_HNSW_SQ \
+                 and text columns use FTS"
             )));
         }
     }
-    let spec = VectorIndexSpec {
-        name: body.name.unwrap_or_else(|| format!("{}_idx", body.column)),
-        column: body.column,
-        metric: body
-            .metric_type
-            .unwrap_or_else(|| "l2".into())
-            .to_lowercase(),
-    };
-    let mut revision = s.revision.lock().await;
-    *revision = format!("\"{}\"", uuid::Uuid::new_v4());
-    engine
-        .configure_vector_index(&name, spec)
-        .await
-        .map_err(|e| error(e.as_ref()))?;
     Ok(Json(serde_json::json!({})).into_response())
 }
 
+/// Every index the table maintains, vector and text alike. Listing only the
+/// vector ones made a text index look like it had not been created.
 async fn list_indices(
     State(s): State<Arc<Service>>,
     Path(name): Path<String>,
     h: HeaderMap,
 ) -> Reply {
     let engine = engine(&s, &h)?;
-    let indexes: Vec<_> = engine
+    let mut indexes: Vec<serde_json::Value> = engine
         .vector_indexes(&name)
         .await
         .map_err(|e| error(e.as_ref()))?
@@ -517,6 +562,22 @@ async fn list_indices(
             })
         })
         .collect();
+    // Reported as FTS, the name it is created under, so a client can read the
+    // listing and rebuild the same index without translating anything.
+    indexes.extend(
+        engine
+            .text_indexes(&name)
+            .await
+            .map_err(|e| error(e.as_ref()))?
+            .into_iter()
+            .map(|i| {
+                serde_json::json!({
+                    "index_name": i.name,
+                    "columns": [i.column],
+                    "index_type": "FTS",
+                })
+            }),
+    );
     Ok(Json(serde_json::json!({"indexes": indexes})).into_response())
 }
 
