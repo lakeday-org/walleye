@@ -147,9 +147,7 @@ fn extract_pk_point_tuples(
     for conjunct in conjuncts {
         let (column, literals) = extract_column_literals(conjunct)?;
 
-        let Some(field) = schema.field_with_name(&column).ok() else {
-            return None;
-        };
+        let field = schema.field_with_name(&column).ok()?;
         if !pk_columns.iter().any(|pk| pk == &column) || values.contains_key(&column) {
             return None;
         }
@@ -2868,9 +2866,8 @@ mod tests {
                 .and(col("entry").in_list(vec![lit("one"), lit("two")], false)),
         );
 
-        let error = match scanner.try_into_batch().await {
-            Ok(_) => panic!("null PK membership must not fall back to row scanning"),
-            Err(error) => error,
+        let Err(error) = scanner.try_into_batch().await else {
+            panic!("null PK membership must not fall back to row scanning")
         };
         assert!(
             error.to_string().contains("null")
@@ -2943,9 +2940,8 @@ mod tests {
                 .and(col("entry").in_list(vec![lit("one"), lit("two")], false)),
         );
 
-        let error = match scanner.try_into_stream().await {
-            Ok(_) => panic!("partial PK sidecar must not fall back to row scanning"),
-            Err(error) => error,
+        let Err(error) = scanner.try_into_stream().await else {
+            panic!("partial PK sidecar must not fall back to row scanning")
         };
         assert!(
             error.to_string().contains("page_lookup")
