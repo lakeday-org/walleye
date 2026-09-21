@@ -311,7 +311,7 @@ async fn one_call_answers_a_whole_question_set() {
             "SELECT d['team']['answer'] AS team, \
                     d['team']['confidence'] AS sure, \
                     d['refund']['value'] AS refund, \
-                    d['severity']['label'] AS severity \
+                    d['severity']['answer'] AS severity \
              FROM (SELECT prompt_jev(body, '{spec}') AS d FROM tickets)"
         ),
     )
