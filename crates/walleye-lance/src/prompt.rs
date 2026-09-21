@@ -18,14 +18,17 @@ use lance::deps::datafusion::{
         datatypes::{DataType, Field, FieldRef, Fields},
     },
     common::Result as DfResult,
+    common::ScalarValue,
     error::DataFusionError,
     execution::context::SessionContext,
     logical_expr::{
-        ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
+        ColumnarValue, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature,
+        Volatility,
     },
 };
 use serde_json::Value;
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
+use walleye_typesafe::Question;
 
 fn execution(error: impl std::fmt::Display) -> DataFusionError {
     DataFusionError::Execution(error.to_string())
@@ -126,7 +129,7 @@ impl ScalarUDFImpl for Prompt {
             });
             slot.push(Some(at));
         }
-        let answered = crate::classify::wait(async {
+        let answered = crate::decisions::wait(async {
             use futures::stream::StreamExt;
             futures::stream::iter(
                 distinct
@@ -164,30 +167,130 @@ impl ScalarUDFImpl for Prompt {
     }
 }
 
-/// Ask the decision service a typed question about each row.
+/// Ask the decision service about each row.
 ///
-/// `prompt_jev(state, question)` where `question` is the same JSON the service
-/// takes: `{"type": "choice", "instructions": ..., "criteria": {...}}`, or
-/// `score` with a list of levels, or `noul` with none. It answers with the
-/// chosen option and how sure the service was, so a caller can act on one and
-/// gate on the other.
+/// `prompt_jev(state, question)` takes the service's own JSON. One question
+/// answers with one struct:
+///
+/// ```sql
+/// prompt_jev(body, '{"type":"choice","instructions":"...","criteria":{...}}')
+///   -> {answer: 'damage', value: NULL, confidence: 0.74}
+/// ```
+///
+/// A set of questions answers with one struct per question, named by the keys
+/// the caller chose, and costs the same single call:
+///
+/// ```sql
+/// prompt_jev(body, '{"topic":{"type":"choice",...},"heat":{"type":"score",...}}')
+///   -> {topic: {...}, heat: {...}}
+/// ```
+///
+/// Asking several things about a row at once is the cheap way to do it: the
+/// service answers them in parallel and charges by the call, so a set of six
+/// costs what one costs.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct PromptJev {
     signature: Signature,
 }
+
+/// What one answer looks like, whichever kind of question it came from: a
+/// label where there is one, a number where there is one, and how sure.
+fn answer_fields() -> Fields {
+    Fields::from(vec![
+        Field::new("answer", DataType::Utf8, true),
+        Field::new("value", DataType::Float64, true),
+        Field::new("confidence", DataType::Float64, true),
+    ])
+}
+
+/// The questions a literal spec asks. A spec naming a `type` at the top is one
+/// question; anything else is a set of them.
+fn questions_of(json: &str) -> DfResult<(BTreeMap<String, Question>, bool)> {
+    let parsed: Value = serde_json::from_str(json)
+        .map_err(|e| execution(format!("prompt_jev needs a question as JSON: {e}")))?;
+    if parsed.get("type").is_some() {
+        let question: Question = serde_json::from_value(parsed)
+            .map_err(|e| execution(format!("prompt_jev question is not a valid question: {e}")))?;
+        question.validate().map_err(execution)?;
+        return Ok(([(SOLE.to_owned(), question)].into(), true));
+    }
+    let set = walleye_typesafe::parse_spec(json).map_err(execution)?;
+    for question in set.values() {
+        question.validate().map_err(execution)?;
+    }
+    Ok((set, false))
+}
+
+/// The key a single question is filed under, never seen by a caller.
+const SOLE: &str = "answer";
+
+fn literal(scalar: Option<&ScalarValue>) -> DfResult<String> {
+    match scalar {
+        Some(ScalarValue::Utf8(Some(text)))
+        | Some(ScalarValue::LargeUtf8(Some(text)))
+        | Some(ScalarValue::Utf8View(Some(text))) => Ok(text.clone()),
+        _ => Err(execution(
+            "prompt_jev needs its question as a literal string, because the columns it \
+             returns are named by the questions it asks",
+        )),
+    }
+}
+
 impl PromptJev {
     fn new() -> Self {
         Self {
             signature: Signature::any(2, Volatility::Volatile),
         }
     }
-    fn fields() -> Fields {
-        Fields::from(vec![
-            Field::new("answer", DataType::Utf8, true),
-            Field::new("confidence", DataType::Float64, true),
-        ])
+    fn shape(questions: &BTreeMap<String, Question>, sole: bool) -> DataType {
+        if sole {
+            return DataType::Struct(answer_fields());
+        }
+        DataType::Struct(Fields::from(
+            questions
+                .keys()
+                .map(|name| Field::new(name, DataType::Struct(answer_fields()), true))
+                .collect::<Vec<_>>(),
+        ))
     }
 }
+
+/// One question's answers, as the three columns they are reported in.
+fn answered(answers: &[Option<walleye_typesafe::Answer>]) -> ArrayRef {
+    let mut labels = StringBuilder::with_capacity(answers.len(), answers.len() * 16);
+    let mut values = Float64Builder::with_capacity(answers.len());
+    let mut sureness = Float64Builder::with_capacity(answers.len());
+    for answer in answers {
+        match answer {
+            Some(answer) => {
+                match answer.label() {
+                    Some(label) => labels.append_value(label),
+                    None => labels.append_null(),
+                }
+                match answer.value() {
+                    Some(value) => values.append_value(value),
+                    None => values.append_null(),
+                }
+                sureness.append_value(answer.confidence());
+            }
+            None => {
+                labels.append_null();
+                values.append_null();
+                sureness.append_null();
+            }
+        }
+    }
+    Arc::new(StructArray::new(
+        answer_fields(),
+        vec![
+            Arc::new(labels.finish()),
+            Arc::new(values.finish()),
+            Arc::new(sureness.finish()),
+        ],
+        None,
+    ))
+}
+
 impl ScalarUDFImpl for PromptJev {
     fn name(&self) -> &str {
         "prompt_jev"
@@ -196,54 +299,49 @@ impl ScalarUDFImpl for PromptJev {
         &self.signature
     }
     fn return_type(&self, _arguments: &[DataType]) -> DfResult<DataType> {
-        Ok(DataType::Struct(Self::fields()))
+        Err(execution(
+            "prompt_jev needs its question as a literal string",
+        ))
+    }
+    fn return_field_from_args(&self, arguments: ReturnFieldArgs) -> DfResult<FieldRef> {
+        let json = literal(arguments.scalar_arguments.get(1).copied().flatten())?;
+        let (questions, sole) = questions_of(&json)?;
+        Ok(Arc::new(Field::new(
+            "prompt_jev",
+            Self::shape(&questions, sole),
+            true,
+        )))
     }
     fn invoke_with_args(&self, arguments: ScalarFunctionArgs) -> DfResult<ColumnarValue> {
         let rows = arguments.number_rows;
         let states = strings(&arguments.args[0], rows, "prompt_jev")?;
-        let raw = constant(&arguments.args[1], "question", "prompt_jev")?;
-        let question: walleye_typesafe::Question = serde_json::from_str(&raw)
-            .map_err(|e| execution(format!("prompt_jev question is not a valid question: {e}")))?;
-        let answers = crate::classify::answers_for(&states, question, "prompt_jev")?;
-
-        let mut labels = StringBuilder::with_capacity(answers.len(), answers.len() * 16);
-        let mut sureness = Float64Builder::with_capacity(answers.len());
-        for answer in &answers {
-            match answer {
-                Some(answer) => {
-                    match answer.label() {
-                        Some(label) => labels.append_value(label),
-                        // A yes-or-no has a probability and no label; it is
-                        // reported as the number it is.
-                        None => labels.append_null(),
-                    }
-                    match answer.value() {
-                        Some(value) => sureness.append_value(value),
-                        None => sureness.append_value(answer.confidence()),
-                    }
-                }
-                None => {
-                    labels.append_null();
-                    sureness.append_null();
-                }
+        let json = match &arguments.args[1] {
+            ColumnarValue::Scalar(scalar) => literal(Some(scalar))?,
+            ColumnarValue::Array(_) => {
+                return Err(execution(
+                    "prompt_jev needs one question for the whole query, not one per row",
+                ));
             }
+        };
+        let (questions, sole) = questions_of(&json)?;
+        let decided = crate::decisions::decisions_for(&states, &questions, "prompt_jev")?;
+        let pick = |name: &str| -> Vec<Option<walleye_typesafe::Answer>> {
+            decided
+                .iter()
+                .map(|decision| decision.as_ref().and_then(|d| d.answers.get(name).cloned()))
+                .collect()
+        };
+        if sole {
+            return Ok(ColumnarValue::Array(answered(&pick(SOLE))));
         }
-        let columns: Vec<ArrayRef> = vec![Arc::new(labels.finish()), Arc::new(sureness.finish())];
+        let columns: Vec<ArrayRef> = questions.keys().map(|name| answered(&pick(name))).collect();
+        let fields = match Self::shape(&questions, false) {
+            DataType::Struct(fields) => fields,
+            _ => unreachable!("a set of questions is a struct"),
+        };
         Ok(ColumnarValue::Array(Arc::new(StructArray::new(
-            Self::fields(),
-            columns,
-            None,
+            fields, columns, None,
         ))))
-    }
-    fn return_field_from_args(
-        &self,
-        _arguments: lance::deps::datafusion::logical_expr::ReturnFieldArgs,
-    ) -> DfResult<FieldRef> {
-        Ok(Arc::new(Field::new(
-            "prompt_jev",
-            DataType::Struct(Self::fields()),
-            true,
-        )))
     }
 }
 

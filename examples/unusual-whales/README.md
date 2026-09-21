@@ -79,11 +79,11 @@ much, which is why this uses `decide`:
 
 ```sql
 SELECT ticker, premium, summary,
-       d['stance']['label']      AS stance,
+       d['stance']['answer']      AS stance,
        d['stance']['confidence'] AS stance_sure,
-       d['conviction']['label']  AS conviction,
+       d['conviction']['answer']  AS conviction,
        d['urgent']['value']      AS urgency
-  FROM (SELECT ticker, premium, summary, decide(summary, '<question set>') AS d
+  FROM (SELECT ticker, premium, summary, prompt_jev(summary, '<question set>') AS d
           FROM silver_flow)
 ```
 

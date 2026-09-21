@@ -74,7 +74,7 @@ rather than something a worker can assume. An entry covers its subdomains.
 
 ## Classification
 
-Only relevant if you use `classify`, `decide`, `rate` or `holds` in SQL.
+Only relevant if you use `prompt` or `prompt_jev` in SQL.
 
 | Variable | Default | Meaning |
 |---|---|---|
