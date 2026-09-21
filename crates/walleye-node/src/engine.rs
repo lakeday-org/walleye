@@ -330,6 +330,15 @@ struct Stream {
     /// Next arrival number to hand out, once the stream's high-water mark is
     /// known. Unset until the first append after opening.
     seq: Mutex<Option<u64>>,
+    /// Set once another live process has claimed this stream's writer.
+    ///
+    /// Claiming is the only way a writer epoch moves, so reopening takes the
+    /// writer back from whoever holds it. A superseded process that keeps
+    /// reopening fights its own successor, and both answer 200 for writes to
+    /// the same stream. Once this is set the process stands down: it opens
+    /// nothing further for this stream and says so retryably, so callers move
+    /// to the writer that holds it.
+    superseded: std::sync::atomic::AtomicBool,
 }
 impl Stream {
     /// Bytes this stream's writer may hold in memory: the memtable size and
@@ -356,6 +365,13 @@ impl Stream {
     /// unreadable and unwritable until the process restarted. Returns whether
     /// it discarded one.
     async fn discard_fenced_writer(&self, reason: walleye_lance::FenceReason) -> bool {
+        // A peer claiming the epoch means a live process took this stream.
+        // A persistence failure is this writer's own, and reopening is the
+        // recovery for it.
+        if reason == walleye_lance::FenceReason::PeerClaimedEpoch {
+            self.superseded
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
         let taken = self.table.lock().await.take();
         let Some(table) = taken else {
             return false;
@@ -383,6 +399,16 @@ impl Stream {
         *self.last_used.lock().await = Instant::now();
         let mut table = self.table.lock().await;
         if table.is_none() {
+            // Opening claims the next epoch, which would take the writer back
+            // from the process that superseded this one.
+            if self.superseded.load(Ordering::Acquire) {
+                return Err(Box::new(walleye_lance::LanceError::fenced_by_peer(
+                    format!(
+                        "another writer holds {}; this process stood down",
+                        self.definition.name
+                    ),
+                )));
+            }
             let durability = match &self.bitr {
                 Some(writer) => {
                     if walleye_lance::prepare_bitr_takeover(
@@ -576,6 +602,7 @@ impl Engine {
                 lease: Mutex::new(None),
                 last_compaction: Mutex::new(None),
                 seq: Mutex::new(None),
+                superseded: std::sync::atomic::AtomicBool::new(false),
             })
         });
         Ok(stream.clone())
