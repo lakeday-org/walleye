@@ -1,0 +1,31 @@
+{
+  "today": "2026-09-18",
+  "tables": {
+    "customers": [
+      {"name": "id", "type": "int64"},
+      {"name": "name", "type": "string"},
+      {"name": "city", "type": "string"},
+      {"name": "signed_up", "type": "string"}
+    ],
+    "orders": [
+      {"name": "id", "type": "int64"},
+      {"name": "customer_id", "type": "int64"},
+      {"name": "status", "type": "string"},
+      {"name": "total", "type": "float64"},
+      {"name": "placed_on", "type": "string"}
+    ],
+    "shipments": [
+      {"name": "id", "type": "int64"},
+      {"name": "order_id", "type": "int64"},
+      {"name": "carrier", "type": "string"},
+      {"name": "days_late", "type": "int64"},
+      {"name": "shipped_on", "type": "string"}
+    ],
+    "reviews": [
+      {"name": "id", "type": "int64"},
+      {"name": "order_id", "type": "int64"},
+      {"name": "stars", "type": "int64"},
+      {"name": "body", "type": "string"}
+    ]
+  }
+}
