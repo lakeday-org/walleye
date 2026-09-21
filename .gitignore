@@ -5,3 +5,6 @@
 *.log
 .DS_Store
 __pycache__/
+
+# Benchmark runs are measurements, not source.
+benchmarks/*/results.json

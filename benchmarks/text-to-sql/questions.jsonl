@@ -1,0 +1,116 @@
+{"id":"count-1","kind":"count","q":"how many orders are there","sql":"SELECT count(*) FROM orders"}
+{"id":"count-2","kind":"count","q":"how many customers do we have","sql":"SELECT count(*) FROM customers"}
+{"id":"count-3","kind":"count","q":"total number of shipments","sql":"SELECT count(*) FROM shipments"}
+{"id":"count-4","kind":"count","q":"how many reviews are there","sql":"SELECT count(*) FROM reviews"}
+{"id":"rows-1","kind":"rows","q":"show me the orders","sql":"SELECT * FROM orders"}
+{"id":"rows-2","kind":"rows","q":"list every customer","sql":"SELECT * FROM customers"}
+{"id":"filter-text-1","kind":"filter-text","q":"customers in seattle","sql":"SELECT * FROM customers WHERE city = 'seattle'"}
+{"id":"filter-text-2","kind":"filter-text","q":"pending orders","sql":"SELECT * FROM orders WHERE status = 'pending'"}
+{"id":"filter-text-3","kind":"filter-text","q":"shipments by fedex","sql":"SELECT * FROM shipments WHERE carrier = 'fedex'"}
+{"id":"filter-text-4","kind":"filter-text","q":"how many orders are cancelled","sql":"SELECT count(*) FROM orders WHERE status = 'cancelled'"}
+{"id":"filter-text-5","kind":"filter-text","q":"customers named acme","sql":"SELECT * FROM customers WHERE name = 'acme'"}
+{"id":"filter-num-1","kind":"filter-number","q":"orders over 100","sql":"SELECT * FROM orders WHERE total > 100"}
+{"id":"filter-num-2","kind":"filter-number","q":"orders under 50","sql":"SELECT * FROM orders WHERE total < 50"}
+{"id":"filter-num-3","kind":"filter-number","q":"shipments more than 3 days late","sql":"SELECT * FROM shipments WHERE days_late > 3"}
+{"id":"filter-num-4","kind":"filter-number","q":"how many orders are over five hundred","sql":"SELECT count(*) FROM orders WHERE total > 500"}
+{"id":"filter-num-5","kind":"filter-number","q":"reviews with thirteen stars","sql":"SELECT * FROM reviews WHERE stars = 13"}
+{"id":"filter-num-6","kind":"filter-number","q":"orders worth $1,200 or more","sql":"SELECT * FROM orders WHERE total >= 1200"}
+{"id":"filter-num-7","kind":"filter-number","q":"reviews with one star","sql":"SELECT * FROM reviews WHERE stars = 1"}
+{"id":"filter-num-8","kind":"filter-number","q":"shipments twenty five days late","sql":"SELECT * FROM shipments WHERE days_late = 25"}
+{"id":"date-1","kind":"date","q":"orders placed today","sql":"SELECT * FROM orders WHERE placed_on >= '2026-09-18' AND placed_on < '2026-09-19'"}
+{"id":"date-2","kind":"date","q":"orders placed yesterday","sql":"SELECT * FROM orders WHERE placed_on >= '2026-09-17' AND placed_on < '2026-09-18'"}
+{"id":"date-3","kind":"date","q":"orders from last week","sql":"SELECT * FROM orders WHERE placed_on >= '2026-09-11' AND placed_on < '2026-09-18'"}
+{"id":"date-4","kind":"date","q":"orders placed last month","sql":"SELECT * FROM orders WHERE placed_on >= '2026-08-01' AND placed_on < '2026-09-01'"}
+{"id":"date-5","kind":"date","q":"how many orders in the last 7 days","sql":"SELECT count(*) FROM orders WHERE placed_on >= '2026-09-11' AND placed_on < '2026-09-19'"}
+{"id":"date-6","kind":"date","q":"customers who signed up this year","sql":"SELECT * FROM customers WHERE signed_up >= '2026-01-01' AND signed_up < '2027-01-01'"}
+{"id":"date-7","kind":"date","q":"shipments sent on the 3rd","sql":"SELECT * FROM shipments WHERE shipped_on >= '2026-09-03' AND shipped_on < '2026-09-04'"}
+{"id":"date-8","kind":"date","q":"orders placed in march","sql":"SELECT * FROM orders WHERE placed_on >= '2026-03-01' AND placed_on < '2026-04-01'"}
+{"id":"date-9","kind":"date","q":"orders from the past three weeks","sql":"SELECT * FROM orders WHERE placed_on >= '2026-08-28' AND placed_on < '2026-09-19'"}
+{"id":"date-10","kind":"date","q":"how many customers signed up last year","sql":"SELECT count(*) FROM customers WHERE signed_up >= '2025-01-01' AND signed_up < '2026-01-01'"}
+{"id":"group-1","kind":"group","q":"break down orders by status","sql":"SELECT status, count(*) FROM orders GROUP BY status"}
+{"id":"group-2","kind":"group","q":"count customers by city","sql":"SELECT city, count(*) FROM customers GROUP BY city"}
+{"id":"group-3","kind":"group","q":"shipments per carrier","sql":"SELECT carrier, count(*) FROM shipments GROUP BY carrier"}
+{"id":"order-1","kind":"order","q":"biggest orders first","sql":"SELECT * FROM orders ORDER BY total DESC"}
+{"id":"order-2","kind":"order","q":"latest shipments first","sql":"SELECT * FROM shipments ORDER BY shipped_on DESC"}
+{"id":"order-3","kind":"order","q":"cheapest orders first","sql":"SELECT * FROM orders ORDER BY total ASC"}
+{"id":"limit-1","kind":"limit","q":"top ten orders by value","sql":"SELECT * FROM orders ORDER BY total DESC LIMIT 10"}
+{"id":"limit-2","kind":"limit","q":"the five worst reviews","sql":"SELECT * FROM reviews ORDER BY stars ASC LIMIT 5"}
+{"id":"limit-3","kind":"limit","q":"single most expensive order","sql":"SELECT * FROM orders ORDER BY total DESC LIMIT 1"}
+{"id":"select-1","kind":"select-column","q":"what are the customer names","sql":"SELECT name FROM customers"}
+{"id":"select-2","kind":"select-column","q":"which cities do we ship to","sql":"SELECT DISTINCT city FROM customers"}
+{"id":"select-3","kind":"select-column","q":"list the carriers","sql":"SELECT DISTINCT carrier FROM shipments"}
+{"id":"select-4","kind":"select-column","q":"names of customers in portland","sql":"SELECT name FROM customers WHERE city = 'portland'"}
+{"id":"select-5","kind":"select-column","q":"order ids and totals","sql":"SELECT id, total FROM orders"}
+{"id":"select-6","kind":"select-column","q":"what statuses are there","sql":"SELECT DISTINCT status FROM orders"}
+{"id":"agg-1","kind":"aggregate","q":"total revenue","sql":"SELECT sum(total) FROM orders"}
+{"id":"agg-2","kind":"aggregate","q":"average order value","sql":"SELECT avg(total) FROM orders"}
+{"id":"agg-3","kind":"aggregate","q":"biggest order value","sql":"SELECT max(total) FROM orders"}
+{"id":"agg-4","kind":"aggregate","q":"average review score","sql":"SELECT avg(stars) FROM reviews"}
+{"id":"agg-5","kind":"aggregate","q":"worst lateness","sql":"SELECT max(days_late) FROM shipments"}
+{"id":"agg-6","kind":"aggregate","q":"revenue by status","sql":"SELECT status, sum(total) FROM orders GROUP BY status"}
+{"id":"agg-7","kind":"aggregate","q":"average order value per city","sql":"SELECT c.city, avg(o.total) FROM orders o JOIN customers c ON c.id = o.customer_id GROUP BY c.city"}
+{"id":"agg-8","kind":"aggregate","q":"how much did we make last month","sql":"SELECT sum(total) FROM orders WHERE placed_on >= '2026-08-01' AND placed_on < '2026-09-01'"}
+{"id":"join-1","kind":"join","q":"which carriers shipped acme orders","sql":"SELECT DISTINCT s.carrier FROM shipments s JOIN orders o ON o.id = s.order_id JOIN customers c ON c.id = o.customer_id WHERE c.name = 'acme'"}
+{"id":"join-2","kind":"join","q":"orders that shipped late","sql":"SELECT o.* FROM orders o JOIN shipments s ON s.order_id = o.id WHERE s.days_late > 0"}
+{"id":"join-3","kind":"join","q":"how many orders shipped by ups","sql":"SELECT count(*) FROM orders o JOIN shipments s ON s.order_id = o.id WHERE s.carrier = 'ups'"}
+{"id":"join-4","kind":"join","q":"customers with orders over 500","sql":"SELECT DISTINCT c.* FROM customers c JOIN orders o ON o.customer_id = c.id WHERE o.total > 500"}
+{"id":"join-5","kind":"join","q":"review scores for fedex shipments","sql":"SELECT r.stars FROM reviews r JOIN shipments s ON s.order_id = r.order_id WHERE s.carrier = 'fedex'"}
+{"id":"join-6","kind":"join","q":"names of customers who left a review","sql":"SELECT DISTINCT c.name FROM customers c JOIN orders o ON o.customer_id = c.id JOIN reviews r ON r.order_id = o.id"}
+{"id":"text-1","kind":"text-search","q":"reviews mentioning a refund","sql":"SELECT * FROM reviews WHERE body MATCH 'refund'"}
+{"id":"text-2","kind":"text-search","q":"reviews that talk about packaging","sql":"SELECT * FROM reviews WHERE body MATCH 'packaging'"}
+{"id":"text-3","kind":"text-search","q":"complaints about delivery","sql":"SELECT * FROM reviews WHERE body MATCH 'delivery'"}
+{"id":"text-4","kind":"text-search","q":"how many reviews mention damage","sql":"SELECT count(*) FROM reviews WHERE body MATCH 'damage'"}
+{"id":"text-5","kind":"text-search","q":"one star reviews mentioning shipping","sql":"SELECT * FROM reviews WHERE stars = 1 AND body MATCH 'shipping'"}
+{"id":"implied-1","kind":"implied-condition","q":"late shipments","sql":"SELECT * FROM shipments WHERE days_late > 0"}
+{"id":"implied-2","kind":"implied-condition","q":"how many shipments were late","sql":"SELECT count(*) FROM shipments WHERE days_late > 0"}
+{"id":"implied-3","kind":"implied-condition","q":"on time shipments","sql":"SELECT * FROM shipments WHERE days_late <= 0"}
+{"id":"implied-4","kind":"implied-condition","q":"bad reviews","sql":"SELECT * FROM reviews WHERE stars <= 2"}
+{"id":"implied-5","kind":"implied-condition","q":"big orders","sql":"SELECT * FROM orders WHERE total > 500"}
+{"id":"implied-6","kind":"implied-condition","q":"unshipped orders","sql":"SELECT o.* FROM orders o LEFT JOIN shipments s ON s.order_id = o.id WHERE s.id IS NULL"}
+{"id":"or-1","kind":"or-not-in","q":"customers in seattle or portland","sql":"SELECT * FROM customers WHERE city IN ('seattle', 'portland')"}
+{"id":"or-2","kind":"or-not-in","q":"orders that are not cancelled","sql":"SELECT * FROM orders WHERE status != 'cancelled'"}
+{"id":"or-3","kind":"or-not-in","q":"orders between 100 and 500","sql":"SELECT * FROM orders WHERE total BETWEEN 100 AND 500"}
+{"id":"or-4","kind":"or-not-in","q":"shipments not by ups","sql":"SELECT * FROM shipments WHERE carrier != 'ups'"}
+{"id":"or-5","kind":"or-not-in","q":"reviews with 1 or 2 stars","sql":"SELECT * FROM reviews WHERE stars IN (1, 2)"}
+{"id":"nested-1","kind":"nested","q":"customers who spent more than average","sql":"SELECT c.* FROM customers c JOIN orders o ON o.customer_id = c.id GROUP BY c.id HAVING sum(o.total) > (SELECT avg(total) FROM orders)"}
+{"id":"nested-2","kind":"nested","q":"the city with the most customers","sql":"SELECT city FROM customers GROUP BY city ORDER BY count(*) DESC LIMIT 1"}
+{"id":"nested-3","kind":"nested","q":"carriers with more than 10 late shipments","sql":"SELECT carrier FROM shipments WHERE days_late > 0 GROUP BY carrier HAVING count(*) > 10"}
+{"id":"nested-4","kind":"nested","q":"customers with no orders","sql":"SELECT c.* FROM customers c LEFT JOIN orders o ON o.customer_id = c.id WHERE o.id IS NULL"}
+{"id":"ambiguous-1","kind":"ambiguous","q":"best customers","sql":"SELECT c.name, sum(o.total) FROM customers c JOIN orders o ON o.customer_id = c.id GROUP BY c.name ORDER BY sum(o.total) DESC"}
+{"id":"ambiguous-2","kind":"ambiguous","q":"how are we doing","sql":null}
+{"id":"ambiguous-3","kind":"ambiguous","q":"problem shipments","sql":"SELECT * FROM shipments WHERE days_late > 0"}
+{"id":"nonsense-1","kind":"unanswerable","q":"what is the weather","sql":null}
+{"id":"nonsense-2","kind":"unanswerable","q":"delete everything","sql":null}
+{"id":"nonsense-3","kind":"unanswerable","q":"who is the president","sql":null}
+{"id":"join-7","kind":"join","q":"total spent by each customer","sql":"SELECT c.name, sum(o.total) FROM customers c JOIN orders o ON o.customer_id = c.id GROUP BY c.name"}
+{"id":"join-8","kind":"join","q":"average days late per carrier for acme","sql":"SELECT s.carrier, avg(s.days_late) FROM shipments s JOIN orders o ON o.id = s.order_id JOIN customers c ON c.id = o.customer_id WHERE c.name = 'acme' GROUP BY s.carrier"}
+{"id":"join-9","kind":"join","q":"how many orders per city","sql":"SELECT c.city, count(*) FROM orders o JOIN customers c ON c.id = o.customer_id GROUP BY c.city"}
+{"id":"join-10","kind":"join","q":"average review score by carrier","sql":"SELECT s.carrier, avg(r.stars) FROM reviews r JOIN shipments s ON s.order_id = r.order_id GROUP BY s.carrier"}
+{"id":"join-11","kind":"join","q":"revenue per carrier","sql":"SELECT s.carrier, sum(o.total) FROM orders o JOIN shipments s ON s.order_id = o.id GROUP BY s.carrier"}
+{"id":"join-12","kind":"join","q":"which city has the worst reviews","sql":"SELECT c.city, avg(r.stars) FROM reviews r JOIN orders o ON o.id = r.order_id JOIN customers c ON c.id = o.customer_id GROUP BY c.city ORDER BY avg(r.stars) ASC LIMIT 1"}
+{"id":"join-13","kind":"join","q":"top five customers by number of orders","sql":"SELECT c.name, count(*) FROM customers c JOIN orders o ON o.customer_id = c.id GROUP BY c.name ORDER BY count(*) DESC LIMIT 5"}
+{"id":"join-14","kind":"join","q":"late shipments to portland","sql":"SELECT s.* FROM shipments s JOIN orders o ON o.id = s.order_id JOIN customers c ON c.id = o.customer_id WHERE c.city = 'portland' AND s.days_late > 0"}
+{"id":"join-15","kind":"join","q":"revenue by city last month","sql":"SELECT c.city, sum(o.total) FROM orders o JOIN customers c ON c.id = o.customer_id WHERE o.placed_on >= '2026-08-01' AND o.placed_on < '2026-09-01' GROUP BY c.city"}
+{"id":"join-16","kind":"join","q":"carriers used by customers in seattle","sql":"SELECT DISTINCT s.carrier FROM shipments s JOIN orders o ON o.id = s.order_id JOIN customers c ON c.id = o.customer_id WHERE c.city = 'seattle'"}
+{"id":"group-4","kind":"group","q":"orders per status per city","sql":"SELECT c.city, o.status, count(*) FROM orders o JOIN customers c ON c.id = o.customer_id GROUP BY c.city, o.status"}
+{"id":"group-5","kind":"group","q":"how many reviews at each star rating","sql":"SELECT stars, count(*) FROM reviews GROUP BY stars"}
+{"id":"group-6","kind":"group","q":"signups per month this year","sql":"SELECT substr(signed_up, 1, 7), count(*) FROM customers WHERE signed_up >= '2026-01-01' AND signed_up < '2027-01-01' GROUP BY substr(signed_up, 1, 7)"}
+{"id":"agg-9","kind":"aggregate","q":"cheapest and most expensive order","sql":"SELECT min(total), max(total) FROM orders"}
+{"id":"agg-10","kind":"aggregate","q":"how many distinct cities do customers live in","sql":"SELECT count(DISTINCT city) FROM customers"}
+{"id":"agg-11","kind":"aggregate","q":"average lateness for orders over 500","sql":"SELECT avg(s.days_late) FROM shipments s JOIN orders o ON o.id = s.order_id WHERE o.total > 500"}
+{"id":"agg-12","kind":"aggregate","q":"total revenue from late orders","sql":"SELECT sum(o.total) FROM orders o JOIN shipments s ON s.order_id = o.id WHERE s.days_late > 0"}
+{"id":"nested-5","kind":"nested","q":"orders worth more than average","sql":"SELECT * FROM orders WHERE total > (SELECT avg(total) FROM orders)"}
+{"id":"nested-6","kind":"nested","q":"customers who never left a review","sql":"SELECT c.* FROM customers c WHERE c.id NOT IN (SELECT o.customer_id FROM orders o JOIN reviews r ON r.order_id = o.id)"}
+{"id":"nested-7","kind":"nested","q":"carriers whose average lateness beats the overall average","sql":"SELECT carrier FROM shipments GROUP BY carrier HAVING avg(days_late) < (SELECT avg(days_late) FROM shipments)"}
+{"id":"nested-8","kind":"nested","q":"cities with more than five customers","sql":"SELECT city FROM customers GROUP BY city HAVING count(*) > 5"}
+{"id":"nested-9","kind":"nested","q":"the most recent order for each customer","sql":"SELECT customer_id, max(placed_on) FROM orders GROUP BY customer_id"}
+{"id":"nested-10","kind":"nested","q":"statuses with average value above 200","sql":"SELECT status FROM orders GROUP BY status HAVING avg(total) > 200"}
+{"id":"nested-11","kind":"nested","q":"shipments later than any acme shipment","sql":"SELECT * FROM shipments WHERE days_late > (SELECT max(s.days_late) FROM shipments s JOIN orders o ON o.id = s.order_id JOIN customers c ON c.id = o.customer_id WHERE c.name = 'acme')"}
+{"id":"date-11","kind":"date","q":"revenue this month versus last month","sql":"SELECT sum(CASE WHEN placed_on >= '2026-09-01' THEN total ELSE 0 END), sum(CASE WHEN placed_on >= '2026-08-01' AND placed_on < '2026-09-01' THEN total ELSE 0 END) FROM orders"}
+{"id":"date-12","kind":"date","q":"late shipments in the last 30 days","sql":"SELECT * FROM shipments WHERE days_late > 0 AND shipped_on >= '2026-08-19' AND shipped_on < '2026-09-19'"}
+{"id":"select-7","kind":"select-column","q":"customer names and the cities they are in","sql":"SELECT name, city FROM customers"}
+{"id":"select-8","kind":"select-column","q":"carrier and days late for every late shipment","sql":"SELECT carrier, days_late FROM shipments WHERE days_late > 0"}
+{"id":"text-6","kind":"text-search","q":"one star reviews mentioning the driver","sql":"SELECT * FROM reviews WHERE stars = 1 AND body MATCH 'driver'"}
+{"id":"text-7","kind":"text-search","q":"reviews about broken items from fedex shipments","sql":"SELECT r.* FROM reviews r JOIN shipments s ON s.order_id = r.order_id WHERE s.carrier = 'fedex' AND r.body MATCH 'broken'"}
+{"id":"implied-7","kind":"implied-condition","q":"which carriers are unreliable","sql":"SELECT carrier FROM shipments GROUP BY carrier HAVING avg(days_late) > 1"}
+{"id":"implied-8","kind":"implied-condition","q":"our best city by revenue","sql":"SELECT c.city, sum(o.total) FROM orders o JOIN customers c ON c.id = o.customer_id GROUP BY c.city ORDER BY sum(o.total) DESC LIMIT 1"}
