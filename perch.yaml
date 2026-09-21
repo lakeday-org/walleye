@@ -46,3 +46,33 @@
     Anything taking a write quorum requires exactly two and refuses any other
     value rather than accepting it. Two of the three copies is the guarantee
     this engine sells, so it is not a tunable.
+
+- name: search-is-never-disabled
+  where: "crates/walleye-node/src/**/*.rs"
+  ensure_absent: >
+    A handler that refuses vector search or full-text search because the engine
+    does not implement it, rather than because the request was malformed. Both
+    are search engine features this database sells; a stub that answers "not
+    supported yet" is a feature switched off, and it stays off because nothing
+    fails while it is. If a search request cannot be served, that is a bug to
+    fix and not an error message to return.
+
+- name: index-types-are-not-silently-narrowed
+  where: mentions create_index
+  each: method
+  min: 75
+  ensure: >
+    This method accepts every index type the storage layer can build - vector
+    and full text - and rejects only types that genuinely do not exist. It does
+    not accept a request and then build a different kind of index, and it does
+    not name one supported type in its error while another is also supported.
+
+- name: text-columns-can-be-searched
+  where: mentions full_text_query
+  each: method
+  min: 75
+  ensure: >
+    A full-text query over a column with a text index is answered by that index.
+    It is not turned into a substring scan, and it is not refused. A phrase
+    search that reads every row is a correctness problem as well as a speed one,
+    because substring matching and term matching do not return the same rows.

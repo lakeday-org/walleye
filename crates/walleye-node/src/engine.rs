@@ -23,7 +23,7 @@ use walleye_bitr::{HttpReplica, QuorumWriter};
 use walleye_lance::{
     BitrWalBackend, CachedStorage, CompactionResult, JsonSchema, LanceDurability,
     LanceStorageOptions, LsmStats, SearchRequest, SnapshotSource, Table, TableConfig,
-    TableSnapshot, VectorIndexSpec,
+    TableSnapshot, TextIndexSpec, VectorIndexSpec,
 };
 use walleye_ring::Node;
 
@@ -126,6 +126,7 @@ impl From<StreamRequest> for StreamDefinition {
             primary_key: request.primary_key,
             schema: None,
             vector_indexes: Vec::new(),
+            text_indexes: Vec::new(),
         }
     }
 }
@@ -146,6 +147,9 @@ pub struct StreamDefinition {
     /// Vector indexes maintained on the memtable and every generation.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub vector_indexes: Vec<VectorIndexSpec>,
+    /// Full-text indexes maintained on the memtable and every generation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub text_indexes: Vec<TextIndexSpec>,
 }
 /// Columns the node maintains and clients neither write nor see.
 pub fn hidden(column: &str) -> bool {
@@ -218,6 +222,7 @@ impl StreamDefinition {
             primary_key,
             schema: Some(serde_json::to_value(json)?),
             vector_indexes,
+            text_indexes: Vec::new(),
         })
     }
     /// Same table shape: everything except the index configuration.
@@ -259,7 +264,8 @@ impl StreamDefinition {
                 Arc::new(schema),
                 self.primary_key.clone(),
             )?
-            .with_vector_indexes(self.vector_indexes.clone())?);
+            .with_vector_indexes(self.vector_indexes.clone())?
+            .with_text_indexes(self.text_indexes.clone())?);
         }
         let mut seen = std::collections::HashSet::new();
         let fields = self
@@ -299,12 +305,17 @@ impl StreamDefinition {
         // consumer's cursor is useless on a stream that does not have it.
         let mut fields = fields;
         fields.push(Field::new(HIDDEN_SEQ, DataType::UInt64, false));
+        // A table declared by columns takes its indexes from the catalog the
+        // same way one declared by schema does. It did not, so a stream-API
+        // table could hold an index spec that nothing ever built.
         Ok(TableConfig::new(
             &self.name,
             format!("{}/data/{}", root.trim_end_matches('/'), self.name),
             Arc::new(Schema::new(fields)),
             self.primary_key.clone(),
-        )?)
+        )?
+        .with_vector_indexes(self.vector_indexes.clone())?
+        .with_text_indexes(self.text_indexes.clone())?)
     }
 }
 struct Stream {
@@ -1307,6 +1318,51 @@ impl Engine {
         // returning, so no query sees an index built with the old metric.
         compact_stream(&stream, 1, self.cache.storage.query_timeout(), true).await?;
         Ok(())
+    }
+    /// Set the full-text index for a column. As with a vector index the spec
+    /// is stored in the catalog and the table reopened, so the memtable and
+    /// every later generation maintain it, and existing generations pick it up
+    /// at their next compaction.
+    pub async fn configure_text_index(&self, name: &str, spec: TextIndexSpec) -> Result<(), Error> {
+        let closed = self.closed.read().await;
+        if *closed {
+            return Err("engine is closed".into());
+        }
+        let stream = self.stream(name).await?;
+        let mut definition = stream.definition.clone();
+        definition.text_indexes.retain(|t| t.column != spec.column);
+        definition.text_indexes.push(spec);
+        definition
+            .text_indexes
+            .sort_by(|a, b| a.column.cmp(&b.column));
+        definition.table_config(&self.config.root_uri)?;
+        let stream = if definition.text_indexes == stream.definition.text_indexes {
+            stream
+        } else {
+            let path = self.catalog_path.clone().join(format!("{name}.json"));
+            let bytes = serde_json::to_vec(&definition)?;
+            let put_started = catalog_stage_start("catalog_put", name);
+            match self.catalog.inner.put(&path, bytes.into()).await {
+                Ok(_) => catalog_stage_finish("catalog_put", name, put_started, "updated"),
+                Err(error) => {
+                    catalog_stage_finish("catalog_put", name, put_started, "error");
+                    return Err(error.into());
+                }
+            }
+            if let Some(mut table) = stream.table.lock().await.take() {
+                let _ = table.checkpoint().await;
+                table.close().await?;
+            }
+            self.streams.lock().await.remove(name);
+            self.register(definition).await?
+        };
+        drop(stream.table().await?);
+        compact_stream(&stream, 1, self.cache.storage.query_timeout(), true).await?;
+        Ok(())
+    }
+    pub async fn text_indexes(&self, name: &str) -> Result<Vec<TextIndexSpec>, Error> {
+        let stream = self.stream(name).await?;
+        Ok(stream.definition.text_indexes.clone())
     }
     pub async fn vector_indexes(&self, name: &str) -> Result<Vec<VectorIndexSpec>, Error> {
         let stream = self.stream(name).await?;
