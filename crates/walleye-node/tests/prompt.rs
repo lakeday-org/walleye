@@ -103,9 +103,11 @@ async fn sql(app: &axum::Router, statement: &str) -> (StatusCode, Value) {
 }
 
 const ARROW: &str = "application/vnd.apache.arrow.stream";
-const TAXONOMY: &str = "returns=Exchanges, refunds, wrong or damaged items; \
-     shipping=Delivery status, delays, lost packages; \
-     billing=Charges, invoices, payment problems";
+/// One choice, as the service's own JSON.
+const TEAM: &str = r#"{"type":"choice","instructions":"Which team should handle this?",
+  "criteria":{"returns":"Exchanges, refunds, wrong or damaged items",
+              "shipping":"Delivery status, delays, lost packages",
+              "billing":"Charges, invoices, payment problems"}}"#;
 
 async fn seeded(path: &std::path::Path, rows: &[&str]) -> axum::Router {
     let service = Service::open(config(path)).await.unwrap();
@@ -143,7 +145,7 @@ async fn sql_classifies_a_column_against_an_inline_taxonomy() {
     let (status, body) = sql(
         &app,
         &format!(
-            "SELECT id, classify(body, 'Which team should handle this?', '{TAXONOMY}') AS team \
+            "SELECT id, prompt_jev(body, '{TEAM}')['answer'] AS team \
              FROM tickets ORDER BY id"
         ),
     )
@@ -170,10 +172,9 @@ async fn confidence_is_queryable_so_a_tier_can_gate_on_it() {
     let (status, body) = sql(
         &app,
         &format!(
-            "SELECT classify(body, 'Which team should handle this?', '{TAXONOMY}') AS team, \
-                    classify_confidence(body, 'Which team should handle this?', '{TAXONOMY}') AS sure, \
-                    holds(body, 'The customer is asking for money back') AS refund \
-             FROM tickets"
+            "SELECT d['answer'] AS team, d['confidence'] AS sure, \
+                    prompt_jev(body, '{{\"type\":\"noul\",\"instructions\":\"The customer is asking for money back\"}}')['value'] AS refund \
+             FROM (SELECT body, prompt_jev(body, '{TEAM}') AS d FROM tickets)"
         ),
     )
     .await;
@@ -196,31 +197,31 @@ async fn confidence_is_queryable_so_a_tier_can_gate_on_it() {
     );
 }
 
-/// A taxonomy the service would refuse is refused as a query error naming the
+/// A question the service would refuse is refused as a query error naming the
 /// problem, rather than as a column of nulls the caller has to interpret.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_malformed_taxonomy_fails_the_query_and_says_why() {
+async fn a_malformed_question_fails_the_query_and_says_why() {
     let d = tempfile::tempdir().unwrap();
     let app = seeded(d.path(), &["anything at all"]).await;
 
     let (status, body) = sql(
         &app,
-        "SELECT classify(body, 'pick one', 'no-equals-sign-here') AS team FROM tickets",
+        "SELECT prompt_jev(body, 'not-json-at-all') AS team FROM tickets",
     )
     .await;
     assert_ne!(
         status,
         StatusCode::OK,
-        "a taxonomy with no meanings is not usable"
+        "text that is not a question is not usable"
     );
     assert!(
-        body.to_string().contains("option=meaning"),
-        "names what the taxonomy should look like, got {body}"
+        body.to_string().contains("JSON"),
+        "names what the question should look like, got {body}"
     );
 
     let (status, body) = sql(
         &app,
-        "SELECT classify(body, 'pick one', 'only=the sole option') AS team FROM tickets",
+        "SELECT prompt_jev(body, '{\"type\":\"choice\",\"instructions\":\"pick one\",\"criteria\":{\"only\":\"the sole option\"}}') AS team FROM tickets",
     )
     .await;
     assert_ne!(status, StatusCode::OK, "a choice of one is not a choice");
@@ -247,7 +248,7 @@ async fn repeated_text_is_asked_about_once() {
     let (status, body) = sql(
         &app,
         &format!(
-            "SELECT classify(body, 'Which team should handle this?', '{TAXONOMY}') AS team \
+            "SELECT prompt_jev(body, '{TEAM}')['answer'] AS team \
              FROM tickets"
         ),
     )
@@ -307,11 +308,11 @@ async fn one_call_answers_a_whole_question_set() {
     let (status, body) = sql(
         &app,
         &format!(
-            "SELECT d['team']['label'] AS team, \
+            "SELECT d['team']['answer'] AS team, \
                     d['team']['confidence'] AS sure, \
                     d['refund']['value'] AS refund, \
-                    d['severity']['label'] AS severity \
-             FROM (SELECT decide(body, '{spec}') AS d FROM tickets)"
+                    d['severity']['answer'] AS severity \
+             FROM (SELECT prompt_jev(body, '{spec}') AS d FROM tickets)"
         ),
     )
     .await;
@@ -335,7 +336,7 @@ async fn one_call_answers_a_whole_question_set() {
 async fn a_question_set_that_is_not_a_literal_is_refused_while_planning() {
     let d = tempfile::tempdir().unwrap();
     let app = seeded(d.path(), &["anything at all"]).await;
-    let (status, body) = sql(&app, "SELECT decide(body, body) AS d FROM tickets").await;
+    let (status, body) = sql(&app, "SELECT prompt_jev(body, body) AS d FROM tickets").await;
     assert_ne!(
         status,
         StatusCode::OK,

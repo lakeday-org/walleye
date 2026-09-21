@@ -1,10 +1,12 @@
 //! Standalone Lance tables and a Bitr implementation of Lance's WAL boundary.
 mod backend;
 mod cached_storage;
-pub mod classify;
+mod decisions;
 mod error;
 mod identity;
 mod ipc;
+pub mod model;
+pub mod prompt;
 mod result_memory;
 mod sql;
 mod storage_options;
