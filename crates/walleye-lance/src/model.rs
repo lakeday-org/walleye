@@ -184,6 +184,58 @@ impl Model {
         Err(format!("model unreachable after 4 attempts, last was {last}").into())
     }
 
+    /// Answer one prompt with text.
+    ///
+    /// `shape` is an optional JSON schema; supplying one makes the answer
+    /// structured JSON rather than prose, which is what a column of records
+    /// usually wants.
+    pub async fn complete(&self, prompt: &str, shape: Option<&Value>) -> Result<String, Error> {
+        let mut body = json!({
+            "model": self.name,
+            "input": [{"role": "user", "content": prompt}],
+            "max_output_tokens": 32000,
+            "store": false,
+        });
+        if let Some(effort) = &self.effort {
+            body["reasoning"] = json!({"effort": effort});
+        }
+        if let Some(schema) = shape {
+            body["text"] = json!({"format": {
+                "type": "json_schema",
+                "name": schema.get("name").and_then(Value::as_str).unwrap_or("answer"),
+                "schema": schema.get("schema").unwrap_or(schema),
+                "strict": schema.get("strict").and_then(Value::as_bool).unwrap_or(true),
+            }});
+        }
+        let payload = self.send(&body).await?;
+        let mut text = String::new();
+        for item in payload["output"].as_array().unwrap_or(&vec![]) {
+            for part in item["content"].as_array().unwrap_or(&vec![]) {
+                if part["type"] == "output_text"
+                    && let Some(chunk) = part["text"].as_str()
+                {
+                    text.push_str(chunk);
+                }
+            }
+        }
+        Ok(text.trim().to_owned())
+    }
+
+    /// The same client, with this call's own model and effort.
+    pub fn with(&self, name: Option<&str>, effort: Option<&str>) -> Self {
+        Self {
+            endpoint: self.endpoint.clone(),
+            key: self.key.clone(),
+            name: name.unwrap_or(&self.name).to_owned(),
+            effort: match effort {
+                Some("") => None,
+                Some(other) => Some(other.to_owned()),
+                None => self.effort.clone(),
+            },
+            http: self.http.clone(),
+        }
+    }
+
     /// Draft a statement for `phrase` against `schema`.
     ///
     /// `refused` carries statements an earlier draft produced that the planner

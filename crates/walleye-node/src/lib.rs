@@ -4,7 +4,6 @@ pub mod cluster;
 pub mod cron;
 mod engine;
 mod lancedb;
-pub mod model;
 mod processor;
 pub mod reach;
 pub use processor::ProcessorConfig;

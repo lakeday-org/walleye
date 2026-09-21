@@ -46,7 +46,7 @@ fn client() -> Option<&'static Arc<Client>> {
 /// else it borrows a dedicated runtime, because blocking the only thread of a
 /// single-threaded runtime would deadlock against the very work being waited
 /// on.
-fn wait<F: std::future::Future>(future: F) -> F::Output {
+pub(crate) fn wait<F: std::future::Future>(future: F) -> F::Output {
     use tokio::runtime::{Handle, RuntimeFlavor};
     match Handle::try_current() {
         Ok(handle) if handle.runtime_flavor() == RuntimeFlavor::MultiThread => {
@@ -103,7 +103,7 @@ fn to_strings(array: &dyn Array, function: &str) -> DfResult<StringArray> {
 /// drawn from twenty phrasings costs twenty calls, not a thousand. A row the
 /// service could not answer yields null rather than failing the query, so one
 /// unanswerable row does not discard the batch.
-fn answers_for(
+pub(crate) fn answers_for(
     states: &StringArray,
     question: Question,
     function: &str,

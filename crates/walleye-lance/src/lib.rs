@@ -5,6 +5,8 @@ pub mod classify;
 mod error;
 mod identity;
 mod ipc;
+pub mod model;
+pub mod prompt;
 mod result_memory;
 mod sql;
 mod storage_options;
