@@ -10,8 +10,8 @@
 //! is either answered by the model or refused, because a quietly worse answer
 //! is harder to notice than no answer.
 use crate::engine::Engine;
-use crate::model::Model;
 use arrow_schema::DataType;
+use walleye_lance::model::Model;
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
 
@@ -25,7 +25,7 @@ pub struct Answered {
     pub row_count: usize,
     /// What the model asked the decision service along the way, and how sure
     /// each answer was. Empty when it asked nothing.
-    pub decisions: Vec<crate::model::Decision>,
+    pub decisions: Vec<walleye_lance::model::Decision>,
     /// Statements the planner refused before this one was accepted.
     pub corrected: Vec<Refusal>,
     /// Which member wrote the statement, and which ran it.

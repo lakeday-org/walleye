@@ -31,6 +31,8 @@ fn context(storage: &LanceStorageOptions) -> lance::Result<SessionContext> {
     // Typed decisions are ordinary functions to a query, so they are added
     // wherever a session is built rather than only on one path.
     crate::classify::register(&context);
+    // A model and a decision service, as functions a query can call.
+    crate::prompt::register(&context);
     Ok(context)
 }
 fn err(e: impl std::fmt::Display) -> lance::Error {

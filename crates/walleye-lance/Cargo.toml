@@ -9,6 +9,7 @@ publish.workspace = true
 [dependencies]
 arrow-cast.workspace = true
 walleye-typesafe = { path = "../walleye-typesafe" }
+reqwest.workspace = true
 walleye-cache.workspace = true
 lance-core = "=11.0.0"
 lance-io = { version = "=11.0.0", default-features = false, features = ["aws"] }
