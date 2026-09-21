@@ -328,8 +328,8 @@ async fn tiers_refine_raw_rows_into_confident_labels() {
             "source": "bronze",
             "target": "silver_tickets",
             "sql": format!(
-                "SELECT body, d['team']['label'] AS team, d['team']['confidence'] AS sure \
-                 FROM (SELECT body, decide(body, '{spec}') AS d FROM bronze)"
+                "SELECT body, d['team']['answer'] AS team, d['team']['confidence'] AS sure \
+                 FROM (SELECT body, prompt_jev(body, '{spec}') AS d FROM bronze)"
             )
         }),
     )

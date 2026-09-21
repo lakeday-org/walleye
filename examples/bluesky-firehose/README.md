@@ -97,12 +97,12 @@ Three questions, one call per post:
 
 ```sql
 SELECT uri, author, posted_at, text,
-       d['topic']['label']      AS topic,
+       d['topic']['answer']      AS topic,
        d['topic']['confidence'] AS topic_sure,
-       d['heat']['label']       AS heat,
+       d['heat']['answer']       AS heat,
        d['newsworthy']['value'] AS newsworthy
   FROM (SELECT uri, author, posted_at, text,
-               decide(text, '<question set>') AS d FROM sampled)
+               prompt_jev(text, '<question set>') AS d FROM sampled)
 ```
 
 Topic is a choice across news, technology, culture, sport, personal and other.
