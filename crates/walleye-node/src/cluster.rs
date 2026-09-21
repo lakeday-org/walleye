@@ -126,6 +126,39 @@ impl Cluster {
             .await
             .map_err(|error| format!("owner {} truncated {stream}: {error}", owner.id))
     }
+    /// Run one statement on the member that owns the table it reads, and take
+    /// its rows.
+    ///
+    /// The alternative is [`Self::fetch_snapshot`], which drags every row of
+    /// the table across the network so this node can filter it. For a
+    /// statement naming a single table, asking its owner to run the statement
+    /// moves the answer rather than the table.
+    pub async fn run_sql(&self, owner: &Node, sql: &str) -> Result<bytes::Bytes, String> {
+        let url = format!("{}/v1/query", owner.endpoint.trim_end_matches('/'));
+        let response = self
+            .client
+            .post(url)
+            .bearer_auth(&self.token)
+            .header(MEMBERS_HEADER, self.fingerprint())
+            .header(FORWARDED_HEADER, "1")
+            .json(&serde_json::json!({"sql": sql}))
+            .send()
+            .await
+            .map_err(|error| format!("owner {} is unreachable: {error}", owner.id))?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(format!(
+                "owner {} refused the query with {status}: {body}",
+                owner.id
+            ));
+        }
+        response
+            .bytes()
+            .await
+            .map_err(|error| format!("owner {} truncated the answer: {error}", owner.id))
+    }
+
     /// Relay one request to `owner` and return its response verbatim.
     pub async fn forward(
         &self,

@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+walleye-typesafe = { path = "../walleye-typesafe" }
 rustls.workspace = true
 tokio-tungstenite.workspace = true
 walleye-v8 = { path = "../walleye-v8" }

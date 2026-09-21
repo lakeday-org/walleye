@@ -1147,6 +1147,22 @@ impl Engine {
             .cloned()
             .collect())
     }
+    /// Every table's client-visible schema, read from the catalog rather than
+    /// by opening the table.
+    ///
+    /// [`Self::describe`] goes through [`Self::stream`], which refuses a table
+    /// this node does not own. That is right for reading rows and wrong for
+    /// describing a schema: the catalog is shared, so a node that cannot say
+    /// what columns a table has cannot answer a question about it.
+    pub async fn schemas(&self) -> Result<Vec<(String, Schema)>, Error> {
+        let mut out = Vec::new();
+        for name in self.table_names().await? {
+            if let Ok(stream) = self.definition(&name).await {
+                out.push((name, stream.definition.user_schema(&stream.config.schema)));
+            }
+        }
+        Ok(out)
+    }
     /// Current version and client-visible schema.
     pub async fn describe(&self, name: &str) -> Result<(u64, Schema), Error> {
         let stream = self.stream(name).await?;
