@@ -11,19 +11,9 @@
 //! That is the property these tests pin down, at the two layers where it can
 //! break: the claim itself, and the daemon's policy about re-claiming.
 //!
-//! As of today the two layers disagree. The claim passes back and forth
-//! exactly as it should, on a local store and on a bucket: six handovers, six
-//! ascending epochs, every row kept. The daemon will not use it that way. A
-//! process fenced by a peer sets `Stream::superseded` and never opens that
-//! stream again (`engine.rs`, "this process stood down"), so the lock moves
-//! once and stops. That is deliberate — #66 made it sticky so a process being
-//! replaced during a rolling upgrade cannot claw the writer back from its
-//! successor — but it is the opposite of a pool of peers taking turns, and a
-//! process cannot tell the two situations apart from where it stands.
-//!
-//! So the two `two_processes_*` tests are the property we want rather than the
-//! behaviour we have, and they are `#[ignore]`d: run them with
-//! `cargo test --test cas_handoff -- --ignored` to see where it stops.
+//! Both layers hold. A fenced process discards the dead handle and takes the
+//! writer back on its next write, so the lock is a rota rather than a
+//! one-way door, and the price of a turn is one open and a WAL replay.
 //!
 //! Two `Service`s over one root are two processes as far as the lock is
 //! concerned. They share no memory, no catalog, no cache and no writer handle;
@@ -311,14 +301,12 @@ async fn a_claim_can_be_taken_and_retaken_on_a_bucket() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "a fenced process stands down for good (#66), so the lock moves once and stops"]
 async fn two_processes_pass_the_writer_back_and_forth_on_a_local_store() {
     let dir = tempfile::tempdir().unwrap();
     processes_alternate(&format!("file://{}/store", dir.path().display())).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "a fenced process stands down for good (#66), so the lock moves once and stops"]
 async fn two_processes_pass_the_writer_back_and_forth_on_a_bucket() {
     let Some(root) = bucket_root() else {
         eprintln!("skipping: set WALLEYE_TEST_S3_URI to run this against a bucket");
