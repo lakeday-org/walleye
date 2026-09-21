@@ -40,11 +40,7 @@ fn strings(value: &ColumnarValue, rows: usize, function: &str) -> DfResult<Strin
         ColumnarValue::Array(array) => array.clone(),
         ColumnarValue::Scalar(scalar) => scalar.to_array_of_size(rows).map_err(execution)?,
     };
-    array
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .cloned()
-        .ok_or_else(|| execution(format!("{function} takes text")))
+    crate::decisions::to_strings(&array, function)
 }
 
 /// An argument that must be the same for every row, because it configures the
