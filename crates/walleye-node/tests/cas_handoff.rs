@@ -471,11 +471,10 @@ async fn concurrent_writes_mostly_succeed_on_a_bucket() {
 /// has to say where the holder answers, and posting to that address has to
 /// actually drain the stream.
 ///
-/// Both are checked here. What is not checked here is the two together, which
-/// needs a claimant that genuinely cannot read the tail, and that means two
-/// Bitr clusters: six replica nodes and two gateways. Nodes writing the
-/// object-store WAL always can read it, correctly, so no refusal ever happens
-/// between them and this test cannot manufacture one.
+/// Both are checked here. The two together, on a claimant that genuinely
+/// cannot read the tail, are in `tests/bitr_clusters.rs`: nodes writing the
+/// object-store WAL always can read it, correctly, so no refusal can be
+/// manufactured between them and it takes two real Bitr clusters to make one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_writer_holding_a_tail_says_where_it_answers_and_drains_when_asked() {
     let dir = tempfile::tempdir().unwrap();

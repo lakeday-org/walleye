@@ -6722,6 +6722,7 @@ dependencies = [
  "lance-core",
  "lance-io",
  "object_store 0.13.2",
+ "object_store 0.14.1",
  "reqwest 0.12.28",
  "rustls",
  "serde",
