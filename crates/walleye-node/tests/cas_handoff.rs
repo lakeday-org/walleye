@@ -423,23 +423,20 @@ async fn concurrent_writes_never_lose_an_acknowledged_row() {
     assert!(acked > 0, "someone wrote something, {acked} of {of}");
 }
 
-/// Liveness under contention, which is where this stops working.
+/// Liveness under contention, which is what the backoff buys.
 ///
-/// Taking turns is fine. Writing at the same time is not: each process is
-/// fenced while it is still replaying the WAL to open, so it never finishes
-/// taking the lock before the other steals it back.
+/// Without it the two never settled: each was fenced while still replaying the
+/// WAL to open, so neither finished taking the lock before the other took it
+/// back, and only a fifth to two fifths of writes landed.
 ///
 ///   WAL replay aborted: entry at position 209 has writer_epoch 202
 ///   > our claimed epoch 201 (writer was fenced during open)
 ///
-/// Between a fifth and two fifths of writes get through; the rest exhaust five
-/// retries and are refused. Nothing is lost, because a refusal honestly says
-/// the rows were not stored - this is livelock, not corruption. What is
-/// missing is anything that makes a claim worth holding: a claimant gets no
-/// minimum turn, so two eager writers take the epoch off each other faster
-/// than either can use it.
+/// Waiting before claiming back turns that into taking turns: the loser of a
+/// race leaves the winner alone long enough to replay the log and empty its
+/// queue, so fifty simultaneous writes cost about one handover rather than
+/// forty refusals - and finish ten times quicker than the thrash did.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "two processes writing at once livelock: no minimum hold on a claim"]
 async fn concurrent_writes_mostly_succeed() {
     let dir = tempfile::tempdir().unwrap();
     let (acked, of) =
@@ -451,7 +448,6 @@ async fn concurrent_writes_mostly_succeed() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "two processes writing at once livelock: no minimum hold on a claim"]
 async fn concurrent_writes_mostly_succeed_on_a_bucket() {
     let Some(root) = bucket_root() else {
         eprintln!("skipping: set WALLEYE_TEST_S3_URI to run this against a bucket");
