@@ -10,6 +10,7 @@ pub mod prompt;
 mod result_memory;
 mod sql;
 mod storage_options;
+mod open_tail;
 mod table;
 pub use backend::{BitrWalBackend, RecoveredEntry, WalReceipt};
 pub use cached_storage::CachedStorage;

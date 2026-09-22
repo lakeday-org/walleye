@@ -248,6 +248,11 @@ pub struct Table {
     /// so reusing the open handle saves the manifest resolution and index
     /// load that every query would otherwise repeat against object storage.
     sstables: Arc<SsTableCache>,
+    /// Whether this writer has already said, in shared storage, that it is
+    /// holding rows nobody else can read. Set on the first append after a
+    /// drain and cleared by the next checkpoint, so the note costs one put a
+    /// flush rather than one an append. See [`crate::open_tail`].
+    tail_noted: bool,
 }
 
 /// Emit bounded, stage-level open diagnostics without exposing a dataset URI,
@@ -459,6 +464,11 @@ impl Table {
                 FtsIndexConfig::new(spec.name.clone(), field_id, spec.column.clone()),
             ));
         }
+        // Before the claim, not after. Claiming is what fences the writer that
+        // holds the stream, so a writer that is going to refuse has to refuse
+        // before it takes anything: otherwise a doomed open still knocks the
+        // incumbent off a stream it was serving correctly.
+        reachable_tail(&dataset, &config, &durability).await?;
         let writer_started = open_stage_start(&config, "mem_wal_writer");
         let writer = match dataset.mem_wal_writer(config.shard_id, writer_config).await {
             Ok(writer) => {
@@ -498,12 +508,17 @@ impl Table {
             storage,
             durability,
             sstables: Arc::new(SsTableCache::new(256)),
+            tail_noted: false,
         })
     }
     /// Acknowledge only after the configured WAL authority accepts the Arrow IPC entry.
     /// Batches are put in slices of at most [`Self::PUT_ROWS`] rows, each its
     /// own WAL entry, so a large insert can roll across memtables.
     pub async fn append(&mut self, batches: Vec<RecordBatch>) -> lance::Result<()> {
+        // Before the rows, not after: a note left for a write that then fails
+        // costs a successor one refusal it did not need, and a note missing
+        // for a write that succeeded costs it the rows.
+        self.note_open_tail().await;
         let mut owned = Vec::new();
         for b in batches.into_iter().flat_map(|b| {
             let rows = b.num_rows();
@@ -648,6 +663,49 @@ impl Table {
     pub fn config(&self) -> &TableConfig {
         &self.config
     }
+    /// Say, in shared storage, that this writer is holding acknowledged rows
+    /// that are only in its own log. Cheap and idempotent after the first
+    /// call, because the flag is what decides whether a put happens at all.
+    async fn note_open_tail(&mut self) {
+        if self.tail_noted {
+            return;
+        }
+        let Ok(store) = self.dataset.object_store(None).await else {
+            return;
+        };
+        let base = self.dataset.branch_location().path;
+        let note = crate::open_tail::OpenTail {
+            after: 0,
+            stream: self.config.stream.clone(),
+        };
+        // A note that cannot be written is not worth failing a write over: it
+        // costs a successor its safety check, and losing the write costs the
+        // caller its row. Say so loudly instead.
+        match crate::open_tail::write(&store, &base, self.config.shard_id, &note).await {
+            Ok(()) => self.tail_noted = true,
+            Err(error) => eprintln!(
+                "walleye.storage open_tail stream={} outcome=unwritten error={error}",
+                self.config.stream
+            ),
+        }
+    }
+
+    /// Take the note down: the tail is in shared storage now.
+    async fn clear_open_tail(&mut self) {
+        let Ok(store) = self.dataset.object_store(None).await else {
+            return;
+        };
+        let base = self.dataset.branch_location().path;
+        if let Err(error) = crate::open_tail::clear(&store, &base, self.config.shard_id).await {
+            eprintln!(
+                "walleye.storage open_tail stream={} outcome=uncleared error={error}",
+                self.config.stream
+            );
+            return;
+        }
+        self.tail_noted = false;
+    }
+
     /// The MemWAL writer epoch this table claimed when it opened.
     pub fn writer_epoch(&self) -> u64 {
         self.writer.epoch()
@@ -731,7 +789,9 @@ impl Table {
     }
     /// Flush to Lance SSTables and advance the manifest replay watermark.
     pub async fn checkpoint(&mut self) -> lance::Result<()> {
-        self.writer.checkpoint().await
+        self.writer.checkpoint().await?;
+        self.clear_open_tail().await;
+        Ok(())
     }
     pub async fn close(self) -> lance::Result<()> {
         self.writer.close().await
@@ -895,6 +955,83 @@ fn same_fields(left: &Schema, right: &Schema) -> bool {
 /// A tail with entries after the last checkpoint is refused: only the
 /// object-store WAL holds them, and a Bitr-backed writer could not replay
 /// them. Reopen in single-node mode, checkpoint, then move.
+/// Whether the tail the last writer left is one this writer can actually read.
+///
+/// The note in shared storage says acknowledged rows exist that no flush has
+/// covered. It does not say whose log they are in, so this asks the only
+/// question that settles it: can this writer produce them? A Bitr writer
+/// recovers its stream and sees whether the quorum has anything; a node on the
+/// object-store WAL looks in the WAL directory, which is shared and therefore
+/// always readable by whoever gets here.
+///
+/// An unreachable tail is refused rather than replayed-as-empty, because the
+/// alternative is a stream that silently loses rows a client was told were
+/// stored. The fix is to drain it where it lives - check point the writer that
+/// holds it - after which any writer may take the stream.
+///
+/// What this catches is a log that has never held the stream, which is the
+/// shape a second cluster arrives in. It does not catch a cluster that held
+/// the stream once, was drained, and is now being handed a tail that grew
+/// somewhere else: its log is not empty, so it looks able to serve. Telling
+/// that apart needs the note to say which log the tail is in and the claimant
+/// to prove it holds those positions, and positions are per-cluster, so it
+/// needs an identity for a log as well. Worth doing; not done here.
+async fn reachable_tail(
+    dataset: &Dataset,
+    config: &TableConfig,
+    durability: &LanceDurability,
+) -> lance::Result<()> {
+    let store = dataset.object_store(None).await?;
+    let base = dataset.branch_location().path;
+    let note = crate::open_tail::read(&store, &base, config.shard_id, &config.stream).await?;
+    let Some(_note) = note else {
+        return Ok(());
+    };
+    let reachable = match durability {
+        // The object-store WAL is shared storage. If a tail is noted, its
+        // entries are either in that directory, where this writer will replay
+        // them, or they are in somebody's quorum and this writer cannot have
+        // them.
+        LanceDurability::ObjectStore => {
+            let wal_dir = lance::dataset::mem_wal::util::shard_wal_path(&base, &config.shard_id);
+            let mut entries = store.inner.list(Some(&wal_dir));
+            let mut found = false;
+            while let Some(object) = entries.try_next().await? {
+                if object
+                    .location
+                    .filename()
+                    .and_then(lance::dataset::mem_wal::util::parse_bit_reversed_filename)
+                    .is_some()
+                {
+                    found = true;
+                    break;
+                }
+            }
+            found
+        }
+        // The uncertified tail, which is what `prepare_bitr_takeover` asks
+        // for too: this runs before the claim, so nothing this writer wrote
+        // is in here yet and anything at all means the quorum has held this
+        // stream.
+        LanceDurability::Bitr(backend) => !backend
+            .writer()
+            .recover(&config.stream, 0)
+            .await
+            .map_err(|e| lance::Error::io(format!("Bitr recovery for {}: {e}", config.stream)))?
+            .is_empty(),
+    };
+    if reachable {
+        return Ok(());
+    }
+    Err(lance::Error::invalid_input(format!(
+        "stream {} has rows a writer acknowledged and no flush has covered, and they are not in \
+         the write-ahead log this writer reads. Opening here would serve the stream without \
+         them. Check point the writer that holds them - it is the one whose log has the tail - \
+         and any writer may take the stream afterwards.",
+        config.stream
+    )))
+}
+
 pub async fn prepare_bitr_takeover(
     storage: &LanceStorageOptions,
     uri: &str,

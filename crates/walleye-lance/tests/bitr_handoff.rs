@@ -122,61 +122,92 @@ async fn two_writers_on_one_cluster_hand_the_stream_back_and_forth() {
     }
 }
 
-/// Two processes, two Bitr clusters, one stream. This is the shape that does
-/// not work, and the point of writing it down is that nothing refuses it.
+/// Two processes, two Bitr clusters, one stream: refused, not silently emptied.
 ///
-/// The manifest arbitrates the claim, so the handover looks orderly: the
-/// second writer takes the next epoch and the first is fenced, exactly as
-/// before. But the log it replays is its own cluster's, and the rows the first
-/// one acknowledged are in the other cluster's quorum. The manifest cannot see
-/// the difference, because which Bitr cluster a writer talks to is not
-/// something it records.
+/// The manifest cannot tell the two clusters apart - it records a writer
+/// epoch, replay positions, sstables and a status, and nothing about which log
+/// holds the tail - so the claim itself goes through as it always did. What
+/// stops it is the note the first writer left in shared storage saying it is
+/// holding rows no flush has covered. The second writer reads that, asks its
+/// own quorum for the stream, gets nothing, and refuses rather than opening an
+/// empty table over rows somebody else is still holding.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn two_clusters_on_one_stream_lose_what_the_other_acknowledged() {
+async fn a_tail_in_another_cluster_is_refused_rather_than_lost() {
     let dir = tempfile::tempdir().unwrap();
     let uri = format!("file://{}/events", dir.path().display());
     let (first, second) = (cluster(), cluster());
 
-    let (mut one, first_epoch, _) = claim(&uri, &writer(&first)).await.unwrap();
+    let (mut one, _, _) = claim(&uri, &writer(&first)).await.unwrap();
     one.append(vec![row(1, "acknowledged by the first cluster")])
         .await
         .expect("the first writer stores a row");
     assert_eq!(ids(&mut one).await, vec![1]);
     // Deliberately no checkpoint: the row is acknowledged and durable in the
-    // first quorum, and nowhere else yet. That is the state a live handover
-    // happens in.
+    // first quorum, and nowhere else. That is the state a live handover
+    // happens in, and the state that used to lose it.
 
-    let (mut two, second_epoch, moved) = claim(&uri, &writer(&second))
-        .await
-        .expect("a writer on another cluster claims the stream regardless");
-    // Not a bad reset: the one guard there is declined to treat this as a
-    // stream moving off the object-store WAL, which is the only mismatch it
-    // knows how to look for. There is no guard for the mismatch that is
-    // happening, so the open simply finds an empty log and believes it.
+    let refused = claim(&uri, &writer(&second)).await;
+    let error = refused
+        .err()
+        .expect("a writer that cannot read the tail must not open the stream");
+    let said = error.to_string();
     assert!(
-        !moved,
-        "the second cluster did not reset anything; it had nothing to replay"
+        said.contains("not in the write-ahead log this writer reads"),
+        "the refusal names the problem, got {said}"
     );
     assert!(
-        second_epoch > first_epoch,
-        "the manifest hands over as usual: {first_epoch} then {second_epoch}"
+        said.contains("Check point the writer that holds them"),
+        "the refusal names the fix, got {said}"
     );
 
-    let after = ids(&mut two).await;
-    assert_eq!(
-        after,
-        Vec::<i64>::new(),
-        "the row the first cluster acknowledged is not in the second's log"
-    );
-
-    two.append(vec![row(2, "acknowledged by the second cluster")])
+    // The rows are where they always were, and the writer that holds them is
+    // untouched by the refusal.
+    assert_eq!(ids(&mut one).await, vec![1], "nothing was disturbed");
+    one.append(vec![row(2, "still writing")])
         .await
-        .expect("the second writer stores a row");
+        .expect("the incumbent keeps its stream");
+    one.close().await.unwrap();
+}
+
+/// The premise a safe handover would rest on: a checkpoint drains the private
+/// log into shared storage, so a successor needs nothing from the quorum the
+/// last writer was using.
+///
+/// If this holds, then "sync before the lock is released" is enough to make a
+/// handover safe between any two writers, whatever their WAL authority - two
+/// Bitr clusters, or a Bitr cluster and a plain object-store node.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_checkpoint_makes_the_tail_safe_to_hand_to_anyone() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("file://{}/events", dir.path().display());
+    let (first, second) = (cluster(), cluster());
+
+    let (mut one, _, _) = claim(&uri, &writer(&first)).await.unwrap();
+    one.append(vec![row(1, "acknowledged by the first cluster")])
+        .await
+        .unwrap();
+    // The difference from the test above, and the whole of it.
+    one.checkpoint().await.expect("drain to shared storage");
+    one.close().await.expect("close");
+
+    let (mut two, _, _) = claim(&uri, &writer(&second)).await.unwrap();
     assert_eq!(
         ids(&mut two).await,
-        vec![2],
-        "two writers, two logs, one stream: each sees only its own"
+        vec![1],
+        "a drained tail is readable by a writer on another cluster"
     );
-    let _ = one.close().await;
-    let _ = two.close().await;
+    two.append(vec![row(2, "acknowledged by the second cluster")])
+        .await
+        .unwrap();
+    two.checkpoint().await.unwrap();
+    two.close().await.unwrap();
+
+    // And back again, to the first cluster, which has not seen row 2 either.
+    let (mut back, _, _) = claim(&uri, &writer(&first)).await.unwrap();
+    assert_eq!(
+        ids(&mut back).await,
+        vec![1, 2],
+        "the rota works across clusters when every turn ends drained"
+    );
+    back.close().await.unwrap();
 }
