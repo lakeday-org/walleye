@@ -285,6 +285,102 @@ async fn processes_alternate(root: &str) {
     );
 }
 
+/// Both processes writing at the same time, rather than taking turns.
+///
+/// Alternating writes prove the lock can move. They do not prove it survives
+/// contention: here each process is mid-append when the other claims, so every
+/// write is racing a fence rather than following one. Two things have to hold.
+/// Nothing acknowledged may go missing - a 200 means the rows reached the WAL,
+/// and whichever writer replays it next must adopt them. And the two must make
+/// progress rather than livelock, each one's reclaim fencing the other's
+/// in-flight write for ever.
+///
+/// Ids are split so a lost row is identifiable: evens are A's, odds are B's.
+///
+/// Safety is checked here and holds. Liveness is left to the caller, because
+/// it does not: see the two tests below.
+async fn processes_contend(root: &str, each: i64) -> (usize, usize) {
+    let cache = tempfile::tempdir().unwrap();
+    let (a_service, a) = process(cache.path(), "a", root).await;
+    let (b_service, b) = process(cache.path(), "b", root).await;
+
+    // Every write in flight at once, not one after another. A process that
+    // writes serially gets the lock and empties its queue before the other
+    // notices, which is barely contention at all; this way both are always
+    // mid-append when the other claims.
+    async fn run(app: axum::Router, ids: Vec<i64>) -> (Vec<i64>, Vec<(i64, String)>) {
+        let mut flight = tokio::task::JoinSet::new();
+        for id in ids {
+            let app = app.clone();
+            flight.spawn(async move { (id, write_row(&app, id).await) });
+        }
+        let mut acked = Vec::new();
+        let mut refused = Vec::new();
+        while let Some(done) = flight.join_next().await {
+            match done.expect("a write task finished") {
+                (id, Ok(_)) => acked.push(id),
+                (id, Err(why)) => refused.push((id, why)),
+            }
+        }
+        (acked, refused)
+    }
+
+    let started = std::time::Instant::now();
+    let (left, right) = tokio::join!(
+        tokio::spawn(run(a.clone(), (0..each).map(|n| n * 2).collect())),
+        tokio::spawn(run(b.clone(), (0..each).map(|n| n * 2 + 1).collect())),
+    );
+    let elapsed = started.elapsed();
+    let (a_acked, a_refused) = left.expect("process a finished");
+    let (b_acked, b_refused) = right.expect("process b finished");
+
+    let mut acked: Vec<i64> = a_acked.iter().chain(b_acked.iter()).copied().collect();
+    acked.sort_unstable();
+    println!(
+        "  {} writes each, both at once: {} acknowledged, {} refused, {:.1}s",
+        each,
+        acked.len(),
+        a_refused.len() + b_refused.len(),
+        elapsed.as_secs_f64()
+    );
+    for (id, why) in a_refused.iter().chain(b_refused.iter()).take(3) {
+        println!("    refused id {id}: {why}");
+    }
+
+    a_service.close().await;
+    b_service.close().await;
+
+    let stamped = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("at", DataType::Int64, false),
+        Field::new("_walleye_seq", DataType::UInt64, false),
+    ]));
+    let stored = ids_in_storage(root, stamped).await;
+
+    // The invariant that matters. A 503 says the rows were not stored, so a
+    // refusal losing its row is the contract working; a 200 losing its row is
+    // the contract broken.
+    let missing: Vec<i64> = acked
+        .iter()
+        .copied()
+        .filter(|id| !stored.contains(id))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "every acknowledged row survived the contention, lost {missing:?}"
+    );
+    let unasked: Vec<i64> = stored
+        .iter()
+        .copied()
+        .filter(|id| !acked.contains(id))
+        .collect();
+    assert!(
+        unasked.is_empty(),
+        "nothing appeared that was never acknowledged, found {unasked:?}"
+    );
+    (acked.len(), (each * 2) as usize)
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_claim_can_be_taken_and_retaken_on_a_local_store() {
     let dir = tempfile::tempdir().unwrap();
@@ -313,4 +409,59 @@ async fn two_processes_pass_the_writer_back_and_forth_on_a_bucket() {
         return;
     };
     processes_alternate(&root).await;
+}
+
+/// Safety under contention: a 200 is a promise, and contention does not break
+/// it. Whatever the two processes do to each other, no acknowledged row goes
+/// missing and no row appears that nobody was told about.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_writes_never_lose_an_acknowledged_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let (acked, of) =
+        processes_contend(&format!("file://{}/store", dir.path().display()), 25).await;
+    // Deliberately not a floor on how many land: see the test below for why.
+    assert!(acked > 0, "someone wrote something, {acked} of {of}");
+}
+
+/// Liveness under contention, which is where this stops working.
+///
+/// Taking turns is fine. Writing at the same time is not: each process is
+/// fenced while it is still replaying the WAL to open, so it never finishes
+/// taking the lock before the other steals it back.
+///
+///   WAL replay aborted: entry at position 209 has writer_epoch 202
+///   > our claimed epoch 201 (writer was fenced during open)
+///
+/// Between a fifth and two fifths of writes get through; the rest exhaust five
+/// retries and are refused. Nothing is lost, because a refusal honestly says
+/// the rows were not stored - this is livelock, not corruption. What is
+/// missing is anything that makes a claim worth holding: a claimant gets no
+/// minimum turn, so two eager writers take the epoch off each other faster
+/// than either can use it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "two processes writing at once livelock: no minimum hold on a claim"]
+async fn concurrent_writes_mostly_succeed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (acked, of) =
+        processes_contend(&format!("file://{}/store", dir.path().display()), 25).await;
+    assert!(
+        acked * 10 >= of * 9,
+        "contention costs a retry or two, not most of the writes: {acked} of {of} landed"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "two processes writing at once livelock: no minimum hold on a claim"]
+async fn concurrent_writes_mostly_succeed_on_a_bucket() {
+    let Some(root) = bucket_root() else {
+        eprintln!("skipping: set WALLEYE_TEST_S3_URI to run this against a bucket");
+        return;
+    };
+    // Every turn against a bucket is an open and a replay, so this is minutes
+    // at ten apiece rather than seconds.
+    let (acked, of) = processes_contend(&root, 10).await;
+    assert!(
+        acked * 10 >= of * 9,
+        "contention costs a retry or two, not most of the writes: {acked} of {of} landed"
+    );
 }
