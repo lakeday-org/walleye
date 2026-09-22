@@ -1071,9 +1071,7 @@ pub async fn open_tail_holder(
 /// can resolve by getting the holder to flush rather than by giving up.
 #[must_use]
 pub fn is_unreachable_tail(error: &lance::Error) -> bool {
-    error
-        .to_string()
-        .contains(UNREACHABLE_TAIL)
+    error.to_string().contains(UNREACHABLE_TAIL)
 }
 
 /// The sentence both the refusal and its recogniser are built from, so they

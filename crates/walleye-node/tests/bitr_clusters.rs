@@ -85,7 +85,13 @@ async fn bitr_cluster(
     (format!("http://{address}"), tasks)
 }
 
-fn config(cache: &std::path::Path, node: &str, root: &str, bitr: &str, members: Vec<Node>) -> Config {
+fn config(
+    cache: &std::path::Path,
+    node: &str,
+    root: &str,
+    bitr: &str,
+    members: Vec<Node>,
+) -> Config {
     Config {
         node_id: node.into(),
         listen: "127.0.0.1:0".into(),
@@ -119,7 +125,9 @@ async fn send(app: &axum::Router, uri: &str, body: Value) -> (StatusCode, String
         .await
         .unwrap();
     let status = response.status();
-    let bytes = to_bytes(response.into_body(), 4 * 1024 * 1024).await.unwrap();
+    let bytes = to_bytes(response.into_body(), 4 * 1024 * 1024)
+        .await
+        .unwrap();
     (status, String::from_utf8_lossy(&bytes).into_owned())
 }
 
@@ -183,7 +191,9 @@ async fn ids_in_storage(root: &str) -> Vec<i64> {
                 .as_any()
                 .downcast_ref::<Int64Array>()
                 .expect("id is int64");
-            (0..values.len()).map(|i| values.value(i)).collect::<Vec<_>>()
+            (0..values.len())
+                .map(|i| values.value(i))
+                .collect::<Vec<_>>()
         })
         .collect();
     let _ = table.close().await;
@@ -245,7 +255,11 @@ async fn a_stream_moves_between_two_bitr_clusters_without_losing_a_row() {
     // Acknowledged, and deliberately not flushed. This row exists only in the
     // first cluster's quorum.
     let (status, body) = write_row(&first_app, 1).await;
-    assert_eq!(status, StatusCode::OK, "the first daemon stores a row: {body}");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the first daemon stores a row: {body}"
+    );
 
     // The second daemon, on the other cluster, takes the stream.
     let second = Service::open(config(

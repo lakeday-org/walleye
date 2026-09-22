@@ -101,7 +101,9 @@ async fn send(app: &axum::Router, method: &str, uri: &str, body: Value) -> (Stat
         .await
         .unwrap();
     let status = response.status();
-    let bytes = to_bytes(response.into_body(), 4 * 1024 * 1024).await.unwrap();
+    let bytes = to_bytes(response.into_body(), 4 * 1024 * 1024)
+        .await
+        .unwrap();
     (status, String::from_utf8_lossy(&bytes).into_owned())
 }
 
@@ -174,7 +176,9 @@ async fn ids_in_storage(root: &str, stored: Arc<Schema>) -> Vec<i64> {
                 .as_any()
                 .downcast_ref::<Int64Array>()
                 .expect("id is int64");
-            (0..values.len()).map(|i| values.value(i)).collect::<Vec<_>>()
+            (0..values.len())
+                .map(|i| values.value(i))
+                .collect::<Vec<_>>()
         })
         .collect();
     let _ = table.close().await;
@@ -214,10 +218,9 @@ async fn claims_alternate(root: &str) {
             ],
         )
         .unwrap();
-        table
-            .append(vec![batch])
-            .await
-            .unwrap_or_else(|e| panic!("round {round} claimed the writer but could not write: {e}"));
+        table.append(vec![batch]).await.unwrap_or_else(|e| {
+            panic!("round {round} claimed the writer but could not write: {e}")
+        });
         table.checkpoint().await.expect("checkpoint");
         table.close().await.expect("close");
     }
@@ -544,10 +547,8 @@ async fn a_writer_holding_a_tail_says_where_it_answers_and_drains_when_asked() {
     let cluster = walleye_node::cluster::Cluster::new(
         "claimant".into(),
         Arc::new(
-            walleye_ring::Membership::new(vec![
-                Node::new("holder", held_at.clone(), 1.0).unwrap(),
-            ])
-            .unwrap(),
+            walleye_ring::Membership::new(vec![Node::new("holder", held_at.clone(), 1.0).unwrap()])
+                .unwrap(),
         ),
         TOKEN.into(),
     )

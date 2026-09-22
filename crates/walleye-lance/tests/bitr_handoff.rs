@@ -73,7 +73,9 @@ async fn ids(table: &mut Table) -> Vec<i64> {
                 .as_any()
                 .downcast_ref::<Int64Array>()
                 .expect("id is int64");
-            (0..values.len()).map(|i| values.value(i)).collect::<Vec<_>>()
+            (0..values.len())
+                .map(|i| values.value(i))
+                .collect::<Vec<_>>()
         })
         .collect();
     found.sort_unstable();
