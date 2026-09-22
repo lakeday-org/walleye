@@ -461,3 +461,116 @@ async fn concurrent_writes_mostly_succeed_on_a_bucket() {
         "contention costs a retry or two, not most of the writes: {acked} of {of} landed"
     );
 }
+
+/// The two halves of a cooperative handover, checked where they can be.
+///
+/// A claimant that cannot read a stream's tail asks the writer holding it to
+/// flush, because a fenced writer can no longer flush for itself - its commit
+/// is rejected by epoch - so the drain has to happen while the holder still
+/// holds it. That needs two things to be true: the note left in shared storage
+/// has to say where the holder answers, and posting to that address has to
+/// actually drain the stream.
+///
+/// Both are checked here. What is not checked here is the two together, which
+/// needs a claimant that genuinely cannot read the tail, and that means two
+/// Bitr clusters: six replica nodes and two gateways. Nodes writing the
+/// object-store WAL always can read it, correctly, so no refusal ever happens
+/// between them and this test cannot manufacture one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_writer_holding_a_tail_says_where_it_answers_and_drains_when_asked() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = format!("file://{}/store", dir.path().display());
+    let cache = tempfile::tempdir().unwrap();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let held_at = format!("http://{}", listener.local_addr().unwrap());
+    let members = vec![
+        Node::new("holder", held_at.clone(), 1.0).unwrap(),
+        Node::new("other", "http://127.0.0.1:1", 1.0).unwrap(),
+    ];
+    let mut holder_config = config(cache.path(), "holder", &root);
+    holder_config.members = members;
+    let holder = Service::open(holder_config).await.unwrap();
+    let app = router(holder.clone());
+    let (status, body) = send(
+        &app,
+        "POST",
+        "/v1/streams",
+        json!({"name": STREAM, "primary_key": ["id"],
+               "columns": [{"name":"id","type":"int64"},{"name":"at","type":"int64"}]}),
+    )
+    .await;
+    assert!(
+        status == StatusCode::OK || body.contains("already exists"),
+        "define: {status} {body}"
+    );
+    let serving = tokio::spawn({
+        let app = app.clone();
+        async move {
+            let _ = axum::serve(listener, app).await;
+        }
+    });
+
+    // A row acknowledged and not flushed. The writer is now holding something
+    // nobody else can necessarily read, and must say so.
+    assert!(write_row(&app, 1).await.is_ok());
+
+    let uri = format!("{}/data/{STREAM}", root.trim_end_matches('/'));
+    let shard = walleye_lance::TableConfig::new(
+        STREAM,
+        uri.clone(),
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("at", DataType::Int64, false),
+        ])),
+        vec!["id".into()],
+    )
+    .unwrap();
+    let advertised = walleye_lance::open_tail_holder(
+        &walleye_lance::LanceStorageOptions::default(),
+        &uri,
+        shard.shard_id,
+        &shard.stream,
+    )
+    .await
+    .expect("reading the note");
+    assert_eq!(
+        advertised.as_deref(),
+        Some(held_at.as_str()),
+        "the note names the address a claimant should ask"
+    );
+
+    // Asking that address drains the stream, which is what makes the tail
+    // readable by anyone and takes the note down.
+    let cluster = walleye_node::cluster::Cluster::new(
+        "claimant".into(),
+        Arc::new(
+            walleye_ring::Membership::new(vec![
+                Node::new("holder", held_at.clone(), 1.0).unwrap(),
+            ])
+            .unwrap(),
+        ),
+        TOKEN.into(),
+    )
+    .unwrap();
+    cluster
+        .ask_to_flush(&held_at, STREAM)
+        .await
+        .expect("the holder flushes when asked");
+
+    let drained = walleye_lance::open_tail_holder(
+        &walleye_lance::LanceStorageOptions::default(),
+        &uri,
+        shard.shard_id,
+        &shard.stream,
+    )
+    .await
+    .expect("reading the note again");
+    assert_eq!(
+        drained, None,
+        "a drained stream leaves no note, so the next claimant just takes it"
+    );
+
+    holder.close().await;
+    serving.abort();
+}

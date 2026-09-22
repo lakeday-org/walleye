@@ -115,6 +115,10 @@ pub struct TableConfig {
     /// regardless of size. Defaults to [`Table::MEMTABLE_AGE`].
     pub memtable_max_age: Duration,
     pub text_indexes: Vec<TextIndexSpec>,
+    /// Where other processes can reach the daemon that opens this table, so a
+    /// writer that finds the stream held elsewhere can ask the holder to drain
+    /// rather than only refusing. `None` on a writer with no address to give.
+    pub holder: Option<String>,
 }
 impl TableConfig {
     pub fn new(
@@ -172,6 +176,7 @@ impl TableConfig {
             vector_indexes: Vec::new(),
             memtable_max_age: Table::MEMTABLE_AGE,
             text_indexes: Vec::new(),
+            holder: None,
         })
     }
     /// Smallest possible encoded row: fixed-width columns at their width,
@@ -190,6 +195,14 @@ impl TableConfig {
             .max(1)
     }
     /// Override how long the active memtable may hold rows before it rotates.
+    /// Advertise where this writer answers, for the note it leaves while it
+    /// holds an unflushed tail. See [`crate::open_tail`].
+    #[must_use]
+    pub fn with_holder(mut self, holder: impl Into<String>) -> Self {
+        self.holder = Some(holder.into());
+        self
+    }
+
     pub fn with_memtable_max_age(mut self, age: Duration) -> Self {
         self.memtable_max_age = age;
         self
@@ -677,6 +690,7 @@ impl Table {
         let note = crate::open_tail::OpenTail {
             after: 0,
             stream: self.config.stream.clone(),
+            holder: self.config.holder.clone(),
         };
         // A note that cannot be written is not worth failing a write over: it
         // costs a successor its safety check, and losing the write costs the
@@ -1024,13 +1038,47 @@ async fn reachable_tail(
         return Ok(());
     }
     Err(lance::Error::invalid_input(format!(
-        "stream {} has rows a writer acknowledged and no flush has covered, and they are not in \
-         the write-ahead log this writer reads. Opening here would serve the stream without \
-         them. Check point the writer that holds them - it is the one whose log has the tail - \
-         and any writer may take the stream afterwards.",
-        config.stream
+        "stream {} has rows a writer acknowledged and no flush has covered, and they are {}. \
+         Opening here would serve the stream without them. Check point the writer that holds \
+         them - it is the one whose log has the tail - and any writer may take the stream \
+         afterwards.",
+        config.stream, UNREACHABLE_TAIL
     )))
 }
+
+/// The address of the writer holding this stream's unflushed tail, if it left
+/// one and is reachable. A caller refused by [`reachable_tail`] asks this, then
+/// asks that address to flush.
+pub async fn open_tail_holder(
+    storage: &LanceStorageOptions,
+    uri: &str,
+    shard_id: Uuid,
+    stream: &str,
+) -> lance::Result<Option<String>> {
+    let dataset = match storage.open_dataset(uri).await {
+        Ok(dataset) => dataset,
+        Err(lance::Error::DatasetNotFound { .. }) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let store = dataset.object_store(None).await?;
+    let base = dataset.branch_location().path;
+    Ok(crate::open_tail::read(&store, &base, shard_id, stream)
+        .await?
+        .and_then(|note| note.holder))
+}
+
+/// Whether this error is the refusal [`reachable_tail`] raises, which a caller
+/// can resolve by getting the holder to flush rather than by giving up.
+#[must_use]
+pub fn is_unreachable_tail(error: &lance::Error) -> bool {
+    error
+        .to_string()
+        .contains(UNREACHABLE_TAIL)
+}
+
+/// The sentence both the refusal and its recogniser are built from, so they
+/// cannot drift apart.
+const UNREACHABLE_TAIL: &str = "not in the write-ahead log this writer reads";
 
 pub async fn prepare_bitr_takeover(
     storage: &LanceStorageOptions,

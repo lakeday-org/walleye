@@ -72,6 +72,17 @@ impl Cluster {
             .pool_idle_timeout(std::time::Duration::from_secs(5))
             .build()
     }
+    /// Where this node answers, as its peers know it. This is what a writer
+    /// advertises while it holds an unflushed tail, so a claimant can ask it
+    /// to drain instead of only being refused.
+    pub fn self_endpoint(&self) -> Option<String> {
+        self.ring
+            .snapshot()
+            .members()
+            .iter()
+            .find(|member| member.id == self.node_id)
+            .map(|member| member.endpoint.clone())
+    }
     /// The member that owns `stream`, or `None` when this node does.
     pub fn owner(&self, stream: &str) -> Option<Node> {
         let ring = self.ring.snapshot();
@@ -133,6 +144,42 @@ impl Cluster {
     /// the table across the network so this node can filter it. For a
     /// statement naming a single table, asking its owner to run the statement
     /// moves the answer rather than the table.
+    /// Ask whoever holds a stream to flush it, so its unflushed tail lands in
+    /// shared storage and any writer may take the stream.
+    ///
+    /// This is the cooperative half of a handover. The claim itself is a
+    /// compare-and-swap nobody can refuse, but a writer that has been fenced
+    /// can no longer flush - its manifest commit is rejected by epoch - so the
+    /// drain has to happen while the holder still holds it. Hence a request,
+    /// before the claim, rather than anything the claimant can do alone.
+    pub async fn ask_to_flush(&self, endpoint: &str, stream: &str) -> Result<(), String> {
+        let url = format!(
+            "{}/v1/table/{stream}/flush_lsm/",
+            endpoint.trim_end_matches('/')
+        );
+        let response = self
+            .client
+            .post(url)
+            .bearer_auth(&self.token)
+            // Deliberately no membership fingerprint. This is not a routed
+            // request and does not depend on the two sides agreeing about a
+            // ring: the whole point is to reach the writer holding a stream,
+            // which may be a node of another deployment entirely. Sending one
+            // would make every cross-deployment drain a 409.
+            .header(FORWARDED_HEADER, "1")
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .map_err(|error| format!("the writer holding {stream} is unreachable: {error}"))?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(format!(
+                "the writer holding {stream} refused to flush with {status}: {body}"
+            ));
+        }
+        Ok(())
+    }
     pub async fn run_sql(&self, owner: &Node, sql: &str) -> Result<bytes::Bytes, String> {
         let url = format!("{}/v1/query", owner.endpoint.trim_end_matches('/'));
         let response = self

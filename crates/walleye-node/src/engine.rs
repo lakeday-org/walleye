@@ -375,6 +375,9 @@ struct Stream {
     /// [`MIN_HOLD`]. Two writers racing drive this up and back each other off;
     /// one turn that lasts puts it back to nothing.
     contention: std::sync::atomic::AtomicU32,
+    /// How to reach peers, for asking the writer that holds a stream to flush
+    /// it. Absent on a node with no cluster, which then has nobody to ask.
+    cluster: Option<Cluster>,
 }
 impl Stream {
     /// Bytes this stream's writer may hold in memory: the memtable size and
@@ -475,41 +478,104 @@ impl Stream {
         let wait = spread / 2 + jitter(&self.definition.name) % spread.max(1);
         tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
     }
+    /// A refused claim this process can do something about.
+    ///
+    /// The refusal means the stream's acknowledged tail is in a log this
+    /// writer cannot read - another Bitr cluster, or a quorum where this node
+    /// has only the object store. Flushing puts those rows in shared storage,
+    /// and only the writer still holding the stream can flush them, because a
+    /// fenced writer's commit is rejected by epoch. So this asks it to, and
+    /// says whether the asking worked.
+    ///
+    /// Returns false for every other error, and for a tail whose holder left
+    /// no address, which is the case an operator has to settle by hand.
+    async fn drained_by_holder(&self, error: &Error) -> bool {
+        let Some(fault) = error.downcast_ref::<walleye_lance::LanceError>() else {
+            return false;
+        };
+        if !walleye_lance::is_unreachable_tail(fault) {
+            return false;
+        }
+        let Some(cluster) = &self.cluster else {
+            return false;
+        };
+        let holder = walleye_lance::open_tail_holder(
+            &self.storage,
+            &self.config.uri,
+            self.config.shard_id,
+            &self.config.stream,
+        )
+        .await;
+        let Ok(Some(holder)) = holder else {
+            eprintln!(
+                "walleye.storage open_tail stream={} outcome=held_elsewhere holder=unknown",
+                self.definition.name
+            );
+            return false;
+        };
+        match cluster.ask_to_flush(&holder, &self.definition.name).await {
+            Ok(()) => {
+                eprintln!(
+                    "walleye.storage open_tail stream={} outcome=drained_by_holder holder={holder}",
+                    self.definition.name
+                );
+                true
+            }
+            Err(why) => {
+                eprintln!(
+                    "walleye.storage open_tail stream={} outcome=holder_refused holder={holder} error={why}",
+                    self.definition.name
+                );
+                false
+            }
+        }
+    }
+
+    /// Build this writer's durability and claim the table.
+    ///
+    /// Separate from [`Self::table`] because a refused claim can sometimes be
+    /// made to succeed - by getting the writer that holds the stream to flush -
+    /// and the retry has to redo all of this: the Bitr identity is minted
+    /// against an epoch, and that epoch moves while we are asking.
+    async fn claim_table(&self) -> Result<Table, Error> {
+        let durability = match &self.bitr {
+            Some(writer) => {
+                if walleye_lance::prepare_bitr_takeover(
+                    &self.storage,
+                    &self.config.uri,
+                    self.config.shard_id,
+                    &self.config.stream,
+                    writer,
+                )
+                .await?
+                {
+                    eprintln!(
+                        "walleye.storage takeover stream={} outcome=reset_wal_positions",
+                        self.definition.name
+                    );
+                }
+                let epoch = walleye_lance::next_writer_epoch(
+                    &self.storage,
+                    &self.config.uri,
+                    self.config.shard_id,
+                )
+                .await?;
+                LanceDurability::Bitr(Arc::new(BitrWalBackend::new(
+                    writer.clone(),
+                    &self.config.stream,
+                    self.config.shard_id,
+                    epoch,
+                )?))
+            }
+            None => LanceDurability::ObjectStore,
+        };
+        Ok(Table::open(self.config.clone(), self.storage.clone(), durability).await?)
+    }
+
     async fn table(&self) -> Result<MappedMutexGuard<'_, Table>, Error> {
         *self.last_used.lock().await = Instant::now();
         let mut table = self.table.lock().await;
         if table.is_none() {
-            let durability = match &self.bitr {
-                Some(writer) => {
-                    if walleye_lance::prepare_bitr_takeover(
-                        &self.storage,
-                        &self.config.uri,
-                        self.config.shard_id,
-                        &self.config.stream,
-                        writer,
-                    )
-                    .await?
-                    {
-                        eprintln!(
-                            "walleye.storage takeover stream={} outcome=reset_wal_positions",
-                            self.definition.name
-                        );
-                    }
-                    let epoch = walleye_lance::next_writer_epoch(
-                        &self.storage,
-                        &self.config.uri,
-                        self.config.shard_id,
-                    )
-                    .await?;
-                    LanceDurability::Bitr(Arc::new(BitrWalBackend::new(
-                        writer.clone(),
-                        &self.config.stream,
-                        self.config.shard_id,
-                        epoch,
-                    )?))
-                }
-                None => LanceDurability::ObjectStore,
-            };
             // Fail closed before opening: a writer we cannot afford must not
             // exist. Memtable plus unflushed bound, plus the in-memory vector
             // graph sized for the memtable's row capacity.
@@ -518,8 +584,15 @@ impl Stream {
                 self.memory_footprint(),
             )?;
             *self.lease.lock().await = Some(lease);
-            *table =
-                Some(Table::open(self.config.clone(), self.storage.clone(), durability).await?);
+            let opened = match self.claim_table().await {
+                Err(error) if self.drained_by_holder(&error).await => {
+                    // The holder flushed, so the tail is in shared storage and
+                    // this writer can read it. Claim again from scratch.
+                    self.claim_table().await?
+                }
+                other => other?,
+            };
+            *table = Some(opened);
             *self.claimed_at.lock().await = Some(Instant::now());
         }
         Ok(MutexGuard::map(table, |table| {
@@ -662,7 +735,12 @@ impl Engine {
         Ok(engine)
     }
     async fn register(&self, definition: StreamDefinition) -> Result<Arc<Stream>, Error> {
-        let config = definition.table_config(&self.config.root_uri)?;
+        let mut config = definition.table_config(&self.config.root_uri)?;
+        // Say where this writer answers, so a process that finds the stream
+        // held here can ask it to drain rather than only being told no.
+        if let Some(endpoint) = self.cluster.as_ref().and_then(Cluster::self_endpoint) {
+            config = config.with_holder(endpoint);
+        }
         let mut streams = self.streams.lock().await;
         // A drop in flight owns this name until it finishes. Reinstating it
         // here would resurrect the stream the drop is removing.
@@ -685,6 +763,7 @@ impl Engine {
                 seq: Mutex::new(None),
                 claimed_at: Mutex::new(None),
                 contention: std::sync::atomic::AtomicU32::new(0),
+                cluster: self.cluster.clone(),
             })
         });
         Ok(stream.clone())

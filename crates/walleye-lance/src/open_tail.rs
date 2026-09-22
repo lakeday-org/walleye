@@ -35,6 +35,14 @@ pub struct OpenTail {
     pub after: u64,
     /// Which stream, for an operator reading this by hand.
     pub stream: String,
+    /// Where to reach the writer holding it, when it is reachable at all.
+    ///
+    /// A claimant that cannot read the tail does not have to give up: it can
+    /// ask this address to flush, which puts the rows in shared storage and
+    /// makes the stream takeable by anyone. Absent when the writer had no
+    /// address to advertise, in which case the only remedy is manual.
+    #[serde(default)]
+    pub holder: Option<String>,
 }
 
 /// Where the note lives: beside the shard's WAL rather than inside it, so the
@@ -65,6 +73,7 @@ pub async fn read(
         Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes).unwrap_or(OpenTail {
             after: 0,
             stream: stream.to_owned(),
+            holder: None,
         }))),
         Err(lance::Error::NotFound { .. }) => Ok(None),
         Err(e) => Err(e),
