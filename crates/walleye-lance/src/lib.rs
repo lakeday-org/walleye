@@ -40,7 +40,7 @@ pub use sql::{SnapshotSource, TableSnapshot, query, query_with_gathered, sql_tab
 pub use storage_options::LanceStorageOptions;
 pub use table::{
     LsmStats, ScanResult, SearchRequest, SsTableStats, Table, TableConfig, TextIndexSpec,
-    TextQuery, VectorIndexSpec, VectorQuery, is_unreachable_tail, next_writer_epoch,
+    TextQuery, VectorIndexSpec, VectorQuery, is_claim_race, is_unreachable_tail, next_writer_epoch,
     open_tail_holder, prepare_bitr_takeover,
 };
 pub type Error = WalBackendError;

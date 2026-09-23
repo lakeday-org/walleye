@@ -478,6 +478,12 @@ impl Stream {
         let wait = spread / 2 + jitter(&self.definition.name) % spread.max(1);
         tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
     }
+    /// How many times an open will re-read the manifest and claim again after
+    /// losing the race to another opener. Overlapping opens are ordinary - a
+    /// reconfigure reopening a stream while the warm-up opens it, for one - and
+    /// failing the request over one is a flake, not a fault.
+    const CLAIM_ATTEMPTS: usize = 5;
+
     /// A refused claim this process can do something about.
     ///
     /// The refusal means the stream's acknowledged tail is in a log this
@@ -584,13 +590,46 @@ impl Stream {
                 self.memory_footprint(),
             )?;
             *self.lease.lock().await = Some(lease);
-            let opened = match self.claim_table().await {
-                Err(error) if self.drained_by_holder(&error).await => {
-                    // The holder flushed, so the tail is in shared storage and
-                    // this writer can read it. Claim again from scratch.
-                    self.claim_table().await?
+            let mut opened = None;
+            for attempt in 0..Self::CLAIM_ATTEMPTS {
+                match self.claim_table().await {
+                    Ok(table) => {
+                        opened = Some(table);
+                        break;
+                    }
+                    Err(error) if self.drained_by_holder(&error).await => {
+                        // The holder flushed, so the tail is in shared storage
+                        // and this writer can read it. Claim again from
+                        // scratch: the epoch has moved while we were asking.
+                        continue;
+                    }
+                    // Two opens overlapping, one of which committed the epoch
+                    // first. Nothing is wrong and nothing was fenced; the
+                    // manifest moved under this one, and reading it again
+                    // gives a claim that works.
+                    Err(error)
+                        if attempt + 1 < Self::CLAIM_ATTEMPTS
+                            && error
+                                .downcast_ref::<walleye_lance::LanceError>()
+                                .is_some_and(walleye_lance::is_claim_race) =>
+                    {
+                        // Count it as contention so the wait is a real one:
+                        // two opens that retry the instant they lose simply
+                        // race again, and the backoff exists to stagger them.
+                        self.contention.fetch_add(1, Ordering::AcqRel);
+                        self.wait_before_reclaiming().await;
+                        continue;
+                    }
+                    Err(error) => return Err(error),
                 }
-                other => other?,
+            }
+            let Some(opened) = opened else {
+                return Err(Box::new(walleye_lance::LanceError::io(format!(
+                    "could not claim the writer for {} after {} attempts; another opener keeps \
+                     winning the race",
+                    self.definition.name,
+                    Self::CLAIM_ATTEMPTS
+                ))));
             };
             *table = Some(opened);
             *self.claimed_at.lock().await = Some(Instant::now());

@@ -1098,6 +1098,21 @@ pub fn is_unreachable_tail(error: &lance::Error) -> bool {
 /// cannot drift apart.
 const UNREACHABLE_TAIL: &str = "not in the write-ahead log this writer reads";
 
+/// Whether this error is two openers racing for the same writer epoch rather
+/// than anything being wrong.
+///
+/// Claiming is a compare-and-swap on the shard manifest. When two opens
+/// overlap, as a reconfigure reopening a stream does with the warm-up opening
+/// it, one commits the epoch and the other finds it taken. The loser has not
+/// been fenced and nothing is damaged: the manifest simply moved under it, and
+/// reading it again gives a claim that works. Worth retrying, and no use
+/// reporting.
+#[must_use]
+pub fn is_claim_race(error: &lance::Error) -> bool {
+    let said = error.to_string();
+    said.contains("another writer claimed epoch")
+        || (said.contains("Failed to claim shard") && said.contains("already exists"))
+}
 
 pub async fn prepare_bitr_takeover(
     storage: &LanceStorageOptions,

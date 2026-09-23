@@ -574,3 +574,59 @@ async fn a_writer_holding_a_tail_says_where_it_answers_and_drains_when_asked() {
     holder.close().await;
     serving.abort();
 }
+
+/// Two opens of one stream overlapping, which is ordinary rather than
+/// exceptional: a reconfigure reopens a stream while the warm-up is opening
+/// it, and both claim the writer epoch.
+///
+/// One of them commits first and the other finds the epoch taken. Nothing has
+/// been fenced and nothing is damaged - the manifest moved under it - so the
+/// loser re-reads and claims again rather than failing a request. This used to
+/// surface as an unrelated test failing at random with "another writer claimed
+/// epoch 2 (>= our target 2)".
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn opens_that_overlap_retry_instead_of_failing() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = format!("file://{}/store", dir.path().display());
+    let cache = tempfile::tempdir().unwrap();
+    let (service, app) = process(cache.path(), "solo", &root).await;
+
+    // Reconfiguring drops the writer and opens a fresh one; doing it while
+    // writes are in flight is what puts two opens on the same stream.
+    let mut flight = tokio::task::JoinSet::new();
+    for id in 0..12 {
+        let app = app.clone();
+        flight.spawn(async move { write_row(&app, id).await });
+    }
+    for round in 0..4 {
+        let (status, body) = send(
+            &app,
+            "POST",
+            &format!("/v1/table/{STREAM}/create_index/"),
+            json!({"column": "at", "index_type": "FTS", "name": format!("at_{round}")}),
+        )
+        .await;
+        // Indexing a numeric column is refused on its merits, which is fine:
+        // the reopen it does first is the part that races.
+        assert_ne!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a reconfigure must not fail on a claim race: {body}"
+        );
+        assert!(
+            !body.contains("another writer claimed epoch"),
+            "a lost claim race is retried, not reported: {body}"
+        );
+    }
+    let mut refused = Vec::new();
+    while let Some(done) = flight.join_next().await {
+        if let Err(why) = done.expect("a write finished") {
+            refused.push(why);
+        }
+    }
+    service.close().await;
+    assert!(
+        refused.is_empty(),
+        "writes survive a reconfigure racing them: {refused:?}"
+    );
+}
