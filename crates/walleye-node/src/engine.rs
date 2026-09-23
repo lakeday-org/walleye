@@ -189,7 +189,7 @@ pub(crate) fn now_micros() -> u64 {
 }
 /// The Arrow type a column kind is stored as. `json` is text holding the value
 /// exactly as it arrived; `decimal` keeps nine places, which is every
-/// currency; `timestamp` is microseconds in UTC.
+/// currency; `timestamp` is microseconds in UTC; `vector:N` is N floats.
 pub(crate) fn storage_type(kind: &str) -> Option<DataType> {
     Some(match kind {
         "string" | "json" => DataType::Utf8,
@@ -201,6 +201,11 @@ pub(crate) fn storage_type(kind: &str) -> Option<DataType> {
             crate::ingest::literal::DECIMAL_SCALE as i8,
         ),
         "timestamp" => DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("UTC".into())),
+        // A vector of this many floats, the shape a vector index searches.
+        vector if vector.starts_with("vector:") => {
+            let width: i32 = vector["vector:".len()..].parse().ok().filter(|w| *w > 0)?;
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), width)
+        }
         _ => return None,
     })
 }
@@ -322,7 +327,8 @@ impl StreamDefinition {
                     return Err(format!("column {} uses a reserved name", c.name).into());
                 }
                 let t = storage_type(&c.kind).ok_or(
-                    "type must be string, int64, float64, boolean, decimal, timestamp, or json",
+                    "type must be string, int64, float64, boolean, decimal, timestamp, json, or \
+                     vector:N",
                 )?;
                 if c.nullable && self.primary_key.contains(&c.name) {
                     return Err("primary key must be non-nullable".into());

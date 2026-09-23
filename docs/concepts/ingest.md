@@ -94,6 +94,37 @@ confidence) or there's no judge configured, the safe choice is made instead. Saf
 - optional rather than required
 - a value that doesn't fit is kept aside rather than refused
 
+## Search by meaning
+
+With an embedding model configured (see
+[Configuration](../self-hosting/configuration.md#embeddings)), a text column
+worth searching by meaning gets a vector column beside it, `review_embedding`
+next to `review`, with a cosine vector index.
+
+Which columns qualify is decided once per column, like everything else:
+
+- Code rules out what isn't prose: anything that isn't text, the key, and
+  short values like codes, names and labels.
+- Paragraphs of words are embedded without asking anyone.
+- A sentence that could be either, like a one-line issue description, goes to
+  Jev.
+
+Writing a row doesn't wait on the embedding model. Texts are embedded in
+batches as rows are written, and each distinct text is sent only once. If the
+model is slow or down, the rows are written anyway with their vectors empty
+(`unembedded` in the response), and the next request for that table fills them
+in. A rebuild keeps the vectors the table already has, so it doesn't re-embed
+every row.
+
+Search with any LanceDB client, naming the column:
+
+```python
+table.search(embed("box arrived damaged"), vector_column_name="review_embedding").limit(5)
+```
+
+The query text has to be embedded with the same model the table used. The
+table's rule records which model that is.
+
 ## When records change shape
 
 | What arrives | What happens |
@@ -115,7 +146,7 @@ digit.
 | `ingest_bronze` | every record, as it arrived |
 | `ingest_quarantine` | records that were refused, with the reason |
 | `ingest/routes/{source}.json` | which table each source goes to |
-| `ingest/tables/{table}.json` | each table's rule, and the history of what was decided and by whom |
+| `ingest/tables/{table}.json` | each table's rule: columns, key, which text is embedded and by which model, and the history of what was decided and by whom |
 
 ## Limits
 
@@ -127,3 +158,8 @@ digit.
   rarely after, but it's proportional to what bronze holds.
 - On a cluster, ingest runs on the node that receives the request, and that
   node needs to own the typed table.
+- Embedding a query is the client's job for now. Walleye doesn't yet embed
+  search text for you.
+- Switching embedding models doesn't re-embed an existing table. Its vectors
+  stay with the model that made them, and new rows aren't embedded until the
+  models match again.

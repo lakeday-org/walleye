@@ -29,6 +29,7 @@
 //! Some limits are code rather than judgement, because a judge that is wrong
 //! once must not be able to cause damage a rebuild cannot undo: a key column
 //! is never optional, and a table never grows past [`MAX_COLUMNS`].
+pub mod embed;
 pub mod literal;
 
 use crate::engine::{Column, Engine, StreamDefinition};
@@ -138,6 +139,26 @@ pub struct TableRule {
     /// What was decided, by whom, and how sure it was. Newest last.
     #[serde(default)]
     pub history: Vec<Change>,
+    /// Text columns that carry a vector, for searching by meaning.
+    #[serde(default)]
+    pub embeddings: Vec<Embedding>,
+    /// Text columns already considered for embedding, embedded or not. Each
+    /// is decided once; after that the rule decides.
+    #[serde(default)]
+    pub embed_considered: Vec<String>,
+}
+
+/// One text column's vector.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct Embedding {
+    /// The text column the vector is made from.
+    pub source: String,
+    /// The vector column, beside it in the same table.
+    pub column: String,
+    /// The model that made it. Vectors from two models cannot be compared,
+    /// so a table's vectors all come from this one.
+    pub model: String,
+    pub dimensions: usize,
 }
 
 /// One decision, as the rule remembers it and a response reports it.
@@ -173,6 +194,13 @@ pub struct Report {
     pub rescued: usize,
     /// The table was rebuilt from bronze to take a new column or type.
     pub rebuilt: bool,
+    /// Rows given vectors by this request, including ones filled in that an
+    /// earlier request had to write without.
+    pub embedded: usize,
+    /// Rows this request wrote whose text is still waiting for a vector,
+    /// because the embedding model did not answer. The next request for the
+    /// table fills them in.
+    pub unembedded: usize,
     pub changes: Vec<Change>,
 }
 
@@ -472,6 +500,13 @@ fn definition(rule: &TableRule) -> StreamDefinition {
             nullable: column.name != key,
         });
     }
+    for embedding in &rule.embeddings {
+        columns.push(Column {
+            name: embedding.column.clone(),
+            kind: format!("vector:{}", embedding.dimensions),
+            nullable: true,
+        });
+    }
     columns.push(Column {
         name: EXTRA.into(),
         kind: "json".into(),
@@ -482,7 +517,15 @@ fn definition(rule: &TableRule) -> StreamDefinition {
         columns,
         primary_key: vec![key],
         schema: None,
-        vector_indexes: Vec::new(),
+        vector_indexes: rule
+            .embeddings
+            .iter()
+            .map(|e| walleye_lance::VectorIndexSpec {
+                name: format!("{}_idx", e.column),
+                column: e.column.clone(),
+                metric: "cosine".into(),
+            })
+            .collect(),
         text_indexes: Vec::new(),
     }
 }
@@ -581,6 +624,11 @@ pub async fn ingest(
         objects.iter().filter_map(|a| a.fields.as_ref()).collect();
     let evolved = evolve(engine, &mut rule, source, &records).await;
     changes.extend(evolved.changes.iter().cloned());
+    // Which text is worth searching by meaning, once the columns are settled.
+    let embedder = embed::Embedder::from_env();
+    let (planned, embedding_added) =
+        plan_embeddings(embedder.as_ref(), &mut rule, source, &records).await;
+    changes.extend(planned);
     for (index, reason) in &evolved.quarantine {
         quarantine.push((objects[*index], reason.clone()));
     }
@@ -616,23 +664,41 @@ pub async fn ingest(
         .filter(|a| !refused.contains(a.id.as_str()))
         .collect();
 
-    let rebuilt = created || evolved.reshaped;
-    if created || evolved.reshaped {
+    let rebuilt = created || evolved.reshaped || embedding_added;
+    if rebuilt {
         rule.version += 1;
     }
     save(engine, "tables", &rule.table, &rule).await?;
 
-    let rescued;
+    let (rescued, embedded, unembedded);
     if rebuilt {
         // The table is made again from bronze, which already holds this
         // request's records, so they arrive with everything else.
         rescued = accepted.iter().filter(|a| row(&rule, a).1).count();
-        rebuild(engine, &rule).await?;
+        let built = rebuild(engine, &rule, embedder.as_ref()).await?;
+        embedded = built.embedded;
+        unembedded = built.awaiting;
     } else {
-        let (batch, extra) = batch(&rule, &accepted)?;
-        rescued = extra;
-        if batch.num_rows() > 0 {
-            engine.append(&rule.table, vec![batch]).await?;
+        // Vectors an earlier request could not get, first, so a newer
+        // version of a key in this batch is the one that lands last.
+        let repaired = repair(engine, &rule, embedder.as_ref()).await;
+        let mut known = HashMap::new();
+        if let Some(why) = vectors_for(
+            embedder.as_ref(),
+            &rule,
+            texts(&rule, &accepted),
+            &mut known,
+        )
+        .await
+        {
+            changes.push(by_rule("embedding".into(), format!("deferred: {why}")));
+        }
+        let built = batch(&rule, &accepted, &known)?;
+        rescued = built.rescued;
+        embedded = built.embedded + repaired;
+        unembedded = built.awaiting;
+        if built.batch.num_rows() > 0 {
+            engine.append(&rule.table, vec![built.batch]).await?;
         }
     }
 
@@ -644,6 +710,8 @@ pub async fn ingest(
         quarantined: quarantine.len(),
         rescued,
         rebuilt,
+        embedded,
+        unembedded,
         changes,
     })
 }
@@ -1004,6 +1072,8 @@ async fn design(
             keys_are_data,
             sources: vec![source.to_owned()],
             history: Vec::new(),
+            embeddings: Vec::new(),
+            embed_considered: Vec::new(),
         },
         changes,
     ))
@@ -1061,7 +1131,10 @@ async fn evolve(
         }
         for record in records {
             for (key, value) in record.iter() {
-                if find(rule, key).is_none() && column_name(key) {
+                if find(rule, key).is_none()
+                    && column_name(key)
+                    && !rule.embeddings.iter().any(|e| &e.column == key)
+                {
                     if !values.contains_key(key.as_str()) {
                         order.push(key.as_str());
                     }
@@ -1580,9 +1653,53 @@ fn raw_json(value: &Literal) -> Box<RawValue> {
         .unwrap_or_else(|_| RawValue::from_string("null".into()).expect("null is JSON"))
 }
 
-/// Records as one Arrow batch in the table's column order, and how many of
-/// them kept something in the catch-all.
-fn batch(rule: &TableRule, records: &[&Arrived]) -> Result<(RecordBatch, usize), Error> {
+/// Records as one Arrow batch in the table's column order.
+struct Built {
+    batch: RecordBatch,
+    /// Rows that kept something in the catch-all.
+    rescued: usize,
+    /// Rows with at least one vector.
+    embedded: usize,
+    /// Rows with text that has no vector yet.
+    awaiting: usize,
+}
+
+/// The text a record gives each embedded column, where it gives one worth
+/// embedding. Blank text is not: a model refuses it, and it means nothing.
+fn embeddable(rule: &TableRule, values: &[Option<Value>]) -> Vec<Option<String>> {
+    rule.embeddings
+        .iter()
+        .map(|embedding| {
+            let at = rule
+                .columns
+                .iter()
+                .position(|c| c.name == embedding.source)?;
+            match values.get(at)? {
+                Some(Value::Text(text)) if !text.trim().is_empty() => Some(text.clone()),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+/// Every distinct text these records would embed.
+fn texts(rule: &TableRule, records: &[&Arrived]) -> BTreeSet<String> {
+    if rule.embeddings.is_empty() {
+        return BTreeSet::new();
+    }
+    records
+        .iter()
+        .flat_map(|record| embeddable(rule, &row(rule, record).0))
+        .flatten()
+        .collect()
+}
+
+fn batch(
+    rule: &TableRule,
+    records: &[&Arrived],
+    vectors: &HashMap<String, Vec<f32>>,
+) -> Result<Built, Error> {
+    use arrow_array::builder::{FixedSizeListBuilder, Float32Builder};
     let definition = definition(rule);
     let mut ids = StringBuilder::new();
     let mut extras = StringBuilder::new();
@@ -1591,18 +1708,52 @@ fn batch(rule: &TableRule, records: &[&Arrived]) -> Result<(RecordBatch, usize),
         .iter()
         .map(|c| fill_for(Kind::from_name(&c.kind).unwrap_or(Kind::String)))
         .collect();
-    let mut rescued = 0;
+    let mut lists: Vec<FixedSizeListBuilder<Float32Builder>> = rule
+        .embeddings
+        .iter()
+        .map(|e| {
+            FixedSizeListBuilder::new(Float32Builder::new(), e.dimensions as i32).with_field(
+                Arc::new(Field::new("item", arrow_schema::DataType::Float32, true)),
+            )
+        })
+        .collect();
+    let (mut rescued, mut embedded, mut awaiting) = (0, 0, 0);
     for record in records {
         let (values, kept, extra) = row(rule, record);
+        let wanted = embeddable(rule, &values);
         ids.append_value(&record.id);
         for (builder, value) in builders.iter_mut().zip(values) {
             builder.push(value);
         }
+        let (mut has, mut lacks) = (false, false);
+        for ((list, embedding), text) in lists.iter_mut().zip(&rule.embeddings).zip(wanted) {
+            let vector = text
+                .as_ref()
+                .and_then(|t| vectors.get(t))
+                .filter(|v| v.len() == embedding.dimensions);
+            match vector {
+                Some(vector) => {
+                    list.values().append_slice(vector);
+                    list.append(true);
+                    has = true;
+                }
+                None => {
+                    for _ in 0..embedding.dimensions {
+                        list.values().append_null();
+                    }
+                    list.append(false);
+                    lacks |= text.is_some();
+                }
+            }
+        }
         extras.append_option(extra);
         rescued += kept as usize;
+        embedded += has as usize;
+        awaiting += lacks as usize;
     }
     let mut columns: Vec<ArrayRef> = vec![Arc::new(ids.finish())];
     columns.extend(builders.iter_mut().map(|b| b.finish()));
+    columns.extend(lists.iter_mut().map(|l| Arc::new(l.finish()) as ArrayRef));
     columns.push(Arc::new(extras.finish()));
     let fields: Vec<Field> = definition
         .columns
@@ -1615,10 +1766,288 @@ fn batch(rule: &TableRule, records: &[&Arrived]) -> Result<(RecordBatch, usize),
             )
         })
         .collect();
-    Ok((
-        RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)?,
+    Ok(Built {
+        batch: RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)?,
         rescued,
-    ))
+        embedded,
+        awaiting,
+    })
+}
+
+// --- embedding ----------------------------------------------------------------
+
+/// Embed whatever of these texts is not already known. Returns why it could
+/// not, when it could not: the rows are then written without their vectors,
+/// and filled in by a later request, because ingestion does not wait on a
+/// model that is slow or down.
+async fn vectors_for(
+    embedder: Option<&embed::Embedder>,
+    rule: &TableRule,
+    texts: BTreeSet<String>,
+    known: &mut HashMap<String, Vec<f32>>,
+) -> Option<String> {
+    let embedder = embedder?;
+    if rule.embeddings.is_empty() {
+        return None;
+    }
+    if let Some(other) = rule.embeddings.iter().find(|e| e.model != embedder.model) {
+        return Some(format!(
+            "this table's vectors come from {}, and {} is configured; vectors from two \
+             models cannot be compared",
+            other.model, embedder.model
+        ));
+    }
+    let missing: Vec<String> = texts
+        .into_iter()
+        .filter(|t| !known.contains_key(t))
+        .collect();
+    if missing.is_empty() {
+        return None;
+    }
+    match embedder.embed(&missing).await {
+        Ok(vectors) => {
+            known.extend(missing.into_iter().zip(vectors));
+            None
+        }
+        Err(error) => {
+            eprintln!(
+                "walleye.ingest embed table={} outcome=deferred error={error}",
+                rule.table
+            );
+            Some(error.to_string())
+        }
+    }
+}
+
+/// Decide which text columns carry a vector. Each column is decided once and
+/// remembered; after that the rule decides.
+///
+/// Code rules out what is not prose - codes, names, labels, short values -
+/// and embeds what plainly is, paragraphs of words, without asking anybody.
+/// What is left, a sentence that might be a note or might be a title, is the
+/// judge's. Returns whether a vector column was added, which is a rebuild.
+async fn plan_embeddings(
+    embedder: Option<&embed::Embedder>,
+    rule: &mut TableRule,
+    source: &str,
+    records: &[&BTreeMap<String, Literal>],
+) -> (Vec<Change>, bool) {
+    let mut changes = Vec::new();
+    let Some(embedder) = embedder else {
+        return (changes, false);
+    };
+    if rule.embeddings.iter().any(|e| e.model != embedder.model) || rule.keys_are_data {
+        return (changes, false);
+    }
+    let mut clearly: Vec<String> = Vec::new();
+    let mut maybe: Vec<String> = Vec::new();
+    let mut considered: Vec<String> = Vec::new();
+    for column in &rule.columns {
+        if column.kind != Kind::String.name()
+            || Some(&column.name) == rule.primary_key.as_ref()
+            || rule.embed_considered.contains(&column.name)
+        {
+            continue;
+        }
+        let seen: Vec<&str> = records
+            .iter()
+            .filter_map(|record| {
+                std::iter::once(&column.name)
+                    .chain(column.aliases.iter())
+                    .find_map(|name| match record.get(name) {
+                        Some(Literal::Text(text)) => Some(text.as_str()),
+                        _ => None,
+                    })
+            })
+            .collect();
+        // Nothing to judge by yet; decide when there is.
+        if seen.is_empty() {
+            continue;
+        }
+        match embed::prose(&seen) {
+            embed::Prose::No => considered.push(column.name.clone()),
+            embed::Prose::Clearly => clearly.push(column.name.clone()),
+            embed::Prose::Maybe => maybe.push(column.name.clone()),
+        }
+    }
+
+    let mut questions = BTreeMap::new();
+    for (index, name) in maybe.iter().enumerate() {
+        questions.insert(
+            format!("embed_{index}"),
+            Question::noul(format!(
+                "The field \"{name}\" holds free text that someone would want to search by \
+                 meaning - a description, a message, a review, a note - rather than a name, a \
+                 title, a code or a label."
+            )),
+        );
+    }
+    let answers = if questions.is_empty() {
+        HashMap::new()
+    } else {
+        ask(&describe(source, records), questions).await
+    };
+
+    let mut wanted: Vec<(String, Change)> = clearly
+        .into_iter()
+        .map(|name| {
+            let change = by_rule(format!("embed {name}"), "true".into());
+            (name, change)
+        })
+        .collect();
+    for (index, name) in maybe.iter().enumerate() {
+        let key = format!("embed_{index}");
+        match decided(&answers, &key) {
+            Some((true, confidence)) => {
+                wanted.push((
+                    name.clone(),
+                    by_judge(format!("embed {name}"), "true".into(), confidence),
+                ));
+            }
+            Some((false, confidence)) => {
+                changes.push(by_judge(
+                    format!("embed {name}"),
+                    "false".into(),
+                    confidence,
+                ));
+                considered.push(name.clone());
+            }
+            // Answered but unsure: not embedded, and not asked again. With no
+            // answer at all the judge was not there, and it is asked next time.
+            None if answers.contains_key(&key) => {
+                changes.push(by_rule(format!("embed {name}"), "false".into()));
+                considered.push(name.clone());
+            }
+            None => {}
+        }
+    }
+    rule.embed_considered.extend(considered);
+    if wanted.is_empty() {
+        return (changes, false);
+    }
+
+    // The width of a vector column is fixed when the table is made, so learn
+    // it now; a table already embedding with this model knows it.
+    let dimensions = match rule.embeddings.first() {
+        Some(existing) => existing.dimensions,
+        None => match embedder.dimensions().await {
+            Ok(width) => width,
+            Err(error) => {
+                // Not recorded as considered, so it is tried again next time.
+                changes.push(by_rule("embedding".into(), format!("unavailable: {error}")));
+                return (changes, false);
+            }
+        },
+    };
+    for (name, change) in wanted {
+        let taken = |candidate: &str| {
+            rule.columns.iter().any(|c| c.name == candidate)
+                || rule.embeddings.iter().any(|e| e.column == candidate)
+                || candidate == ID
+                || candidate == EXTRA
+        };
+        let mut column = format!("{name}_embedding");
+        let mut n = 2;
+        while taken(&column) {
+            column = format!("{name}_embedding_{n}");
+            n += 1;
+        }
+        rule.embeddings.push(Embedding {
+            source: name.clone(),
+            column,
+            model: embedder.model.clone(),
+            dimensions,
+        });
+        rule.embed_considered.push(name);
+        changes.push(change);
+    }
+    (changes, true)
+}
+
+fn quote(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// Fill in vectors an earlier request had to write without, because the model
+/// did not answer then. Bounded per request, so a long outage is caught up a
+/// piece at a time rather than all at once on whoever writes first.
+///
+/// Rows are rewritten from their bronze records under the table's lock, so the
+/// row replaced is the one that was read: no newer version of a key can have
+/// arrived in between.
+async fn repair(engine: &Engine, rule: &TableRule, embedder: Option<&embed::Embedder>) -> usize {
+    if rule.embeddings.is_empty() || embedder.is_none() {
+        return 0;
+    }
+    let gaps: Vec<String> = rule
+        .embeddings
+        .iter()
+        .map(|e| {
+            format!(
+                "({v} IS NULL AND {t} IS NOT NULL AND trim({t}) <> '')",
+                v = quote(&e.column),
+                t = quote(&e.source)
+            )
+        })
+        .collect();
+    let sql = format!(
+        "SELECT {ID} AS id FROM {} WHERE {} LIMIT 256",
+        quote(&rule.table),
+        gaps.join(" OR ")
+    );
+    let Ok(bytes) = engine.query(&sql).await else {
+        return 0;
+    };
+    let ids: Vec<String> = serde_json::from_slice::<Vec<serde_json::Value>>(&bytes)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|r| r.get("id")?.as_str().map(str::to_owned))
+        .filter(|id| id.bytes().all(|b| b.is_ascii_hexdigit()))
+        .collect();
+    if ids.is_empty() {
+        return 0;
+    }
+    let listed = ids
+        .iter()
+        .map(|id| format!("'{id}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!("SELECT {ID} AS id, source, record FROM {BRONZE} WHERE {ID} IN ({listed})");
+    let Ok(bytes) = engine.query(&sql).await else {
+        return 0;
+    };
+    let arrived =
+        arrivals(&serde_json::from_slice::<Vec<serde_json::Value>>(&bytes).unwrap_or_default());
+    let refs: Vec<&Arrived> = arrived.iter().collect();
+    let mut known = HashMap::new();
+    if vectors_for(embedder, rule, texts(rule, &refs), &mut known)
+        .await
+        .is_some()
+    {
+        return 0;
+    }
+    let Ok(built) = batch(rule, &refs, &known) else {
+        return 0;
+    };
+    if built.batch.num_rows() == 0 || engine.append(&rule.table, vec![built.batch]).await.is_err() {
+        return 0;
+    }
+    built.embedded
+}
+
+/// Bronze rows as records, keeping the ids they were given when they arrived.
+fn arrivals(rows: &[serde_json::Value]) -> Vec<Arrived> {
+    rows.iter()
+        .filter_map(|row| {
+            let source = row.get("source")?.as_str()?;
+            let record = row.get("record")?.as_str()?;
+            let raw = RawValue::from_string(record.to_owned()).ok()?;
+            let mut arrived = Arrived::new(source, &raw);
+            arrived.id = row.get("id")?.as_str()?.to_owned();
+            Some(arrived)
+        })
+        .filter(|a| a.fields.is_some())
+        .collect()
 }
 
 /// A column builder that takes converted values.
@@ -1720,9 +2149,51 @@ impl Fill for StringBuilder {
 /// a column to generations that already exist, and bronze holds every record
 /// every source mapped to this table ever sent, byte for byte. Records that
 /// were refused stay refused.
-pub async fn rebuild(engine: &Engine, rule: &TableRule) -> Result<usize, Error> {
+async fn rebuild(
+    engine: &Engine,
+    rule: &TableRule,
+    embedder: Option<&embed::Embedder>,
+) -> Result<Built, Error> {
+    // Vectors the table already holds are kept, keyed by the text they were
+    // made from, so a rebuild for a new column does not pay to embed every
+    // row again. A column that is new to embedding has none to keep.
+    let mut known: HashMap<String, Vec<f32>> = HashMap::new();
+    for embedding in &rule.embeddings {
+        let sql = format!(
+            "SELECT {t} AS text, {v} AS vector FROM {table} WHERE {v} IS NOT NULL",
+            t = quote(&embedding.source),
+            v = quote(&embedding.column),
+            table = quote(&rule.table)
+        );
+        let Ok(bytes) = engine.query(&sql).await else {
+            continue;
+        };
+        for row in serde_json::from_slice::<Vec<serde_json::Value>>(&bytes).unwrap_or_default() {
+            let (Some(text), Some(vector)) = (
+                row.get("text").and_then(|t| t.as_str()),
+                row.get("vector").and_then(|v| v.as_array()),
+            ) else {
+                continue;
+            };
+            let vector: Vec<f32> = vector
+                .iter()
+                .filter_map(|x| x.as_f64())
+                .map(|x| x as f32)
+                .collect();
+            if vector.len() == embedding.dimensions {
+                known.insert(text.to_owned(), vector);
+            }
+        }
+    }
+
     let _ = engine.drop_table(&rule.table).await;
     engine.define_with(definition(rule), false).await?;
+    let mut total = Built {
+        batch: RecordBatch::new_empty(Arc::new(Schema::empty())),
+        rescued: 0,
+        embedded: 0,
+        awaiting: 0,
+    };
     let quoted: Vec<String> = rule
         .sources
         .iter()
@@ -1730,7 +2201,7 @@ pub async fn rebuild(engine: &Engine, rule: &TableRule) -> Result<usize, Error> 
         .map(|s| format!("'{s}'"))
         .collect();
     if quoted.is_empty() {
-        return Ok(0);
+        return Ok(total);
     }
     let sources = quoted.join(", ");
     let table = rule.table.replace('\'', "''");
@@ -1743,29 +2214,21 @@ pub async fn rebuild(engine: &Engine, rule: &TableRule) -> Result<usize, Error> 
     );
     let bytes = engine.query(&sql).await?;
     let rows: Vec<serde_json::Value> = serde_json::from_slice(&bytes)?;
-    let mut written = 0;
     for chunk in rows.chunks(2048) {
-        let arrived: Vec<Arrived> = chunk
-            .iter()
-            .filter_map(|row| {
-                let source = row.get("source")?.as_str()?;
-                let record = row.get("record")?.as_str()?;
-                let raw = RawValue::from_string(record.to_owned()).ok()?;
-                let mut arrived = Arrived::new(source, &raw);
-                // The id was computed when it arrived; keep that one.
-                arrived.id = row.get("id")?.as_str()?.to_owned();
-                Some(arrived)
-            })
-            .filter(|a| a.fields.is_some())
-            .collect();
+        let arrived = arrivals(chunk);
         let refs: Vec<&Arrived> = arrived.iter().collect();
-        let (batch, _) = batch(rule, &refs)?;
-        if batch.num_rows() > 0 {
-            written += batch.num_rows();
-            engine.append(&rule.table, vec![batch]).await?;
+        // A model that does not answer leaves these rows waiting for their
+        // vectors, like any other write; the rebuild itself goes ahead.
+        let _ = vectors_for(embedder, rule, texts(rule, &refs), &mut known).await;
+        let built = batch(rule, &refs, &known)?;
+        total.rescued += built.rescued;
+        total.embedded += built.embedded;
+        total.awaiting += built.awaiting;
+        if built.batch.num_rows() > 0 {
+            engine.append(&rule.table, vec![built.batch]).await?;
         }
     }
-    Ok(written)
+    Ok(total)
 }
 
 #[cfg(test)]
@@ -1828,6 +2291,8 @@ mod tests {
             keys_are_data: false,
             sources: vec!["s".into()],
             history: Vec::new(),
+            embeddings: Vec::new(),
+            embed_considered: Vec::new(),
         };
         let (_, rescued, extra) = row(&rule, &arrived);
         assert!(rescued);

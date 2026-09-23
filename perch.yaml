@@ -187,3 +187,12 @@
     a judge said so, or because a judge was unavailable. Records keyed by ids
     would otherwise make one column per id, and the cap is what stops a single
     wrong call doing that.
+
+- name: ingestion-never-waits-on-the-embedding-model
+  where: "crates/walleye-node/src/ingest.rs"
+  ensure_absent: >
+    A path where an embedding model that is slow, down or refusing makes an
+    ingest request fail or leaves its rows unwritten. Rows are written with
+    their vectors empty and filled in later. A search index that is behind
+    for a while is a far smaller failure than a stream that stops accepting
+    rows.
