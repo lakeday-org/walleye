@@ -155,10 +155,7 @@ impl Engine {
         };
         let decider = walleye_typesafe::Client::from_env();
         let schema = self.catalog_ddl().await?;
-        let me = self
-            .cluster()
-            .map(|c| c.node_id.clone())
-            .unwrap_or_else(|| "local".to_owned());
+        let me = self.ownership().node();
 
         let mut refused: Vec<Refusal> = Vec::new();
         let mut written = None;
@@ -196,20 +193,15 @@ impl Engine {
         // A statement over a single table runs where that table lives; one
         // spanning owners runs here and gathers what it does not own.
         let mut ran_on = me.clone();
-        let bytes = match self.cluster() {
-            Some(cluster) => {
-                let named = walleye_lance::sql_table_names(&draft.sql).unwrap_or_default();
-                match named.first().filter(|_| named.len() == 1) {
-                    Some(table) => match cluster.owner(table) {
-                        Some(owner) => {
-                            ran_on = owner.id.clone();
-                            cluster.run_sql(&owner, &draft.sql).await?
-                        }
-                        None => bytes::Bytes::from(self.query(&draft.sql).await?),
-                    },
-                    None => bytes::Bytes::from(self.query(&draft.sql).await?),
+        let named = walleye_lance::sql_table_names(&draft.sql).unwrap_or_default();
+        let bytes = match named.first().filter(|_| named.len() == 1) {
+            Some(table) => match self.route(table, false).await? {
+                crate::ownership::Route::Remote { peer, .. } => {
+                    ran_on = peer.node.clone();
+                    self.cluster().run_sql(&peer, &draft.sql).await?
                 }
-            }
+                _ => bytes::Bytes::from(self.query(&draft.sql).await?),
+            },
             None => bytes::Bytes::from(self.query(&draft.sql).await?),
         };
         let rows: Vec<serde_json::Value> = serde_json::from_slice(&bytes)?;

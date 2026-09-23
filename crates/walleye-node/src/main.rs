@@ -41,6 +41,13 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         Err(error) => return Err(error.into()),
     };
     let (stop_server, stopped) = tokio::sync::oneshot::channel();
+    // Without TCP_NODELAY a response split into head and body waits out the
+    // peer's delayed acknowledgement, which put about 200 ms on every
+    // forwarded request.
+    use axum::serve::ListenerExt;
+    let listener = listener.tap_io(|tcp| {
+        let _ = tcp.set_nodelay(true);
+    });
     let server = axum::serve(listener, walleye_node::router(Arc::clone(&service)))
         .with_graceful_shutdown(async {
             let _ = stopped.await;
@@ -66,6 +73,9 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     let result = tokio::select! {
         r=&mut server=>r.map_err(Into::into),r=bitr=>r,r=service.discover()=>r,r=&mut processor=>r,
         _=shutdown()=> {
+            // Hand the tables over first, while this process still forwards
+            // requests for them to whoever claims them.
+            service.release().await;
             service.quiesce();
             // Keep serving state commits until the outstanding HTTP processors return.
             let result = if service.config.processor.is_some() {

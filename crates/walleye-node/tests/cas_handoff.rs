@@ -1,24 +1,21 @@
-//! Passing the writer lock back and forth between two processes.
+//! Two processes writing one table on one bucket.
 //!
 //! The MemWAL writer is claimed by a compare-and-swap on the shard manifest:
 //! a claimant reads the current writer epoch and commits `epoch + 1`, and the
 //! loser of a race is fenced. Nothing in that scheme says a claim is final, so
-//! two processes writing the same stream on the same bucket should be able to
-//! hand the lock between them indefinitely — each one claiming, writing, and
-//! losing it again to the other without either corrupting the stream or
-//! dropping an acknowledged row.
+//! the lock itself can pass back and forth indefinitely, and the first test
+//! here shows it does.
 //!
-//! That is the property these tests pin down, at the two layers where it can
-//! break: the claim itself, and the daemon's policy about re-claiming.
+//! The daemon does not use it that way. A table has one owner, recorded in
+//! the bucket, and only the owner opens the writer; every other process
+//! forwards to it. So two processes writing the same table never take the
+//! writer from each other: they both reach the one writer, and the price of
+//! the second process is a forward rather than an open and a WAL replay.
 //!
-//! Both layers hold. A fenced process discards the dead handle and takes the
-//! writer back on its next write, so the lock is a rota rather than a
-//! one-way door, and the price of a turn is one open and a WAL replay.
-//!
-//! Two `Service`s over one root are two processes as far as the lock is
-//! concerned. They share no memory, no catalog, no cache and no writer handle;
-//! the manifest in the object store is the only thing between them, which is
-//! exactly the situation of two hosts against one bucket.
+//! Two `Service`s over one root are two processes. They share no memory, no
+//! catalog, no cache and no writer handle; the bucket is the only thing
+//! between them, which is exactly the situation of two hosts against one
+//! bucket.
 //!
 //! Set `WALLEYE_TEST_S3_URI` (say `s3://walleye/cas-handoff`) to run the same
 //! tests against a real bucket, where the CAS is S3's conditional put rather
@@ -65,7 +62,7 @@ fn schema() -> Arc<Schema> {
     ]))
 }
 
-fn config(cache: &std::path::Path, node: &str, root: &str) -> Config {
+fn config(cache: &std::path::Path, node: &str, root: &str, at: &str) -> Config {
     Config {
         node_id: node.into(),
         listen: "127.0.0.1:0".into(),
@@ -74,11 +71,12 @@ fn config(cache: &std::path::Path, node: &str, root: &str) -> Config {
         disk_bytes: 64 * 1024 * 1024,
         token: TOKEN.into(),
         bitr: false,
-        // Each process is a cluster of one, so ownership never routes a write
-        // elsewhere and the only thing arbitrating is the writer claim.
-        members: vec![Node::new(node, format!("http://{node}"), 1.0).unwrap()],
+        // Each process knows only itself. Who owns the table is in the
+        // bucket, and so is the address to forward to.
+        members: vec![Node::new(node, at, 1.0).unwrap()],
         kubernetes: None,
         processor: None,
+        lease: Default::default(),
         api: Some(ApiConfig {
             root_uri: root.to_owned(),
             bitr_url: None,
@@ -107,11 +105,20 @@ async fn send(app: &axum::Router, method: &str, uri: &str, body: Value) -> (Stat
     (status, String::from_utf8_lossy(&bytes).into_owned())
 }
 
-/// Bring a process up. The first one to get there defines the stream; the
+/// Bring a process up, serving on a port of its own so the other can forward
+/// to it. The first one to get there defines the stream and owns it; the
 /// second finds it in the catalog, which is what a second host would do.
 async fn process(cache: &std::path::Path, node: &str, root: &str) -> (Arc<Service>, axum::Router) {
-    let service = Service::open(config(cache, node, root)).await.unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let at = format!("http://{}", listener.local_addr().unwrap());
+    let service = Service::open(config(cache, node, root, &at)).await.unwrap();
     let app = router(service.clone());
+    tokio::spawn({
+        let app = app.clone();
+        async move {
+            let _ = axum::serve(listener, app).await;
+        }
+    });
     let (status, body) = send(
         &app,
         "POST",
@@ -239,8 +246,8 @@ async fn claims_alternate(root: &str) {
     );
 }
 
-/// Two daemons, one stream, one bucket: the lock goes back and forth while
-/// both stay up, and nothing acknowledged is lost.
+/// Two daemons, one stream, one bucket, writes alternating between them:
+/// every one lands at the owner, and nothing acknowledged is lost.
 async fn processes_alternate(root: &str) {
     let cache = tempfile::tempdir().unwrap();
     let (a_service, a) = process(cache.path(), "a", root).await;
@@ -262,17 +269,21 @@ async fn processes_alternate(root: &str) {
             }
         }
     }
-    println!("  handovers that succeeded: {attempts:?}");
+    println!("  writes that succeeded: {attempts:?}");
 
     a_service.close().await;
     b_service.close().await;
 
     if let Some((round, why)) = refused {
         panic!(
-            "the writer lock stopped moving at round {round} of {ROUNDS}: {why}\n  \
+            "a write was refused at round {round} of {ROUNDS}: {why}\n  \
              rounds that did land: {written:?}"
         );
     }
+    assert!(
+        attempts.iter().all(|(_, tries)| *tries == 1),
+        "a second process forwards rather than fighting for the writer: {attempts:?}"
+    );
 
     // A stream the daemon defined carries the arrival number it stamps on
     // every row, so reading it back needs that column too.
@@ -284,24 +295,16 @@ async fn processes_alternate(root: &str) {
     let ids = ids_in_storage(root, stamped).await;
     assert_eq!(
         ids, written,
-        "every acknowledged row is in the stream after {ROUNDS} handovers"
+        "every acknowledged row is in the stream after {ROUNDS} alternating writes"
     );
 }
 
 /// Both processes writing at the same time, rather than taking turns.
 ///
-/// Alternating writes prove the lock can move. They do not prove it survives
-/// contention: here each process is mid-append when the other claims, so every
-/// write is racing a fence rather than following one. Two things have to hold.
-/// Nothing acknowledged may go missing - a 200 means the rows reached the WAL,
-/// and whichever writer replays it next must adopt them. And the two must make
-/// progress rather than livelock, each one's reclaim fencing the other's
-/// in-flight write for ever.
-///
-/// Ids are split so a lost row is identifiable: evens are A's, odds are B's.
-///
-/// Safety is checked here and holds. Liveness is left to the caller, because
-/// it does not: see the two tests below.
+/// Two things have to hold. Nothing acknowledged may go missing - a 200 means
+/// the rows reached the WAL - and nothing may appear that was never
+/// acknowledged. Ids are split so a lost row is identifiable: evens are A's,
+/// odds are B's.
 async fn processes_contend(root: &str, each: i64) -> (usize, usize) {
     let cache = tempfile::tempdir().unwrap();
     let (a_service, a) = process(cache.path(), "a", root).await;
@@ -400,13 +403,13 @@ async fn a_claim_can_be_taken_and_retaken_on_a_bucket() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn two_processes_pass_the_writer_back_and_forth_on_a_local_store() {
+async fn two_processes_write_one_table_through_its_owner_on_a_local_store() {
     let dir = tempfile::tempdir().unwrap();
     processes_alternate(&format!("file://{}/store", dir.path().display())).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn two_processes_pass_the_writer_back_and_forth_on_a_bucket() {
+async fn two_processes_write_one_table_through_its_owner_on_a_bucket() {
     let Some(root) = bucket_root() else {
         eprintln!("skipping: set WALLEYE_TEST_S3_URI to run this against a bucket");
         return;
@@ -414,165 +417,28 @@ async fn two_processes_pass_the_writer_back_and_forth_on_a_bucket() {
     processes_alternate(&root).await;
 }
 
-/// Safety under contention: a 200 is a promise, and contention does not break
-/// it. Whatever the two processes do to each other, no acknowledged row goes
-/// missing and no row appears that nobody was told about.
+/// A 200 is a promise, and two processes writing at once do not break it:
+/// they reach one writer, so every write lands and none is lost.
+///
+/// When both claimed the writer this was a livelock only a backoff held off,
+/// with each fenced while still replaying the WAL to open. Ownership removes
+/// the contention rather than managing it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn concurrent_writes_never_lose_an_acknowledged_row() {
+async fn concurrent_writes_through_two_processes_all_land() {
     let dir = tempfile::tempdir().unwrap();
     let (acked, of) =
         processes_contend(&format!("file://{}/store", dir.path().display()), 25).await;
-    // Deliberately not a floor on how many land: see the test below for why.
-    assert!(acked > 0, "someone wrote something, {acked} of {of}");
-}
-
-/// Liveness under contention, which is what the backoff buys.
-///
-/// Without it the two never settled: each was fenced while still replaying the
-/// WAL to open, so neither finished taking the lock before the other took it
-/// back, and only a fifth to two fifths of writes landed.
-///
-///   WAL replay aborted: entry at position 209 has writer_epoch 202
-///   > our claimed epoch 201 (writer was fenced during open)
-///
-/// Waiting before claiming back turns that into taking turns: the loser of a
-/// race leaves the winner alone long enough to replay the log and empty its
-/// queue, so fifty simultaneous writes cost about one handover rather than
-/// forty refusals - and finish ten times quicker than the thrash did.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn concurrent_writes_mostly_succeed() {
-    let dir = tempfile::tempdir().unwrap();
-    let (acked, of) =
-        processes_contend(&format!("file://{}/store", dir.path().display()), 25).await;
-    assert!(
-        acked * 10 >= of * 9,
-        "contention costs a retry or two, not most of the writes: {acked} of {of} landed"
-    );
+    assert_eq!(acked, of, "every write through either process landed");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn concurrent_writes_mostly_succeed_on_a_bucket() {
+async fn concurrent_writes_through_two_processes_all_land_on_a_bucket() {
     let Some(root) = bucket_root() else {
         eprintln!("skipping: set WALLEYE_TEST_S3_URI to run this against a bucket");
         return;
     };
-    // Every turn against a bucket is an open and a replay, so this is minutes
-    // at ten apiece rather than seconds.
     let (acked, of) = processes_contend(&root, 10).await;
-    assert!(
-        acked * 10 >= of * 9,
-        "contention costs a retry or two, not most of the writes: {acked} of {of} landed"
-    );
-}
-
-/// The two halves of a cooperative handover, checked where they can be.
-///
-/// A claimant that cannot read a stream's tail asks the writer holding it to
-/// flush, because a fenced writer can no longer flush for itself - its commit
-/// is rejected by epoch - so the drain has to happen while the holder still
-/// holds it. That needs two things to be true: the note left in shared storage
-/// has to say where the holder answers, and posting to that address has to
-/// actually drain the stream.
-///
-/// Both are checked here. The two together, on a claimant that genuinely
-/// cannot read the tail, are in `tests/bitr_clusters.rs`: nodes writing the
-/// object-store WAL always can read it, correctly, so no refusal can be
-/// manufactured between them and it takes two real Bitr clusters to make one.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_writer_holding_a_tail_says_where_it_answers_and_drains_when_asked() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = format!("file://{}/store", dir.path().display());
-    let cache = tempfile::tempdir().unwrap();
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let held_at = format!("http://{}", listener.local_addr().unwrap());
-    let members = vec![
-        Node::new("holder", held_at.clone(), 1.0).unwrap(),
-        Node::new("other", "http://127.0.0.1:1", 1.0).unwrap(),
-    ];
-    let mut holder_config = config(cache.path(), "holder", &root);
-    holder_config.members = members;
-    let holder = Service::open(holder_config).await.unwrap();
-    let app = router(holder.clone());
-    let (status, body) = send(
-        &app,
-        "POST",
-        "/v1/streams",
-        json!({"name": STREAM, "primary_key": ["id"],
-               "columns": [{"name":"id","type":"int64"},{"name":"at","type":"int64"}]}),
-    )
-    .await;
-    assert!(
-        status == StatusCode::OK || body.contains("already exists"),
-        "define: {status} {body}"
-    );
-    let serving = tokio::spawn({
-        let app = app.clone();
-        async move {
-            let _ = axum::serve(listener, app).await;
-        }
-    });
-
-    // A row acknowledged and not flushed. The writer is now holding something
-    // nobody else can necessarily read, and must say so.
-    assert!(write_row(&app, 1).await.is_ok());
-
-    let uri = format!("{}/data/{STREAM}", root.trim_end_matches('/'));
-    let shard = walleye_lance::TableConfig::new(
-        STREAM,
-        uri.clone(),
-        Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("at", DataType::Int64, false),
-        ])),
-        vec!["id".into()],
-    )
-    .unwrap();
-    let advertised = walleye_lance::open_tail_holder(
-        &walleye_lance::LanceStorageOptions::default(),
-        &uri,
-        shard.shard_id,
-        &shard.stream,
-    )
-    .await
-    .expect("reading the note");
-    assert_eq!(
-        advertised.as_deref(),
-        Some(held_at.as_str()),
-        "the note names the address a claimant should ask"
-    );
-
-    // Asking that address drains the stream, which is what makes the tail
-    // readable by anyone and takes the note down.
-    let cluster = walleye_node::cluster::Cluster::new(
-        "claimant".into(),
-        Arc::new(
-            walleye_ring::Membership::new(vec![Node::new("holder", held_at.clone(), 1.0).unwrap()])
-                .unwrap(),
-        ),
-        TOKEN.into(),
-    )
-    .unwrap();
-    cluster
-        .ask_to_flush(&held_at, STREAM)
-        .await
-        .expect("the holder flushes when asked");
-
-    let drained = walleye_lance::open_tail_holder(
-        &walleye_lance::LanceStorageOptions::default(),
-        &uri,
-        shard.shard_id,
-        &shard.stream,
-    )
-    .await
-    .expect("reading the note again");
-    assert_eq!(
-        drained, None,
-        "a drained stream leaves no note, so the next claimant just takes it"
-    );
-
-    holder.close().await;
-    serving.abort();
+    assert_eq!(acked, of, "every write through either process landed");
 }
 
 /// Two opens of one stream overlapping, which is ordinary rather than

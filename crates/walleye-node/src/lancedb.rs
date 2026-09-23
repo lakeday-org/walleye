@@ -180,10 +180,11 @@ fn write_error(e: &(dyn std::error::Error + Send + Sync + 'static)) -> Response 
     error(e)
 }
 fn error(e: &(dyn std::error::Error + 'static)) -> Response {
+    if let Some(response) = crate::cluster::route_error(e) {
+        return response;
+    }
     let status = if e.downcast_ref::<engine::TableNotFound>().is_some() {
         StatusCode::NOT_FOUND
-    } else if e.downcast_ref::<crate::cluster::NotOwner>().is_some() {
-        StatusCode::CONFLICT
     } else {
         StatusCode::BAD_REQUEST
     };

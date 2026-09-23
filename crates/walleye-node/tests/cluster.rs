@@ -1,11 +1,12 @@
 //! Three env-style members on one root: every node serves the full API, each
-//! stream has exactly one owner on the ring, non-owners forward, and writes
-//! through any node are neither lost nor duplicated.
+//! table has exactly one owner - the process that claimed it first - and
+//! non-owners forward, so writes through any node are neither lost nor
+//! duplicated.
 use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use std::{collections::BTreeSet, sync::Arc};
 use walleye_node::{ApiConfig, Config, Service, cluster, router};
-use walleye_ring::{Node, Ring};
+use walleye_ring::Node;
 
 const TOKEN: &str = "deployment-secret-token";
 
@@ -53,6 +54,23 @@ struct Member {
     service: Arc<Service>,
 }
 
+/// The ownership session a member runs under, which is what the owner header
+/// names.
+async fn session(member: &Member) -> String {
+    reqwest::Client::new()
+        .get(format!("{}/internal/ownership", member.base))
+        .header("authorization", format!("Bearer {TOKEN}"))
+        .send()
+        .await
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap()["node"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
 async fn start(root: &std::path::Path, count: usize) -> Vec<Member> {
     let mut listeners = Vec::new();
     for i in 0..count {
@@ -77,6 +95,7 @@ async fn start(root: &std::path::Path, count: usize) -> Vec<Member> {
             members: members.clone(),
             kubernetes: None,
             processor: None,
+            lease: Default::default(),
             api: Some(ApiConfig {
                 root_uri: format!("file://{}/store", root.display()),
                 bitr_url: None,
@@ -97,29 +116,25 @@ async fn every_member_serves_every_stream_with_one_owner() {
     let dir = tempfile::tempdir().unwrap();
     let members = start(dir.path(), 3).await;
     let client = reqwest::Client::new();
-    let ring = Ring::new(
-        members
-            .iter()
-            .map(|m| Node::new(m.id.clone(), m.base.clone(), 1.0).unwrap())
-            .collect(),
-    )
-    .unwrap();
     let tables: Vec<String> = (0..6).map(|i| format!("t{i}")).collect();
-    let owners: BTreeSet<String> = tables
-        .iter()
-        .map(|t| ring.owner(t.as_bytes()).id.clone())
-        .collect();
-    assert!(
-        owners.len() >= 2,
-        "six tables should spread over several owners: {owners:?}"
-    );
+    let mut sessions = Vec::new();
+    for member in &members {
+        sessions.push(session(member).await);
+    }
+    // A table belongs to the process that claims it first, so creating table
+    // i through member i % 3 spreads them over all three.
+    let owner_of = |table: &str| -> String {
+        let index: usize = table[1..].parse().unwrap();
+        sessions[index % members.len()].clone()
+    };
+    let owners: BTreeSet<String> = tables.iter().map(|t| owner_of(t)).collect();
+    assert_eq!(owners.len(), 3, "six tables over three owners: {owners:?}");
 
-    // Create every table through node 0, whoever owns it.
-    for table in &tables {
+    for (index, table) in tables.iter().enumerate() {
         let r = client
             .post(format!(
                 "{}/v1/table/{table}/create/?mode=create",
-                members[0].base
+                members[index % members.len()].base
             ))
             .header("x-api-key", TOKEN)
             .header("content-type", "application/vnd.apache.arrow.stream")
@@ -142,7 +157,7 @@ async fn every_member_serves_every_stream_with_one_owner() {
                 .send()
                 .await
                 .unwrap();
-            let expected_owner = ring.owner(table.as_bytes()).id.clone();
+            let expected_owner = owner_of(table);
             let served_by = r
                 .headers()
                 .get(cluster::OWNER_HEADER)
@@ -192,22 +207,9 @@ async fn every_member_serves_every_stream_with_one_owner() {
         }
     }
 
-    // SQL over one table routes to its owner from any member; a join across
-    // tables with different owners is refused rather than answered wrong.
-    let (a, b) = {
-        let mut by_owner = std::collections::BTreeMap::new();
-        for t in &tables {
-            by_owner
-                .entry(ring.owner(t.as_bytes()).id.clone())
-                .or_insert_with(Vec::new)
-                .push(t.clone());
-        }
-        let mut groups = by_owner.into_values();
-        (
-            groups.next().unwrap()[0].clone(),
-            groups.next().unwrap()[0].clone(),
-        )
-    };
+    // SQL over one table routes to its owner from any member. t0 and t1 have
+    // different owners.
+    let (a, b) = (tables[0].clone(), tables[1].clone());
     for member in &members {
         let r = client
             .post(format!("{}/v1/query", member.base))
@@ -252,23 +254,10 @@ async fn every_member_serves_every_stream_with_one_owner() {
     assert_eq!(r.status(), 200);
     assert_eq!(r.json::<serde_json::Value>().await.unwrap()[0]["n"], 30);
 
-    // A forward that carries a stale membership view is fenced, and a
-    // forwarded request that lands on a non-owner is refused instead of
-    // bouncing around.
+    // A forwarded request that lands on a non-owner is refused, and says why,
+    // instead of bouncing around.
     let table = &tables[0];
-    let non_owner = members
-        .iter()
-        .find(|m| m.id != ring.owner(table.as_bytes()).id)
-        .unwrap();
-    let r = client
-        .post(format!("{}/v1/table/{table}/count_rows/", non_owner.base))
-        .header("x-api-key", TOKEN)
-        .header(cluster::MEMBERS_HEADER, "0000000000000000")
-        .json(&serde_json::json!({}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(r.status(), 409);
+    let non_owner = &members[1];
     let r = client
         .post(format!("{}/v1/table/{table}/count_rows/", non_owner.base))
         .header("x-api-key", TOKEN)
@@ -278,6 +267,10 @@ async fn every_member_serves_every_stream_with_one_owner() {
         .await
         .unwrap();
     assert_eq!(r.status(), 409);
+    assert_eq!(
+        r.headers().get(cluster::ROUTE_ERROR_HEADER).unwrap(),
+        "stale-owner"
+    );
 
     // Listing is served locally by every member from the shared catalog.
     let r = client
@@ -304,17 +297,10 @@ async fn every_member_serves_every_stream_with_one_owner() {
 async fn a_write_to_a_non_owner_is_a_conflict_rather_than_a_bad_request() {
     let d = tempfile::tempdir().unwrap();
     let members = start(d.path(), 3).await;
-    let ring = Ring::new(
-        members
-            .iter()
-            .map(|m| Node::new(&m.id, &m.base, 1.0).unwrap())
-            .collect(),
-    )
-    .unwrap();
 
-    // Define through the owner, so the stream exists everywhere.
-    let owner = ring.owner(b"journal").id.clone();
-    let owning = members.iter().find(|m| m.id == owner).unwrap();
+    // Define through one member, which claims it, so the stream exists
+    // everywhere and has an owner.
+    let owning = &members[0];
     let defined = reqwest::Client::new()
         .post(format!("{}/v1/streams", owning.base))
         .header("authorization", format!("Bearer {TOKEN}"))
@@ -331,7 +317,7 @@ async fn a_write_to_a_non_owner_is_a_conflict_rather_than_a_bad_request() {
     // Ask a non-owner directly, with the forwarding middleware told this
     // request was already forwarded once so it refuses to hop again. That is
     // the path where the engine's own not-owner answer reaches the client.
-    let other = members.iter().find(|m| m.id != owner).unwrap();
+    let other = &members[1];
     let answered = reqwest::Client::new()
         .post(format!("{}/v1/streams/journal/events", other.base))
         .header("authorization", format!("Bearer {TOKEN}"))

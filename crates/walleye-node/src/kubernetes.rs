@@ -44,8 +44,8 @@ pub fn config_from_env() -> Result<Config, Box<dyn std::error::Error>> {
         "http://{}.{}.{}.svc:8080",
         node_id, discovery.service, discovery.namespace
     );
-    // Every pod serves the API; stream ownership is decided per stream on
-    // the ring, so no pod ordinal is special.
+    // Every pod serves the API and may own tables; the ring places cache
+    // entries only, so no pod ordinal is special.
     let api = Some(ApiConfig {
         root_uri: std::env::var("WALLEYE_ROOT_URI")?,
         bitr_url: Some(std::env::var("WALLEYE_BITR_URL")?),
@@ -62,6 +62,7 @@ pub fn config_from_env() -> Result<Config, Box<dyn std::error::Error>> {
         api,
         kubernetes: Some(discovery),
         processor: None,
+        lease: crate::LeaseConfig::default(),
     })
 }
 #[derive(Deserialize)]
