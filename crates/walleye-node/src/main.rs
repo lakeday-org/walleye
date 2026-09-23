@@ -41,6 +41,9 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         Err(error) => return Err(error.into()),
     };
     let (stop_server, stopped) = tokio::sync::oneshot::channel();
+    // The embedded replica stops when this process says so, not on SIGTERM:
+    // the handover below appends and flushes through its gateway.
+    let (stop_bitr, bitr_stopped) = tokio::sync::oneshot::channel::<()>();
     // Without TCP_NODELAY a response split into head and body waits out the
     // peer's delayed acknowledgement, which put about 200 ms on every
     // forwarded request.
@@ -55,7 +58,10 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         .into_future();
     let bitr = async {
         if service.config.bitr {
-            walleye_bitr_server::daemon::run_with_arguments(Vec::new()).await
+            walleye_bitr_server::daemon::run_until(Vec::new(), async {
+                let _ = bitr_stopped.await;
+            })
+            .await
         } else {
             std::future::pending::<Result<(), Box<dyn std::error::Error>>>().await
         }
@@ -69,24 +75,51 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
             None => std::future::pending().await,
         }
     };
-    tokio::pin!(server, processor);
-    let result = tokio::select! {
-        r=&mut server=>r.map_err(Into::into),r=bitr=>r,r=service.discover()=>r,r=&mut processor=>r,
+    tokio::pin!(server, processor, bitr);
+    let (result, closed) = tokio::select! {
+        r=&mut server=>(r.map_err(Into::into), false),r=&mut bitr=>(r, false),r=service.discover()=>(r, false),r=&mut processor=>(r, false),
         _=shutdown()=> {
-            // Hand the tables over first, while this process still forwards
-            // requests for them to whoever claims them.
-            service.release().await;
-            service.quiesce();
-            // Keep serving state commits until the outstanding HTTP processors return.
-            let result = if service.config.processor.is_some() {
-                tokio::select! {r=&mut processor=>r, r=&mut server=>{service.close().await; return r.map_err(Into::into);}}
-            } else { Ok(()) };
-            let _ = stop_server.send(());
-            server.await?;
-            result
+            // Everything from here runs with the embedded replica still
+            // serving: the release flushes each table through it, and a write
+            // this process accepts while it drains is made durable through it.
+            let drain = async {
+                // Hand the tables over first, while this process still
+                // forwards requests for them to whoever claims them.
+                service.release().await;
+                service.quiesce();
+                // Keep serving state commits until the outstanding HTTP processors return.
+                let result = if service.config.processor.is_some() {
+                    tokio::select! {r=&mut processor=>r, r=&mut server=>{service.close().await; return r.map_err(Into::into);}}
+                } else { Ok(()) };
+                let _ = stop_server.send(());
+                server.await?;
+                // Closing flushes too, so it happens while the replica serves.
+                service.close().await;
+                result
+            };
+            tokio::pin!(drain);
+            let mut replica_running = true;
+            loop {
+                tokio::select! {
+                    r = &mut drain => break (r, true),
+                    r = &mut bitr, if replica_running => {
+                        // The replica ended on its own mid-drain. The drain
+                        // goes on; whatever it still has to make durable
+                        // fails the way it would with the replica gone.
+                        replica_running = false;
+                        eprintln!("walleye.shutdown stage=drain replica=stopped outcome={}", match r {
+                            Ok(()) => "ok".to_string(),
+                            Err(error) => format!("error error={error}"),
+                        });
+                    }
+                }
+            }
         }
     };
-    service.close().await;
+    if !closed {
+        service.close().await;
+    }
+    let _ = stop_bitr.send(());
     result
 }
 
