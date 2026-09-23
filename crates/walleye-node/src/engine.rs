@@ -823,9 +823,7 @@ impl Engine {
     }
     async fn register(&self, definition: StreamDefinition) -> Result<Arc<Stream>, Error> {
         let mut config = definition.table_config(&self.config.root_uri)?;
-        // Say where this writer answers, for whoever reads the open-tail note.
-        config = config.with_holder(self.cluster.endpoint.clone());
-        // And name the log this writer appends to. Every process pointed at
+        // Name the log this writer appends to. Every process pointed at
         // one Bitr gateway spells it the same way, and every process without
         // one is writing the object store's own WAL, which they all share.
         config = config.with_log(match &self.config.bitr_url {

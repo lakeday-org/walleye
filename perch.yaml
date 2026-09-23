@@ -94,8 +94,9 @@
     Opening a stream whose acknowledged, unflushed rows are in a write-ahead
     log this writer cannot read, and serving it as though those rows were not
     there. A replay that finds nothing is not proof that nothing was written;
-    it is what a writer on another quorum sees. Refusing is correct, and so is
-    getting the holder to flush first. Serving the stream without the rows is
+    it is what a writer on another quorum sees. Refusing is correct, and an
+    owner that flushes before it releases the stream is what keeps a later
+    open from meeting that refusal. Serving the stream without the rows is
     not, because a client was told they were stored.
 
 - name: unflushed-rows-are-announced-where-others-can-see
