@@ -169,9 +169,13 @@ async fn a_view_processes_each_row_once_and_resumes_where_it_stopped() {
     let again = refresh(&app, "silver").await;
     assert_eq!(again["rows"], 0, "a caught up view does no work: {again}");
 
+    // A write wakes the node's own driver, which may take the new row before
+    // this refresh does. Either way it is taken once: what is asserted is the
+    // table it lands in, not which pass carried it. That no row is ever taken
+    // twice is `workers.rs`'s two_passes_at_once_deliver_each_row_once, which
+    // can see a duplicate where a target, dropping identical rows, cannot.
     add(&app, &["third"]).await;
-    let third = refresh(&app, "silver").await;
-    assert_eq!(third["rows"], 1, "only the new row: {third}");
+    refresh(&app, "silver").await;
 
     let rows = sql(&app, "SELECT shouted FROM silver_rows ORDER BY shouted").await;
     let shouted: Vec<&str> = rows
@@ -224,9 +228,22 @@ async fn a_cursor_survives_a_restart() {
     let after = refresh(&app, "silver").await;
     assert_eq!(after["rows"], 0, "nothing is reprocessed: {after}");
 
+    // New rows still arrive. Which pass takes gamma - this refresh or the
+    // driver its write woke - is not the point; that it lands is.
     add(&app, &["gamma"]).await;
-    let fresh = refresh(&app, "silver").await;
-    assert_eq!(fresh["rows"], 1, "and new rows still arrive: {fresh}");
+    refresh(&app, "silver").await;
+    let rows = sql(&app, "SELECT body FROM silver_rows ORDER BY body").await;
+    let bodies: Vec<&str> = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["body"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        bodies,
+        ["alpha", "beta", "gamma"],
+        "and new rows still arrive: {rows}"
+    );
 }
 
 /// Repeating a pass is safe. The rows a replay produces are identical to the
