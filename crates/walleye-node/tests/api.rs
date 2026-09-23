@@ -409,11 +409,16 @@ async fn the_catalog_tolerates_fields_this_version_does_not_know() {
 /// A fenced writer is a dead handle, not a dead stream. Before this was
 /// handled, a writer fenced once left its table answering the fence error to
 /// every read and write until the process restarted, while readiness reported
-/// the cluster healthy. A process another writer superseded must stand down
-/// instead: it cannot take the writer back, because taking it back is what
-/// makes two processes trade it while both answer 200.
+/// the cluster healthy.
+///
+/// Discarding the handle is the whole of the recovery, and it does not matter
+/// who did the fencing. The writer claim is a compare-and-swap that any live
+/// process may win, so a process a peer fenced takes the stream back on its
+/// next write, the same way the peer took it. That is what lets several
+/// ingestors share one stream: each turn costs an open and a WAL replay, and
+/// the caller sees neither.
 #[tokio::test]
-async fn a_superseded_writer_stands_down_instead_of_taking_it_back() {
+async fn a_fenced_writer_takes_the_stream_back_on_its_next_write() {
     use arrow_schema::{DataType, Field, Schema};
     use std::sync::Arc;
     use walleye_lance::{LanceDurability, LanceStorageOptions, Table, TableConfig};
@@ -459,11 +464,13 @@ async fn a_superseded_writer_stands_down_instead_of_taking_it_back() {
     )
     .await
     .expect("a second writer claims the next epoch");
+    // The interloper holds the writer and is going nowhere, so what follows
+    // is a genuine re-claim rather than a handle nobody wanted.
+    let held = claimed.writer_epoch();
 
-    // The superseded process stands down rather than taking the writer back.
-    // Reopening would claim the epoch again and the two would trade it while
-    // both answered 200, so the write is refused, and refused retryably: the
-    // rows were not stored and the writer that holds the table will take them.
+    // The next write discards the fenced handle, opens a fresh one that claims
+    // the epoch after the interloper's, and stores the rows. The caller is
+    // told none of this: it asked for a write and got one.
     let (status, body) = call(
         &app,
         "/v1/streams/events/events",
@@ -472,36 +479,34 @@ async fn a_superseded_writer_stands_down_instead_of_taking_it_back() {
     .await;
     assert_eq!(
         status,
-        StatusCode::SERVICE_UNAVAILABLE,
-        "a superseded writer answers retryably: {body}"
+        StatusCode::OK,
+        "a fenced writer takes the stream back: {body}"
     );
-    assert_eq!(body["outcome"], "not written", "{body}");
 
-    // And it stays stood down: a second attempt does not quietly reopen.
+    // And it keeps it: the next write does not have to fence anything.
     let (status, body) = call(
         &app,
         "/v1/streams/events/events",
         json!({"rows":[{"id":3,"value":30}]}),
     )
     .await;
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
-    // Reads stand down with it. Serving a stream this process no longer
-    // holds would mean reopening, which is the thing it must not do, so the
-    // whole stream moves to the writer that took it rather than half of it.
-    //
-    // The status is a 400 rather than something retryable, because the SQL
-    // layer flattens the typed fence on its way out. Known, and not fixed
-    // here: the write path is what a takeover needs.
-    let (status, _rows) = call(
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // Reads come back with the writes, over the same reopened handle, and
+    // every row is there: the one written before the fence, which the replay
+    // adopted from the log, and the two written after it.
+    let (status, rows) = call(
         &app,
         "/v1/query",
         json!({"sql":"SELECT count(*) AS n FROM events"}),
     )
     .await;
-    assert_ne!(status, StatusCode::OK, "a stood-down stream serves nothing");
+    assert_eq!(status, StatusCode::OK, "a reclaimed stream serves reads");
+    assert_eq!(rows[0]["n"], 3, "no row was lost to the handover: {rows}");
 
-    // The rows are not lost: the process that took the writer replays the
-    // log below its fence sentinel and adopts them.
+    // The interloper is the one fenced now. The lock moved, rather than being
+    // shared by two writers that both think they hold it.
+    assert!(held > 0, "the interloper held a writer epoch");
     drop(claimed);
     drop(app);
     service.close().await;

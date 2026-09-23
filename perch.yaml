@@ -76,3 +76,69 @@
     It is not turned into a substring scan, and it is not refused. A phrase
     search that reads every row is a correctness problem as well as a speed one,
     because substring matching and term matching do not return the same rows.
+
+- name: a-claim-checks-the-tail-before-taking-it
+  where: callers of claim_epoch
+  each: method
+  min: 75
+  ensure: >
+    Anything this method does that could make it refuse the stream happens
+    before it claims the writer epoch, not after. Claiming is what fences the
+    writer currently holding the stream, so a claim that is then abandoned
+    leaves a healthy writer knocked off a stream it was serving correctly. A
+    check that runs after the claim is the bug this rule exists for.
+
+- name: an-unreadable-tail-is-refused-not-replayed-empty
+  where: "crates/walleye-lance/src/**/*.rs"
+  ensure_absent: >
+    Opening a stream whose acknowledged, unflushed rows are in a write-ahead
+    log this writer cannot read, and serving it as though those rows were not
+    there. A replay that finds nothing is not proof that nothing was written;
+    it is what a writer on another quorum sees. Refusing is correct, and so is
+    getting the holder to flush first. Serving the stream without the rows is
+    not, because a client was told they were stored.
+
+- name: unflushed-rows-are-announced-where-others-can-see
+  where: mentions note_open_tail
+  each: method
+  min: 70
+  ensure: >
+    A writer that acknowledges rows no flush has covered records that fact in
+    shared storage before or as it acknowledges them, and removes the record
+    only when a checkpoint has put those rows where any writer can read them.
+    The shard manifest cannot carry this: it learns positions at flush time and
+    names no log. Without the record a successor cannot tell an empty stream
+    from one whose tail it simply cannot reach.
+
+- name: a-handover-request-does-not-assume-one-ring
+  where: callers of ask_to_flush
+  each: method
+  min: 70
+  ensure: >
+    A request asking another process to flush a stream it holds does not
+    require that process to share this one's view of cluster membership, and
+    does not send a membership fingerprint that would make it refuse. The
+    writer being asked may belong to a different deployment entirely, which is
+    the case the request exists for; two deployments agree about the object
+    store and about nothing else.
+
+- name: a-fenced-writer-is-not-out-for-good
+  where: "crates/walleye-node/src/**/*.rs"
+  ensure_absent: >
+    State that records a stream as taken by a peer and is then used to refuse
+    every later open of it for the life of the process. The writer claim is a
+    compare-and-swap any live process may win, so a fenced writer takes the
+    stream back on its next write, and several ingestors share one stream by
+    taking turns. A flag that never clears turns a rota into a one-way door and
+    sends clients to retry a process that will never serve them again.
+
+- name: a-reclaim-waits-before-it-races
+  where: mentions discard_fenced_writer
+  each: method
+  min: 70
+  ensure: >
+    A writer a peer fenced waits before claiming the stream back, for longer
+    each time it is fenced again quickly, and by an amount that is not the same
+    on both sides. Two writers that reclaim immediately take the epoch off each
+    other faster than either can replay the log behind it, and most writes are
+    refused while neither makes progress.

@@ -35,7 +35,33 @@ pub const GATHER_ROW_LIMIT: usize = 1_000_000;
 /// A table's rows taken from its owner, with the schema they arrived under.
 type GatheredTable = (String, Arc<Schema>, Vec<RecordBatch>);
 /// Minimum spacing between automatic compaction attempts per table.
+/// A number that differs between two processes racing for the same stream and
+/// between one attempt and the next, without taking a dependency on a random
+/// number generator for a backoff nobody is betting on.
+fn jitter(stream: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    std::process::id().hash(&mut hasher);
+    stream.hash(&mut hasher);
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0)
+        .hash(&mut hasher);
+    hasher.finish()
+}
 const COMPACT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+/// How long a claim on a writer is worth having. A writer a peer fences sooner
+/// than this never got a turn: the epoch was taken off it before it had
+/// finished replaying the log behind it, which is what two eager writers do to
+/// each other when nothing makes them wait.
+const MIN_HOLD: std::time::Duration = std::time::Duration::from_millis(250);
+/// How long to leave a peer alone before claiming the writer back, after a
+/// fence that arrived inside [`MIN_HOLD`]. Doubles per consecutive fast fence,
+/// so a stream nobody is fighting over pays nothing and one two processes are
+/// racing settles into turns instead of thrash.
+const RECLAIM_BACKOFF: std::time::Duration = std::time::Duration::from_millis(60);
+const RECLAIM_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_millis(2_000);
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
 
@@ -341,15 +367,17 @@ struct Stream {
     /// Next arrival number to hand out, once the stream's high-water mark is
     /// known. Unset until the first append after opening.
     seq: Mutex<Option<u64>>,
-    /// Set once another live process has claimed this stream's writer.
-    ///
-    /// Claiming is the only way a writer epoch moves, so reopening takes the
-    /// writer back from whoever holds it. A superseded process that keeps
-    /// reopening fights its own successor, and both answer 200 for writes to
-    /// the same stream. Once this is set the process stands down: it opens
-    /// nothing further for this stream and says so retryably, so callers move
-    /// to the writer that holds it.
-    superseded: std::sync::atomic::AtomicBool,
+    /// When the writer this stream holds claimed its epoch. A fence can then
+    /// tell a claim that was used from one taken away before it was worth
+    /// anything.
+    claimed_at: Mutex<Option<Instant>>,
+    /// Consecutive fences that arrived before the claim had been held for
+    /// [`MIN_HOLD`]. Two writers racing drive this up and back each other off;
+    /// one turn that lasts puts it back to nothing.
+    contention: std::sync::atomic::AtomicU32,
+    /// How to reach peers, for asking the writer that holds a stream to flush
+    /// it. Absent on a node with no cluster, which then has nobody to ask.
+    cluster: Option<Cluster>,
 }
 impl Stream {
     /// Bytes this stream's writer may hold in memory: the memtable size and
@@ -375,14 +403,33 @@ impl Stream {
     /// handle, not a dead stream, and keeping it would leave the stream
     /// unreadable and unwritable until the process restarted. Returns whether
     /// it discarded one.
+    ///
+    /// Discarding is all that happens, whoever did the fencing. A peer holding
+    /// the writer is not a reason to stay out of the stream: the claim is a
+    /// compare-and-swap that any live process may win, so the next write here
+    /// takes it back the same way the peer took it. That is what lets several
+    /// ingestors share one stream, each paying an open and a WAL replay for
+    /// its turn, and it is why a fenced write is worth retrying.
+    ///
+    /// The cost is that two processes both writing steadily will trade the
+    /// writer on every append, and an open is not free. Whoever wants one
+    /// writer rather than a rota gets it by routing, not by a process
+    /// refusing to open: see `Engine::owner`.
     async fn discard_fenced_writer(&self, reason: walleye_lance::FenceReason) -> bool {
-        // A peer claiming the epoch means a live process took this stream.
-        // A persistence failure is this writer's own, and reopening is the
-        // recovery for it.
         if reason == walleye_lance::FenceReason::PeerClaimedEpoch {
-            self.superseded
-                .store(true, std::sync::atomic::Ordering::Release);
+            // A claim taken away inside MIN_HOLD is a peer racing us rather
+            // than a handover: it did not last long enough to replay the log
+            // and write anything. Count those, and only those, because a
+            // writer that had its turn should claim straight back.
+            let held = self.claimed_at.lock().await.map(|at| at.elapsed());
+            match held {
+                Some(held) if held < MIN_HOLD => {
+                    self.contention.fetch_add(1, Ordering::AcqRel);
+                }
+                _ => self.contention.store(0, Ordering::Release),
+            }
         }
+        *self.claimed_at.lock().await = None;
         let taken = self.table.lock().await.take();
         let Some(table) = taken else {
             return false;
@@ -406,51 +453,135 @@ impl Stream {
         );
         true
     }
+    /// Leave the peer that fenced us alone for a moment before claiming the
+    /// writer back.
+    ///
+    /// Claiming is a compare-and-swap nobody can refuse, so the only way to
+    /// give a writer a turn is for the other one to wait. Without this, two
+    /// processes writing at once take the epoch off each other faster than
+    /// either can replay the WAL behind it, and most writes are refused while
+    /// the epoch climbs: livelock, not deadlock, and not corruption, but a
+    /// stream that mostly says no.
+    ///
+    /// The wait doubles per consecutive fast fence and is jittered, because
+    /// two processes that back off by the same amount collide again on the
+    /// far side of it. A stream nobody is competing for never gets here.
+    async fn wait_before_reclaiming(&self) {
+        let rounds = self.contention.load(Ordering::Acquire);
+        if rounds == 0 {
+            return;
+        }
+        let doubled = RECLAIM_BACKOFF.saturating_mul(1 << rounds.min(5));
+        let capped = doubled.min(RECLAIM_BACKOFF_MAX);
+        // Half to full, the shape that keeps two backoffs from lining up.
+        let spread = capped.as_millis() as u64;
+        let wait = spread / 2 + jitter(&self.definition.name) % spread.max(1);
+        tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
+    }
+    /// How many times an open will re-read the manifest and claim again after
+    /// losing the race to another opener. Overlapping opens are ordinary - a
+    /// reconfigure reopening a stream while the warm-up opens it, for one - and
+    /// failing the request over one is a flake, not a fault.
+    const CLAIM_ATTEMPTS: usize = 5;
+
+    /// A refused claim this process can do something about.
+    ///
+    /// The refusal means the stream's acknowledged tail is in a log this
+    /// writer cannot read - another Bitr cluster, or a quorum where this node
+    /// has only the object store. Flushing puts those rows in shared storage,
+    /// and only the writer still holding the stream can flush them, because a
+    /// fenced writer's commit is rejected by epoch. So this asks it to, and
+    /// says whether the asking worked.
+    ///
+    /// Returns false for every other error, and for a tail whose holder left
+    /// no address, which is the case an operator has to settle by hand.
+    async fn drained_by_holder(&self, error: &Error) -> bool {
+        let Some(fault) = error.downcast_ref::<walleye_lance::LanceError>() else {
+            return false;
+        };
+        if !walleye_lance::is_unreachable_tail(fault) {
+            return false;
+        }
+        let Some(cluster) = &self.cluster else {
+            return false;
+        };
+        let holder = walleye_lance::open_tail_holder(
+            &self.storage,
+            &self.config.uri,
+            self.config.shard_id,
+            &self.config.stream,
+        )
+        .await;
+        let Ok(Some(holder)) = holder else {
+            eprintln!(
+                "walleye.storage open_tail stream={} outcome=held_elsewhere holder=unknown",
+                self.definition.name
+            );
+            return false;
+        };
+        match cluster.ask_to_flush(&holder, &self.definition.name).await {
+            Ok(()) => {
+                eprintln!(
+                    "walleye.storage open_tail stream={} outcome=drained_by_holder holder={holder}",
+                    self.definition.name
+                );
+                true
+            }
+            Err(why) => {
+                eprintln!(
+                    "walleye.storage open_tail stream={} outcome=holder_refused holder={holder} error={why}",
+                    self.definition.name
+                );
+                false
+            }
+        }
+    }
+
+    /// Build this writer's durability and claim the table.
+    ///
+    /// Separate from [`Self::table`] because a refused claim can sometimes be
+    /// made to succeed - by getting the writer that holds the stream to flush -
+    /// and the retry has to redo all of this: the Bitr identity is minted
+    /// against an epoch, and that epoch moves while we are asking.
+    async fn claim_table(&self) -> Result<Table, Error> {
+        let durability = match &self.bitr {
+            Some(writer) => {
+                if walleye_lance::prepare_bitr_takeover(
+                    &self.storage,
+                    &self.config.uri,
+                    self.config.shard_id,
+                    &self.config.stream,
+                    writer,
+                )
+                .await?
+                {
+                    eprintln!(
+                        "walleye.storage takeover stream={} outcome=reset_wal_positions",
+                        self.definition.name
+                    );
+                }
+                let epoch = walleye_lance::next_writer_epoch(
+                    &self.storage,
+                    &self.config.uri,
+                    self.config.shard_id,
+                )
+                .await?;
+                LanceDurability::Bitr(Arc::new(BitrWalBackend::new(
+                    writer.clone(),
+                    &self.config.stream,
+                    self.config.shard_id,
+                    epoch,
+                )?))
+            }
+            None => LanceDurability::ObjectStore,
+        };
+        Ok(Table::open(self.config.clone(), self.storage.clone(), durability).await?)
+    }
+
     async fn table(&self) -> Result<MappedMutexGuard<'_, Table>, Error> {
         *self.last_used.lock().await = Instant::now();
         let mut table = self.table.lock().await;
         if table.is_none() {
-            // Opening claims the next epoch, which would take the writer back
-            // from the process that superseded this one.
-            if self.superseded.load(Ordering::Acquire) {
-                return Err(Box::new(walleye_lance::LanceError::fenced_by_peer(
-                    format!(
-                        "another writer holds {}; this process stood down",
-                        self.definition.name
-                    ),
-                )));
-            }
-            let durability = match &self.bitr {
-                Some(writer) => {
-                    if walleye_lance::prepare_bitr_takeover(
-                        &self.storage,
-                        &self.config.uri,
-                        self.config.shard_id,
-                        &self.config.stream,
-                        writer,
-                    )
-                    .await?
-                    {
-                        eprintln!(
-                            "walleye.storage takeover stream={} outcome=reset_wal_positions",
-                            self.definition.name
-                        );
-                    }
-                    let epoch = walleye_lance::next_writer_epoch(
-                        &self.storage,
-                        &self.config.uri,
-                        self.config.shard_id,
-                    )
-                    .await?;
-                    LanceDurability::Bitr(Arc::new(BitrWalBackend::new(
-                        writer.clone(),
-                        &self.config.stream,
-                        self.config.shard_id,
-                        epoch,
-                    )?))
-                }
-                None => LanceDurability::ObjectStore,
-            };
             // Fail closed before opening: a writer we cannot afford must not
             // exist. Memtable plus unflushed bound, plus the in-memory vector
             // graph sized for the memtable's row capacity.
@@ -459,8 +590,49 @@ impl Stream {
                 self.memory_footprint(),
             )?;
             *self.lease.lock().await = Some(lease);
-            *table =
-                Some(Table::open(self.config.clone(), self.storage.clone(), durability).await?);
+            let mut opened = None;
+            for attempt in 0..Self::CLAIM_ATTEMPTS {
+                match self.claim_table().await {
+                    Ok(table) => {
+                        opened = Some(table);
+                        break;
+                    }
+                    Err(error) if self.drained_by_holder(&error).await => {
+                        // The holder flushed, so the tail is in shared storage
+                        // and this writer can read it. Claim again from
+                        // scratch: the epoch has moved while we were asking.
+                        continue;
+                    }
+                    // Two opens overlapping, one of which committed the epoch
+                    // first. Nothing is wrong and nothing was fenced; the
+                    // manifest moved under this one, and reading it again
+                    // gives a claim that works.
+                    Err(error)
+                        if attempt + 1 < Self::CLAIM_ATTEMPTS
+                            && error
+                                .downcast_ref::<walleye_lance::LanceError>()
+                                .is_some_and(walleye_lance::is_claim_race) =>
+                    {
+                        // Count it as contention so the wait is a real one:
+                        // two opens that retry the instant they lose simply
+                        // race again, and the backoff exists to stagger them.
+                        self.contention.fetch_add(1, Ordering::AcqRel);
+                        self.wait_before_reclaiming().await;
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            let Some(opened) = opened else {
+                return Err(Box::new(walleye_lance::LanceError::io(format!(
+                    "could not claim the writer for {} after {} attempts; another opener keeps \
+                     winning the race",
+                    self.definition.name,
+                    Self::CLAIM_ATTEMPTS
+                ))));
+            };
+            *table = Some(opened);
+            *self.claimed_at.lock().await = Some(Instant::now());
         }
         Ok(MutexGuard::map(table, |table| {
             table.as_mut().expect("initialized writer")
@@ -474,7 +646,7 @@ impl SnapshotSource for Stream {
         Arc::new(Schema::new(self.config.schema.fields().clone()))
     }
     async fn snapshot(&self) -> Result<TableSnapshot, walleye_lance::LanceError> {
-        for attempt in 0..2 {
+        for attempt in 0..Engine::RECLAIM_ATTEMPTS {
             let outcome = async {
                 let table = self.table().await.map_err(|e| {
                     match walleye_lance::writer_fence_reason(&*e) {
@@ -497,7 +669,11 @@ impl SnapshotSource for Stream {
                 Err(error) => error,
             };
             match error.fence_reason() {
-                Some(reason) if attempt == 0 && self.discard_fenced_writer(reason).await => {
+                Some(reason)
+                    if attempt + 1 < Engine::RECLAIM_ATTEMPTS
+                        && self.discard_fenced_writer(reason).await =>
+                {
+                    self.wait_before_reclaiming().await;
                     continue;
                 }
                 _ => return Err(error),
@@ -534,6 +710,12 @@ pub struct Engine {
     reach: Arc<dyn walleye_v8::Host>,
 }
 impl Engine {
+    /// How many times a request will claim the writer back before it gives up
+    /// and answers retryably. One is enough for a handover, where the peer has
+    /// finished and gone; it is not enough when the peer is still writing,
+    /// because the reclaim is fenced mid-replay and the caller sees a refusal
+    /// for what is only a queue.
+    const RECLAIM_ATTEMPTS: usize = 5;
     pub async fn open(
         config: ApiConfig,
         cache: CachedStorage,
@@ -592,7 +774,19 @@ impl Engine {
         Ok(engine)
     }
     async fn register(&self, definition: StreamDefinition) -> Result<Arc<Stream>, Error> {
-        let config = definition.table_config(&self.config.root_uri)?;
+        let mut config = definition.table_config(&self.config.root_uri)?;
+        // Say where this writer answers, so a process that finds the stream
+        // held here can ask it to drain rather than only being told no.
+        if let Some(endpoint) = self.cluster.as_ref().and_then(Cluster::self_endpoint) {
+            config = config.with_holder(endpoint);
+        }
+        // And name the log this writer appends to. Every process pointed at
+        // one Bitr gateway spells it the same way, and every process without
+        // one is writing the object store's own WAL, which they all share.
+        config = config.with_log(match &self.config.bitr_url {
+            Some(url) => format!("bitr:{}", url.trim_end_matches('/')),
+            None => "object-store".to_owned(),
+        });
         let mut streams = self.streams.lock().await;
         // A drop in flight owns this name until it finishes. Reinstating it
         // here would resurrect the stream the drop is removing.
@@ -613,7 +807,9 @@ impl Engine {
                 lease: Mutex::new(None),
                 last_compaction: Mutex::new(None),
                 seq: Mutex::new(None),
-                superseded: std::sync::atomic::AtomicBool::new(false),
+                claimed_at: Mutex::new(None),
+                contention: std::sync::atomic::AtomicU32::new(0),
+                cluster: self.cluster.clone(),
             })
         });
         Ok(stream.clone())
@@ -992,7 +1188,11 @@ impl Engine {
         stream: &Arc<Stream>,
         batches: Vec<RecordBatch>,
     ) -> Result<(), Error> {
-        for attempt in 0..2 {
+        // More than one reclaim, because under contention the reopen is itself
+        // what gets fenced: the writer is taken back while it is still
+        // replaying the log. Each attempt waits longer than the last, so a
+        // caller sees a slower write rather than a refused one.
+        for attempt in 0..Self::RECLAIM_ATTEMPTS {
             let outcome = async {
                 stream.table().await?.append(batches.clone()).await?;
                 Ok::<(), Error>(())
@@ -1003,7 +1203,7 @@ impl Engine {
                 Err(error) => error,
             };
             let reason = walleye_lance::writer_fence_reason(&*error);
-            let Some(reason) = reason.filter(|_| attempt == 0) else {
+            let Some(reason) = reason.filter(|_| attempt + 1 < Self::RECLAIM_ATTEMPTS) else {
                 return Err(error);
             };
             // A fence means somebody else claimed this stream's writer.
@@ -1021,6 +1221,7 @@ impl Engine {
             if !stream.discard_fenced_writer(reason).await {
                 return Err(error);
             }
+            stream.wait_before_reclaiming().await;
         }
         unreachable!("the loop returns on both outcomes")
     }

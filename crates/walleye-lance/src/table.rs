@@ -115,6 +115,16 @@ pub struct TableConfig {
     /// regardless of size. Defaults to [`Table::MEMTABLE_AGE`].
     pub memtable_max_age: Duration,
     pub text_indexes: Vec<TextIndexSpec>,
+    /// Where other processes can reach the daemon that opens this table, so a
+    /// writer that finds the stream held elsewhere can ask the holder to drain
+    /// rather than only refusing. `None` on a writer with no address to give.
+    pub holder: Option<String>,
+    /// Which write-ahead log this writer appends to, as a name every process
+    /// writing this stream would spell the same way: a Bitr gateway's address,
+    /// or the object store's own WAL. Two writers that name the same log can
+    /// replay each other's entries; two that do not, cannot, whatever either
+    /// one's log happens to contain.
+    pub log: Option<String>,
 }
 impl TableConfig {
     pub fn new(
@@ -172,6 +182,8 @@ impl TableConfig {
             vector_indexes: Vec::new(),
             memtable_max_age: Table::MEMTABLE_AGE,
             text_indexes: Vec::new(),
+            holder: None,
+            log: None,
         })
     }
     /// Smallest possible encoded row: fixed-width columns at their width,
@@ -190,6 +202,21 @@ impl TableConfig {
             .max(1)
     }
     /// Override how long the active memtable may hold rows before it rotates.
+    /// Advertise where this writer answers, for the note it leaves while it
+    /// holds an unflushed tail. See [`crate::open_tail`].
+    #[must_use]
+    pub fn with_holder(mut self, holder: impl Into<String>) -> Self {
+        self.holder = Some(holder.into());
+        self
+    }
+
+    /// Name the write-ahead log this writer appends to. See [`Self::log`].
+    #[must_use]
+    pub fn with_log(mut self, log: impl Into<String>) -> Self {
+        self.log = Some(log.into());
+        self
+    }
+
     pub fn with_memtable_max_age(mut self, age: Duration) -> Self {
         self.memtable_max_age = age;
         self
@@ -248,6 +275,11 @@ pub struct Table {
     /// so reusing the open handle saves the manifest resolution and index
     /// load that every query would otherwise repeat against object storage.
     sstables: Arc<SsTableCache>,
+    /// Whether this writer has already said, in shared storage, that it is
+    /// holding rows nobody else can read. Set on the first append after a
+    /// drain and cleared by the next checkpoint, so the note costs one put a
+    /// flush rather than one an append. See [`crate::open_tail`].
+    tail_noted: bool,
 }
 
 /// Emit bounded, stage-level open diagnostics without exposing a dataset URI,
@@ -459,6 +491,11 @@ impl Table {
                 FtsIndexConfig::new(spec.name.clone(), field_id, spec.column.clone()),
             ));
         }
+        // Before the claim, not after. Claiming is what fences the writer that
+        // holds the stream, so a writer that is going to refuse has to refuse
+        // before it takes anything: otherwise a doomed open still knocks the
+        // incumbent off a stream it was serving correctly.
+        reachable_tail(&dataset, &config, &durability).await?;
         let writer_started = open_stage_start(&config, "mem_wal_writer");
         let writer = match dataset.mem_wal_writer(config.shard_id, writer_config).await {
             Ok(writer) => {
@@ -498,12 +535,17 @@ impl Table {
             storage,
             durability,
             sstables: Arc::new(SsTableCache::new(256)),
+            tail_noted: false,
         })
     }
     /// Acknowledge only after the configured WAL authority accepts the Arrow IPC entry.
     /// Batches are put in slices of at most [`Self::PUT_ROWS`] rows, each its
     /// own WAL entry, so a large insert can roll across memtables.
     pub async fn append(&mut self, batches: Vec<RecordBatch>) -> lance::Result<()> {
+        // Before the rows, not after: a note left for a write that then fails
+        // costs a successor one refusal it did not need, and a note missing
+        // for a write that succeeded costs it the rows.
+        self.note_open_tail().await;
         let mut owned = Vec::new();
         for b in batches.into_iter().flat_map(|b| {
             let rows = b.num_rows();
@@ -648,6 +690,51 @@ impl Table {
     pub fn config(&self) -> &TableConfig {
         &self.config
     }
+    /// Say, in shared storage, that this writer is holding acknowledged rows
+    /// that are only in its own log. Cheap and idempotent after the first
+    /// call, because the flag is what decides whether a put happens at all.
+    async fn note_open_tail(&mut self) {
+        if self.tail_noted {
+            return;
+        }
+        let Ok(store) = self.dataset.object_store(None).await else {
+            return;
+        };
+        let base = self.dataset.branch_location().path;
+        let note = crate::open_tail::OpenTail {
+            after: 0,
+            stream: self.config.stream.clone(),
+            log: self.config.log.clone(),
+            holder: self.config.holder.clone(),
+        };
+        // A note that cannot be written is not worth failing a write over: it
+        // costs a successor its safety check, and losing the write costs the
+        // caller its row. Say so loudly instead.
+        match crate::open_tail::write(&store, &base, self.config.shard_id, &note).await {
+            Ok(()) => self.tail_noted = true,
+            Err(error) => eprintln!(
+                "walleye.storage open_tail stream={} outcome=unwritten error={error}",
+                self.config.stream
+            ),
+        }
+    }
+
+    /// Take the note down: the tail is in shared storage now.
+    async fn clear_open_tail(&mut self) {
+        let Ok(store) = self.dataset.object_store(None).await else {
+            return;
+        };
+        let base = self.dataset.branch_location().path;
+        if let Err(error) = crate::open_tail::clear(&store, &base, self.config.shard_id).await {
+            eprintln!(
+                "walleye.storage open_tail stream={} outcome=uncleared error={error}",
+                self.config.stream
+            );
+            return;
+        }
+        self.tail_noted = false;
+    }
+
     /// The MemWAL writer epoch this table claimed when it opened.
     pub fn writer_epoch(&self) -> u64 {
         self.writer.epoch()
@@ -731,7 +818,9 @@ impl Table {
     }
     /// Flush to Lance SSTables and advance the manifest replay watermark.
     pub async fn checkpoint(&mut self) -> lance::Result<()> {
-        self.writer.checkpoint().await
+        self.writer.checkpoint().await?;
+        self.clear_open_tail().await;
+        Ok(())
     }
     pub async fn close(self) -> lance::Result<()> {
         self.writer.close().await
@@ -895,6 +984,136 @@ fn same_fields(left: &Schema, right: &Schema) -> bool {
 /// A tail with entries after the last checkpoint is refused: only the
 /// object-store WAL holds them, and a Bitr-backed writer could not replay
 /// them. Reopen in single-node mode, checkpoint, then move.
+/// Whether the tail the last writer left is one this writer can actually read.
+///
+/// The note in shared storage says acknowledged rows exist that no flush has
+/// covered. It does not say whose log they are in, so this asks the only
+/// question that settles it: can this writer produce them? A Bitr writer
+/// recovers its stream and sees whether the quorum has anything; a node on the
+/// object-store WAL looks in the WAL directory, which is shared and therefore
+/// always readable by whoever gets here.
+///
+/// An unreachable tail is refused rather than replayed-as-empty, because the
+/// alternative is a stream that silently loses rows a client was told were
+/// stored. The fix is to drain it where it lives - check point the writer that
+/// holds it - after which any writer may take the stream.
+///
+/// What this catches is a log that has never held the stream, which is the
+/// shape a second cluster arrives in. It does not catch a cluster that held
+/// the stream once, was drained, and is now being handed a tail that grew
+/// somewhere else: its log is not empty, so it looks able to serve. Telling
+/// that apart needs the note to say which log the tail is in and the claimant
+/// to prove it holds those positions, and positions are per-cluster, so it
+/// needs an identity for a log as well. Worth doing; not done here.
+async fn reachable_tail(
+    dataset: &Dataset,
+    config: &TableConfig,
+    durability: &LanceDurability,
+) -> lance::Result<()> {
+    let store = dataset.object_store(None).await?;
+    let base = dataset.branch_location().path;
+    let note = crate::open_tail::read(&store, &base, config.shard_id, &config.stream).await?;
+    let Some(note) = note else {
+        return Ok(());
+    };
+    // The note names the log the tail is in, and this writer knows the name of
+    // its own. Equal names mean one log and an ordinary replay; different
+    // names mean the rows are somewhere this writer cannot reach, whatever its
+    // own log happens to hold.
+    let reachable = match (&note.log, &config.log) {
+        (Some(held), Some(mine)) => held == mine,
+        // A note from before logs were named, or a writer that was not told
+        // its own. Fall back to asking whether this writer's log has anything
+        // for the stream at all. That is right for a log which has never held
+        // it and wrong for one that held it, flushed, and handed it on - which
+        // is why the names exist.
+        _ => match durability {
+            LanceDurability::ObjectStore => {
+                let wal_dir =
+                    lance::dataset::mem_wal::util::shard_wal_path(&base, &config.shard_id);
+                let mut entries = store.inner.list(Some(&wal_dir));
+                let mut found = false;
+                while let Some(object) = entries.try_next().await? {
+                    if object
+                        .location
+                        .filename()
+                        .and_then(lance::dataset::mem_wal::util::parse_bit_reversed_filename)
+                        .is_some()
+                    {
+                        found = true;
+                        break;
+                    }
+                }
+                found
+            }
+            LanceDurability::Bitr(backend) => !backend
+                .writer()
+                .recover(&config.stream, 0)
+                .await
+                .map_err(|e| lance::Error::io(format!("Bitr recovery for {}: {e}", config.stream)))?
+                .is_empty(),
+        },
+    };
+    if reachable {
+        return Ok(());
+    }
+    Err(lance::Error::invalid_input(format!(
+        "stream {} has rows a writer acknowledged and no flush has covered, and they are {}. \
+         Opening here would serve the stream without them. Check point the writer that holds \
+         them - it is the one whose log has the tail - and any writer may take the stream \
+         afterwards.",
+        config.stream, UNREACHABLE_TAIL
+    )))
+}
+
+/// The address of the writer holding this stream's unflushed tail, if it left
+/// one and is reachable. A caller refused by [`reachable_tail`] asks this, then
+/// asks that address to flush.
+pub async fn open_tail_holder(
+    storage: &LanceStorageOptions,
+    uri: &str,
+    shard_id: Uuid,
+    stream: &str,
+) -> lance::Result<Option<String>> {
+    let dataset = match storage.open_dataset(uri).await {
+        Ok(dataset) => dataset,
+        Err(lance::Error::DatasetNotFound { .. }) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let store = dataset.object_store(None).await?;
+    let base = dataset.branch_location().path;
+    Ok(crate::open_tail::read(&store, &base, shard_id, stream)
+        .await?
+        .and_then(|note| note.holder))
+}
+
+/// Whether this error is the refusal [`reachable_tail`] raises, which a caller
+/// can resolve by getting the holder to flush rather than by giving up.
+#[must_use]
+pub fn is_unreachable_tail(error: &lance::Error) -> bool {
+    error.to_string().contains(UNREACHABLE_TAIL)
+}
+
+/// The sentence both the refusal and its recogniser are built from, so they
+/// cannot drift apart.
+const UNREACHABLE_TAIL: &str = "not in the write-ahead log this writer reads";
+
+/// Whether this error is two openers racing for the same writer epoch rather
+/// than anything being wrong.
+///
+/// Claiming is a compare-and-swap on the shard manifest. When two opens
+/// overlap, as a reconfigure reopening a stream does with the warm-up opening
+/// it, one commits the epoch and the other finds it taken. The loser has not
+/// been fenced and nothing is damaged: the manifest simply moved under it, and
+/// reading it again gives a claim that works. Worth retrying, and no use
+/// reporting.
+#[must_use]
+pub fn is_claim_race(error: &lance::Error) -> bool {
+    let said = error.to_string();
+    said.contains("another writer claimed epoch")
+        || (said.contains("Failed to claim shard") && said.contains("already exists"))
+}
+
 pub async fn prepare_bitr_takeover(
     storage: &LanceStorageOptions,
     uri: &str,

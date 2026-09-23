@@ -321,7 +321,12 @@ impl Service {
                 peers,
             )
             .await?;
-            let cluster = (config.members.len() > 1 || config.kubernetes.is_some())
+            // A ring of one is still a ring. It routes nothing - the owner of
+            // every stream is this node, and `owner` answers None for that -
+            // but it is how a node knows the address its peers reach it on,
+            // and a single-node deployment holding an unflushed tail has to be
+            // able to say where that is. See `Stream::drained_by_holder`.
+            let cluster = (!config.members.is_empty() || config.kubernetes.is_some())
                 .then(|| {
                     cluster::Cluster::new(
                         config.node_id.clone(),

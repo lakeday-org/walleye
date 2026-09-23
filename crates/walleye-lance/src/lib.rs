@@ -6,6 +6,7 @@ mod error;
 mod identity;
 mod ipc;
 pub mod model;
+mod open_tail;
 pub mod prompt;
 mod result_memory;
 mod sql;
@@ -39,7 +40,8 @@ pub use sql::{SnapshotSource, TableSnapshot, query, query_with_gathered, sql_tab
 pub use storage_options::LanceStorageOptions;
 pub use table::{
     LsmStats, ScanResult, SearchRequest, SsTableStats, Table, TableConfig, TextIndexSpec,
-    TextQuery, VectorIndexSpec, VectorQuery, next_writer_epoch, prepare_bitr_takeover,
+    TextQuery, VectorIndexSpec, VectorQuery, is_claim_race, is_unreachable_tail, next_writer_epoch,
+    open_tail_holder, prepare_bitr_takeover,
 };
 pub type Error = WalBackendError;
 pub type Result<T> = std::result::Result<T, WalBackendError>;
