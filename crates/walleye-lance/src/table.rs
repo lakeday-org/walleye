@@ -119,6 +119,12 @@ pub struct TableConfig {
     /// writer that finds the stream held elsewhere can ask the holder to drain
     /// rather than only refusing. `None` on a writer with no address to give.
     pub holder: Option<String>,
+    /// Which write-ahead log this writer appends to, as a name every process
+    /// writing this stream would spell the same way: a Bitr gateway's address,
+    /// or the object store's own WAL. Two writers that name the same log can
+    /// replay each other's entries; two that do not, cannot, whatever either
+    /// one's log happens to contain.
+    pub log: Option<String>,
 }
 impl TableConfig {
     pub fn new(
@@ -177,6 +183,7 @@ impl TableConfig {
             memtable_max_age: Table::MEMTABLE_AGE,
             text_indexes: Vec::new(),
             holder: None,
+            log: None,
         })
     }
     /// Smallest possible encoded row: fixed-width columns at their width,
@@ -200,6 +207,13 @@ impl TableConfig {
     #[must_use]
     pub fn with_holder(mut self, holder: impl Into<String>) -> Self {
         self.holder = Some(holder.into());
+        self
+    }
+
+    /// Name the write-ahead log this writer appends to. See [`Self::log`].
+    #[must_use]
+    pub fn with_log(mut self, log: impl Into<String>) -> Self {
+        self.log = Some(log.into());
         self
     }
 
@@ -690,6 +704,7 @@ impl Table {
         let note = crate::open_tail::OpenTail {
             after: 0,
             stream: self.config.stream.clone(),
+            log: self.config.log.clone(),
             holder: self.config.holder.clone(),
         };
         // A note that cannot be written is not worth failing a write over: it
@@ -998,41 +1013,46 @@ async fn reachable_tail(
     let store = dataset.object_store(None).await?;
     let base = dataset.branch_location().path;
     let note = crate::open_tail::read(&store, &base, config.shard_id, &config.stream).await?;
-    let Some(_note) = note else {
+    let Some(note) = note else {
         return Ok(());
     };
-    let reachable = match durability {
-        // The object-store WAL is shared storage. If a tail is noted, its
-        // entries are either in that directory, where this writer will replay
-        // them, or they are in somebody's quorum and this writer cannot have
-        // them.
-        LanceDurability::ObjectStore => {
-            let wal_dir = lance::dataset::mem_wal::util::shard_wal_path(&base, &config.shard_id);
-            let mut entries = store.inner.list(Some(&wal_dir));
-            let mut found = false;
-            while let Some(object) = entries.try_next().await? {
-                if object
-                    .location
-                    .filename()
-                    .and_then(lance::dataset::mem_wal::util::parse_bit_reversed_filename)
-                    .is_some()
-                {
-                    found = true;
-                    break;
+    // The note names the log the tail is in, and this writer knows the name of
+    // its own. Equal names mean one log and an ordinary replay; different
+    // names mean the rows are somewhere this writer cannot reach, whatever its
+    // own log happens to hold.
+    let reachable = match (&note.log, &config.log) {
+        (Some(held), Some(mine)) => held == mine,
+        // A note from before logs were named, or a writer that was not told
+        // its own. Fall back to asking whether this writer's log has anything
+        // for the stream at all. That is right for a log which has never held
+        // it and wrong for one that held it, flushed, and handed it on - which
+        // is why the names exist.
+        _ => match durability {
+            LanceDurability::ObjectStore => {
+                let wal_dir =
+                    lance::dataset::mem_wal::util::shard_wal_path(&base, &config.shard_id);
+                let mut entries = store.inner.list(Some(&wal_dir));
+                let mut found = false;
+                while let Some(object) = entries.try_next().await? {
+                    if object
+                        .location
+                        .filename()
+                        .and_then(lance::dataset::mem_wal::util::parse_bit_reversed_filename)
+                        .is_some()
+                    {
+                        found = true;
+                        break;
+                    }
                 }
+                found
             }
-            found
-        }
-        // The uncertified tail, which is what `prepare_bitr_takeover` asks
-        // for too: this runs before the claim, so nothing this writer wrote
-        // is in here yet and anything at all means the quorum has held this
-        // stream.
-        LanceDurability::Bitr(backend) => !backend
-            .writer()
-            .recover(&config.stream, 0)
-            .await
-            .map_err(|e| lance::Error::io(format!("Bitr recovery for {}: {e}", config.stream)))?
-            .is_empty(),
+            LanceDurability::Bitr(backend) => !backend
+                .writer()
+                .recover(&config.stream, 0)
+                .await
+                .map_err(|e| lance::Error::io(format!("Bitr recovery for {}: {e}", config.stream)))?
+                .is_empty(),
+        },
     };
     if reachable {
         return Ok(());
@@ -1077,6 +1097,7 @@ pub fn is_unreachable_tail(error: &lance::Error) -> bool {
 /// The sentence both the refusal and its recogniser are built from, so they
 /// cannot drift apart.
 const UNREACHABLE_TAIL: &str = "not in the write-ahead log this writer reads";
+
 
 pub async fn prepare_bitr_takeover(
     storage: &LanceStorageOptions,

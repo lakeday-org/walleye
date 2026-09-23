@@ -35,6 +35,20 @@ pub struct OpenTail {
     pub after: u64,
     /// Which stream, for an operator reading this by hand.
     pub stream: String,
+    /// Which write-ahead log the tail is in.
+    ///
+    /// This is the field that settles the question. Asking a claimant whether
+    /// its own log has anything for the stream only works while "anything" and
+    /// "these rows" mean the same thing, and they stop meaning the same thing
+    /// the moment a log has held the stream before: a cluster that wrote,
+    /// flushed and handed the stream on still has its old entries, answers yes,
+    /// and replays them over a tail somebody else is holding. Naming the log
+    /// removes the guess - a claimant either is that log or is not.
+    ///
+    /// Absent on a note left before this field existed, where the emptiness
+    /// question is still the best available answer.
+    #[serde(default)]
+    pub log: Option<String>,
     /// Where to reach the writer holding it, when it is reachable at all.
     ///
     /// A claimant that cannot read the tail does not have to give up: it can
@@ -73,6 +87,7 @@ pub async fn read(
         Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes).unwrap_or(OpenTail {
             after: 0,
             stream: stream.to_owned(),
+            log: None,
             holder: None,
         }))),
         Err(lance::Error::NotFound { .. }) => Ok(None),

@@ -50,7 +50,19 @@ fn writer(on: &Arc<MemoryReplica>) -> Arc<QuorumWriter> {
 /// Claim the writer for this stream and open it, exactly as the daemon does:
 /// mint the epoch from the manifest, build a Bitr identity fenced to it, open.
 async fn claim(uri: &str, on: &Arc<QuorumWriter>) -> lance::Result<(Table, u64, bool)> {
-    let config = TableConfig::new("events", uri.to_owned(), schema(), vec!["id".into()]).unwrap();
+    claim_on(uri, on, "bitr:test").await
+}
+
+/// As [`claim`], but naming the log this writer appends to, which is what a
+/// daemon does from its configured gateway address.
+async fn claim_on(
+    uri: &str,
+    on: &Arc<QuorumWriter>,
+    log: &str,
+) -> lance::Result<(Table, u64, bool)> {
+    let config = TableConfig::new("events", uri.to_owned(), schema(), vec!["id".into()])
+        .unwrap()
+        .with_log(log);
     let storage = LanceStorageOptions::default();
     let moved = prepare_bitr_takeover(&storage, uri, config.shard_id, &config.stream, on).await?;
     let epoch = next_writer_epoch(&storage, uri, config.shard_id).await?;
@@ -139,7 +151,7 @@ async fn a_tail_in_another_cluster_is_refused_rather_than_lost() {
     let uri = format!("file://{}/events", dir.path().display());
     let (first, second) = (cluster(), cluster());
 
-    let (mut one, _, _) = claim(&uri, &writer(&first)).await.unwrap();
+    let (mut one, _, _) = claim_on(&uri, &writer(&first), "bitr:first").await.unwrap();
     one.append(vec![row(1, "acknowledged by the first cluster")])
         .await
         .expect("the first writer stores a row");
@@ -148,7 +160,7 @@ async fn a_tail_in_another_cluster_is_refused_rather_than_lost() {
     // first quorum, and nowhere else. That is the state a live handover
     // happens in, and the state that used to lose it.
 
-    let refused = claim(&uri, &writer(&second)).await;
+    let refused = claim_on(&uri, &writer(&second), "bitr:second").await;
     let error = refused
         .err()
         .expect("a writer that cannot read the tail must not open the stream");
@@ -184,7 +196,7 @@ async fn a_checkpoint_makes_the_tail_safe_to_hand_to_anyone() {
     let uri = format!("file://{}/events", dir.path().display());
     let (first, second) = (cluster(), cluster());
 
-    let (mut one, _, _) = claim(&uri, &writer(&first)).await.unwrap();
+    let (mut one, _, _) = claim_on(&uri, &writer(&first), "bitr:first").await.unwrap();
     one.append(vec![row(1, "acknowledged by the first cluster")])
         .await
         .unwrap();
@@ -192,7 +204,9 @@ async fn a_checkpoint_makes_the_tail_safe_to_hand_to_anyone() {
     one.checkpoint().await.expect("drain to shared storage");
     one.close().await.expect("close");
 
-    let (mut two, _, _) = claim(&uri, &writer(&second)).await.unwrap();
+    let (mut two, _, _) = claim_on(&uri, &writer(&second), "bitr:second")
+        .await
+        .unwrap();
     assert_eq!(
         ids(&mut two).await,
         vec![1],
@@ -205,11 +219,61 @@ async fn a_checkpoint_makes_the_tail_safe_to_hand_to_anyone() {
     two.close().await.unwrap();
 
     // And back again, to the first cluster, which has not seen row 2 either.
-    let (mut back, _, _) = claim(&uri, &writer(&first)).await.unwrap();
+    let (mut back, _, _) = claim_on(&uri, &writer(&first), "bitr:first").await.unwrap();
     assert_eq!(
         ids(&mut back).await,
         vec![1, 2],
         "the rota works across clusters when every turn ends drained"
     );
     back.close().await.unwrap();
+}
+
+/// The case that "is my log empty?" gets wrong: a cluster that held the
+/// stream, flushed it, and handed it on.
+///
+/// Its log still has the entries it wrote back then, so asked whether it has
+/// anything for the stream it answers yes - honestly, and about the wrong
+/// rows. It would open, replay its own stale entries, and serve the stream
+/// without the tail another cluster is holding.
+///
+/// Naming the log removes the guess. The note says which log the tail is in;
+/// a claimant is that log or it is not, and what its own log happens to
+/// contain does not enter into it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cluster_with_stale_history_does_not_think_it_holds_the_tail() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("file://{}/events", dir.path().display());
+    let (east, west) = (cluster(), cluster());
+
+    // East holds the stream first, writes, and drains. Its log keeps those
+    // entries; the rows themselves are in the object store now.
+    let (mut first, _, _) = claim_on(&uri, &writer(&east), "bitr:east").await.unwrap();
+    first.append(vec![row(1, "written by east")]).await.unwrap();
+    first.checkpoint().await.expect("east drains");
+    first.close().await.unwrap();
+
+    // West takes the stream and holds an unflushed tail of its own.
+    let (mut second, _, _) = claim_on(&uri, &writer(&west), "bitr:west").await.unwrap();
+    assert_eq!(ids(&mut second).await, vec![1], "east's drained row moved");
+    second
+        .append(vec![row(2, "written by west, not flushed")])
+        .await
+        .unwrap();
+
+    // East comes back. Its log is not empty - it has its own old entries - so
+    // the emptiness question would wave it through. The name does not.
+    let refused = claim_on(&uri, &writer(&east), "bitr:east").await;
+    let error = refused
+        .err()
+        .expect("east must not open over a tail west is holding");
+    assert!(
+        error
+            .to_string()
+            .contains("not in the write-ahead log this writer reads"),
+        "the refusal names the problem, got {error}"
+    );
+
+    // West is undisturbed and still holds what it wrote.
+    assert_eq!(ids(&mut second).await, vec![1, 2]);
+    second.close().await.unwrap();
 }

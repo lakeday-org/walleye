@@ -741,6 +741,13 @@ impl Engine {
         if let Some(endpoint) = self.cluster.as_ref().and_then(Cluster::self_endpoint) {
             config = config.with_holder(endpoint);
         }
+        // And name the log this writer appends to. Every process pointed at
+        // one Bitr gateway spells it the same way, and every process without
+        // one is writing the object store's own WAL, which they all share.
+        config = config.with_log(match &self.config.bitr_url {
+            Some(url) => format!("bitr:{}", url.trim_end_matches('/')),
+            None => "object-store".to_owned(),
+        });
         let mut streams = self.streams.lock().await;
         // A drop in flight owns this name until it finishes. Reinstating it
         // here would resurrect the stream the drop is removing.
