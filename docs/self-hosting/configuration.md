@@ -86,7 +86,6 @@ Only relevant if you write workers, which the
 | `WALLEYE_WORKER_HEAP_MB` | `128` | Heap per worker, unless the view names its own. |
 | `WALLEYE_WORKER_SECONDS` | `15` | Deadline per batch, unless the view names its own. |
 | `WALLEYE_WORKER_FETCH_ALLOW` | empty | Hosts a worker may call, comma separated. Empty means none. |
-| `WALLEYE_VIEW_IDLE_SECONDS` | `30` | How long the pipeline driver waits when nothing moved. |
 
 `WALLEYE_WORKER_FETCH_ALLOW` is empty on purpose. A worker that can call
 anywhere can send your rows anywhere, so reaching out is a decision you make

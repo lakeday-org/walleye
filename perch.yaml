@@ -220,3 +220,29 @@
     their vectors empty and filled in later. A search index that is behind
     for a while is a far smaller failure than a stream that stops accepting
     rows.
+
+- name: an-alarm-fires-only-as-owner
+  where: mentions update_alarms
+  each: method
+  min: 75
+  ensure: >
+    A firing begins with a write to the alarm's key's ownership record, made
+    through the ownership compare-and-swap, before the handler runs. Deciding
+    to fire from what was loaded earlier, or from a local copy, without that
+    write, lets a process that has lost the key run its alarms beside the new
+    owner.
+
+- name: one-firing-per-occurrence
+  where: "crates/walleye-node/src/**/*.rs"
+  ensure_absent: >
+    Scheduled work run by a timer, a polling loop or a per-node task that does
+    not go through an alarm on the owner of its key. Anything that decides
+    when work runs outside the alarms runs once per process instead of once
+    per occurrence, and does not survive the process.
+
+- name: a-schedule-that-fell-behind-runs-once
+  where: "crates/walleye-node/src/alarms.rs"
+  ensure_absent: >
+    A schedule that missed several occurrences running once for each of them,
+    or dropping them without saying so. One run stands for the latest missed
+    time and reports how many it covers.
