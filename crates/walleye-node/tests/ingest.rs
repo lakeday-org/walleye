@@ -1,10 +1,11 @@
 //! Ingest anything, end to end through `POST /v1/ingest/{source}`.
 //!
-//! Most of these run without a judge configured, because that is what a CI
-//! checkout has and because every judgement has a safe default the path must
-//! work with: a lossless type, an optional field, a value kept aside rather
-//! than lost. The ones that need a judge to decide something say so and skip
-//! without a key.
+//! The judge is a stand-in served in the test (see `common`), so every test
+//! here runs in CI. It answers only what a test scripts; anything else gets no
+//! answer, which is how the path sees a judge that is unsure or absent. So
+//! most of these test the safe defaults - a lossless type, an optional field,
+//! a value kept aside rather than lost - and the ones that script answers test
+//! what the path does with a judgement, not how good the judgement is.
 use axum::{
     body::{Body, to_bytes},
     http::{Request, StatusCode},
@@ -17,11 +18,25 @@ use walleye_ring::Node;
 
 const TOKEN: &str = "deployment-secret-token";
 
-fn keyed() -> bool {
-    std::env::var("TYPESAFE_API_KEY").is_ok_and(|key| !key.trim().is_empty())
+mod common;
+
+/// The judge's answer to a choice, sure of it.
+fn sure(label: &str, confidence: f64) -> Value {
+    common::choice(label, confidence, &[(label, confidence)])
+}
+
+/// A needle that matches only this source's questions.
+fn stream(source: &str) -> String {
+    format!("stream \"{source}\"")
+}
+
+/// The judge's answer about one field of one source.
+fn about(source: &str, field: &str, question: &str, answer: Value) {
+    common::answer_to(&stream(source), &format!("\"{field}\""), question, answer);
 }
 
 async fn node(dir: &std::path::Path) -> (Arc<Service>, axum::Router) {
+    common::start(common::JEV);
     let service = Service::open(Config {
         node_id: "n".into(),
         listen: "127.0.0.1:0".into(),
@@ -379,10 +394,16 @@ async fn the_body_can_be_one_record_a_list_or_a_wrapped_list() {
 /// given as seconds, and a count each fit several and are.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_judge_reads_what_the_values_mean() {
-    if !keyed() {
-        eprintln!("skipping: no decision service key configured");
-        return;
-    }
+    common::start(common::JEV);
+    about("shop_orders", "price", "type_", sure("decimal", 0.82));
+    about(
+        "shop_orders",
+        "created",
+        "type_",
+        sure("timestamp_seconds", 0.95),
+    );
+    about("shop_orders", "quantity", "type_", sure("int64", 0.99));
+    common::answer(&stream("shop_orders"), "key", sure("order_id", 0.91));
     let d = tempfile::tempdir().unwrap();
     let (service, app) = node(d.path()).await;
     let records: Vec<Value> = (0..6)
@@ -454,10 +475,8 @@ async fn a_judge_reads_what_the_values_mean() {
 /// holds is mapped to that table once, and by the rule after.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_second_source_of_the_same_records_joins_the_existing_table() {
-    if !keyed() {
-        eprintln!("skipping: no decision service key configured");
-        return;
-    }
+    common::start(common::JEV);
+    common::answer(&stream("billing_us"), "route", sure("billing_eu", 0.84));
     let d = tempfile::tempdir().unwrap();
     let (service, app) = node(d.path()).await;
     let first: Vec<Value> = (0..5)
@@ -524,10 +543,8 @@ async fn a_field_renamed_to_another_case_convention_is_the_same_column() {
 /// being left behind in the old one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_column_typed_too_narrowly_is_widened_and_rebuilt() {
-    if !keyed() {
-        eprintln!("skipping: no decision service key configured");
-        return;
-    }
+    common::start(common::JEV);
+    about("parts", "code", "widen_", sure("string", 0.9));
     let d = tempfile::tempdir().unwrap();
     let (service, app) = node(d.path()).await;
     let before: Vec<Value> = (0..5)
@@ -558,10 +575,18 @@ async fn a_column_typed_too_narrowly_is_widened_and_rebuilt() {
 /// column held beside what the new field holds.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_field_renamed_to_another_word_is_merged_into_its_column() {
-    if !keyed() {
-        eprintln!("skipping: no decision service key configured");
-        return;
-    }
+    common::start(common::JEV);
+    // Leaning, not sure: 62 against 38, the real service's answer to this.
+    about(
+        "support",
+        "client",
+        "rename_",
+        common::choice(
+            "customer",
+            0.24,
+            &[("customer", 0.62), ("__new_field__", 0.38)],
+        ),
+    );
     let d = tempfile::tempdir().unwrap();
     let (service, app) = node(d.path()).await;
     let before: Vec<Value> = ["acme corp", "globex", "initech", "umbrella", "hooli"]
@@ -595,10 +620,18 @@ async fn a_field_renamed_to_another_word_is_merged_into_its_column() {
 /// every record from the rename on, which is why renames lean towards merging.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_key_renamed_to_another_word_is_still_the_key() {
-    if !keyed() {
-        eprintln!("skipping: no decision service key configured");
-        return;
-    }
+    common::start(common::JEV);
+    common::answer(&stream("fulfilment"), "key", sure("order_id", 0.9));
+    about(
+        "fulfilment",
+        "order_number",
+        "rename_",
+        common::choice(
+            "order_id",
+            0.61,
+            &[("order_id", 0.8), ("__new_field__", 0.2)],
+        ),
+    );
     let d = tempfile::tempdir().unwrap();
     let (service, app) = node(d.path()).await;
     let before: Vec<Value> = (0..6)
@@ -638,10 +671,17 @@ async fn a_key_renamed_to_another_word_is_still_the_key() {
 /// which means something else, is a new column.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_unrelated_new_field_is_not_merged_into_a_missing_column() {
-    if !keyed() {
-        eprintln!("skipping: no decision service key configured");
-        return;
-    }
+    common::start(common::JEV);
+    about(
+        "catalogue",
+        "weight_kg",
+        "rename_",
+        common::choice(
+            "__new_field__",
+            1.0,
+            &[("__new_field__", 1.0), ("colour", 0.0)],
+        ),
+    );
     let d = tempfile::tempdir().unwrap();
     let (service, app) = node(d.path()).await;
     let before: Vec<Value> = ["red", "blue", "green", "black", "white"]

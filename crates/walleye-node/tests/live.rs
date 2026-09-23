@@ -1,12 +1,9 @@
-//! A question asked in words, answered by what text means, end to end - with
-//! the model and the embedder as stand-ins, so this runs in CI.
+//! Against the real services: whether a real model, told the vectors exist,
+//! actually searches by meaning. That is an evaluation of the model, not a
+//! test of the code - the code is tested against stand-ins in
+//! `ask_by_meaning.rs` - so it is ignored by default and run on demand:
 //!
-//! What it proves is the plumbing: ingest embeds the reviews, the model is
-//! told which vector holds the meaning of which text, and the statement it
-//! drafts runs `embed` and `cosine_distance` and comes back ranked. The draft
-//! is scripted against the hint itself, so a model that was not told about
-//! the vectors gets no statement and the test fails. How well a real model
-//! uses the hint is `live.rs`'s question, run on demand.
+//!     cargo test -p walleye-node --test live -- --ignored
 use axum::{
     Router,
     body::{Body, to_bytes},
@@ -16,8 +13,6 @@ use serde_json::{Value, json};
 use tower::ServiceExt;
 use walleye_node::{ApiConfig, Config, Service, router};
 use walleye_ring::Node;
-
-mod common;
 
 const TOKEN: &str = "deployment-secret-token";
 
@@ -45,12 +40,19 @@ async fn post(app: &Router, uri: &str, body: Value) -> (StatusCode, Value) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_question_about_meaning_is_answered_by_meaning() {
-    common::start(common::Services {
-        jev: false,
-        model: true,
-        embeddings: true,
-    });
+#[ignore = "calls the real OpenAI services; run with --ignored to evaluate"]
+async fn a_real_model_searches_by_meaning() {
+    let key =
+        std::env::var("OPENAI_API_KEY").expect("set OPENAI_API_KEY to run the live evaluation");
+    // SAFETY: the only test in this binary.
+    unsafe {
+        std::env::set_var("WALLEYE_EMBEDDING_KEY", &key);
+        std::env::remove_var("WALLEYE_EMBEDDING_URL");
+        std::env::set_var("WALLEYE_EMBEDDING_MODEL", "text-embedding-3-small");
+        if std::env::var("WALLEYE_MODEL_KEY").is_err() {
+            std::env::set_var("WALLEYE_MODEL_KEY", &key);
+        }
+    }
     let d = tempfile::tempdir().unwrap();
     let service = Service::open(Config {
         node_id: "n".into(),
@@ -90,32 +92,21 @@ async fn a_question_about_meaning_is_answered_by_meaning() {
     assert_eq!(status, StatusCode::OK, "{report}");
     assert_eq!(report["embedded"], 5, "the reviews were embedded: {report}");
 
-    // Only a prompt that carries the hint gets a statement back.
-    let hint = r#"\"review_embedding\" holds the meaning of \"review\""#;
-    common::draft(
-        hint,
-        "SELECT \"review\" FROM \"shop_reviews\" \
-         ORDER BY cosine_distance(\"review_embedding\", embed('courier left it in the rain')) \
-         LIMIT 1",
-    );
+    // No review says "damaged" or "packaging". The first one means it.
     let (status, answer) = post(
         &app,
         "/v1/query",
-        json!({"text": "which review is about something damaged in delivery?"}),
+        json!({"text": "which review is about something damaged in delivery? just the top one"}),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{answer}");
-    assert_eq!(
-        common::model_prompts(hint).len(),
-        1,
-        "the model was told which vector holds the meaning of which text"
-    );
     let sql = answer["sql"].as_str().unwrap_or_default();
-    assert!(sql.contains("cosine_distance"), "{sql}");
-    assert_eq!(
-        answer["rows"][0]["review"].as_str().unwrap_or_default(),
-        reviews[0],
-        "embed and cosine_distance ran, and ranked: {answer}"
+    eprintln!("SQL {sql}");
+    assert!(
+        sql.contains("cosine_distance") && sql.contains("embed("),
+        "the model searched by meaning rather than by words: {sql}"
     );
+    let first = answer["rows"][0]["review"].as_str().unwrap_or_default();
+    assert_eq!(first, reviews[0], "the review that means it: {answer}");
     service.close().await;
 }
