@@ -142,3 +142,48 @@
     on both sides. Two writers that reclaim immediately take the epoch off each
     other faster than either can replay the log behind it, and most writes are
     refused while neither makes progress.
+
+- name: ingest-keeps-bronze-before-deciding
+  where: "crates/walleye-node/src/ingest.rs"
+  ensure_absent: >
+    A path that decides anything about an ingested record - its table, its
+    columns, whether it is refused - before the record has been written to
+    bronze exactly as it arrived. Every later decision is allowed to be wrong
+    because it can be remade from bronze; one made first cannot.
+
+- name: ingest-numbers-are-never-parsed-lossily
+  where: "crates/walleye-node/src/ingest/**/*.rs"
+  ensure_absent: >
+    An ingested number whose digits are carried forward through a floating
+    point value - into bronze, the catch-all column, an integer or decimal
+    column, or anything a judge is shown - rather than as the text it arrived
+    as. Parsing to test whether a value would fit a float column is fine; that
+    result is thrown away. Past 2^53 a float has already lost digits, and
+    nothing downstream can bring them back.
+
+- name: an-ingest-key-is-never-optional
+  where: mentions primary_key
+  each: method
+  min: 75
+  ensure: >
+    In the ingest path, a record missing its key, or whose key does not convert
+    to the key column's type, is refused into quarantine, and no judgement can
+    make the key optional or nullable. A judge decides what a field means; it
+    does not get to decide that a record can exist without being identifiable.
+
+- name: ingest-judges-once-not-per-record
+  where: "crates/walleye-node/src/ingest.rs"
+  ensure_absent: >
+    A call to the decision service made once per ingested record, or on the
+    path that places records into an already-routed table. A source is judged
+    when it is first seen and a table when its shape changes; after that the
+    rule decides, or a judge's mistake repeats on every record and costs a
+    round trip each time.
+
+- name: ingest-column-cap-is-code
+  where: "crates/walleye-node/src/ingest.rs"
+  ensure_absent: >
+    Any way for a table built by the ingest path to exceed MAX_COLUMNS because
+    a judge said so, or because a judge was unavailable. Records keyed by ids
+    would otherwise make one column per id, and the cap is what stops a single
+    wrong call doing that.

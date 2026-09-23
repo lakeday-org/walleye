@@ -181,11 +181,28 @@ pub struct StreamDefinition {
 pub fn hidden(column: &str) -> bool {
     column == HIDDEN_PK || column == HIDDEN_SEQ
 }
-fn now_micros() -> u64 {
+pub(crate) fn now_micros() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|since| since.as_micros() as u64)
         .unwrap_or(0)
+}
+/// The Arrow type a column kind is stored as. `json` is text holding the value
+/// exactly as it arrived; `decimal` keeps nine places, which is every
+/// currency; `timestamp` is microseconds in UTC.
+pub(crate) fn storage_type(kind: &str) -> Option<DataType> {
+    Some(match kind {
+        "string" | "json" => DataType::Utf8,
+        "int64" => DataType::Int64,
+        "float64" => DataType::Float64,
+        "boolean" => DataType::Boolean,
+        "decimal" => DataType::Decimal128(
+            crate::ingest::literal::DECIMAL_PRECISION,
+            crate::ingest::literal::DECIMAL_SCALE as i8,
+        ),
+        "timestamp" => DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("UTC".into())),
+        _ => return None,
+    })
 }
 fn valid_name(name: &str) -> bool {
     !name.is_empty()
@@ -304,13 +321,9 @@ impl StreamDefinition {
                 if c.name.starts_with('_') {
                     return Err(format!("column {} uses a reserved name", c.name).into());
                 }
-                let t = match c.kind.as_str() {
-                    "string" => DataType::Utf8,
-                    "int64" => DataType::Int64,
-                    "float64" => DataType::Float64,
-                    "boolean" => DataType::Boolean,
-                    _ => return Err("type must be string, int64, float64, or boolean".into()),
-                };
+                let t = storage_type(&c.kind).ok_or(
+                    "type must be string, int64, float64, boolean, decimal, timestamp, or json",
+                )?;
                 if c.nullable && self.primary_key.contains(&c.name) {
                     return Err("primary key must be non-nullable".into());
                 }
@@ -689,6 +702,9 @@ pub struct Engine {
     catalog_path: Path,
     views_path: Path,
     data_path: Path,
+    /// Where the ingest path keeps its routes and table rules.
+    ingest_path: Path,
+    ingest: crate::ingest::State,
     streams: Mutex<BTreeMap<String, Arc<Stream>>>,
     // Names whose drop is still in flight. A catalog load that read the
     // definition object before `drop_table` deleted it would otherwise
@@ -758,6 +774,8 @@ impl Engine {
             catalog,
             catalog_path: prefix.clone().join("streams"),
             views_path: prefix.clone().join("views"),
+            ingest_path: prefix.clone().join("ingest"),
+            ingest: crate::ingest::State::default(),
             data_path: prefix.join("data"),
             streams: Mutex::new(BTreeMap::new()),
             dropping: Mutex::new(BTreeSet::new()),
@@ -1061,10 +1079,12 @@ impl Engine {
                     c.nullable
                 } else {
                     match c.kind.as_str() {
-                        "string" => value.is_string(),
+                        "string" | "json" => value.is_string(),
                         "int64" => value.as_i64().is_some(),
                         "float64" => value.is_number(),
                         "boolean" => value.is_boolean(),
+                        "decimal" => value.is_number() || value.is_string(),
+                        "timestamp" => value.is_string() || value.as_i64().is_some(),
                         _ => false,
                     }
                 };
@@ -1374,6 +1394,10 @@ impl Engine {
                 }
             })
             .await;
+    }
+    /// The object store and prefix the ingest path keeps its rules under.
+    pub(crate) fn ingest_store(&self) -> (&Arc<ObjectStore>, &Path, &crate::ingest::State) {
+        (&self.catalog, &self.ingest_path, &self.ingest)
     }
     pub async fn table_names(&self) -> Result<Vec<String>, Error> {
         self.refresh_catalog().await?;
