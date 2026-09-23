@@ -72,11 +72,23 @@ able to do damage a rebuild can't undo:
   `{"user_123": …}`, are kept whole in the catch-all column instead.
 - **A rename to another case convention is a rename.** `userId` is `user_id`.
   The names match once case and separators are ignored, so no one needs to be
-  asked. Renames that change the words, like `customer` to `client`, go to the
-  judge.
+  asked.
 
-When the judge is unsure (below 0.6 confidence), or there's no judge
-configured, the safe choice is made instead. Safe means recoverable:
+Renames that change the words, like `customer` to `client`, go to the judge.
+It gets one question per new field, "which of these columns is it, or is it
+new?", with every column it could be as an option. Each option shows the
+values that column already holds, next to the values the new field holds.
+
+Renames are merged on the judge's lean, not only on conviction. Both mistakes
+can be fixed by rebuilding from bronze, and a missed rename is the worse one:
+it splits a field across two half-empty columns, and a missed key rename
+refuses every record from the rename on. In practice the judge is decisive
+when a merge would be wrong (a new `weight_kg` field versus a missing `colour`
+column: 100% new field) and only moderately sure when it's right (`client`
+versus `customer`: 62%).
+
+For everything except renames, when the judge is unsure (below 0.6
+confidence) or there's no judge configured, the safe choice is made instead. Safe means recoverable:
 
 - the narrowest type that loses nothing (`decimal` rather than `float64`)
 - optional rather than required

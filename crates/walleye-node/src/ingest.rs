@@ -74,6 +74,9 @@ const MANY_FIELDS: usize = 24;
 const CONFIDENT: f64 = 0.6;
 /// How many records a judge is shown when deciding about a table.
 const SHOWN: usize = 5;
+/// The option meaning "none of these columns" when asking about a rename. No
+/// column can be called this: a leading underscore is not a column name.
+const NEW_FIELD: &str = "__new_field__";
 
 /// Locks for routing a source and for changing a table, so two requests do
 /// not decide the same thing twice. In-process only: two nodes ingesting the
@@ -1089,14 +1092,20 @@ async fn evolve(
         );
     }
     // A new field, and a column no record carrying it has, of a kind its
-    // values fit, looks like a rename. It is asked rather than assumed: two
-    // unrelated fields can arrive and leave together too. The key is a
-    // candidate like any other column; a renamed key is still the key.
-    let mut renames: Vec<(String, &str, usize)> = Vec::new();
+    // values fit, may be that column renamed. The key is a candidate like any
+    // other column; a renamed key is still the key.
+    //
+    // One choice per new field, among every column it could be, rather than a
+    // yes or no per pair: the judge compares candidates against each other,
+    // which is the question that actually needs answering, and a field can
+    // only become one column.
+    let mut renames: Vec<(String, &str, Vec<usize>)> = Vec::new();
     let mut spelled: Vec<(String, usize)> = Vec::new();
+    let mut evidence: HashMap<usize, Vec<String>> = HashMap::new();
     for key in &unknown {
         let carrying: Vec<&&BTreeMap<String, Literal>> =
             records.iter().filter(|r| r.contains_key(*key)).collect();
+        let mut could_be = Vec::new();
         for (at, column) in rule.columns.iter().enumerate() {
             let absent = carrying.iter().all(|r| value_of(r, column).is_none());
             let kind = Kind::from_name(&column.kind).unwrap_or(Kind::String);
@@ -1108,41 +1117,68 @@ async fn evolve(
                     v.is_null() || convert(kind, v).is_some()
                 }
             });
-            if absent && fits && spelled_alike(key, &column.name) {
-                // Not a judgement: the same name in another case convention.
-                spelled.push(((*key).to_owned(), at));
+            if !(absent && fits) {
                 continue;
             }
-            if absent && fits {
-                let question = format!("rename_{}", renames.len());
-                // The judge cannot see the table, so show it the evidence: what
-                // the old column held, beside what the new field holds.
-                let held = held(engine, &rule.table, &column.name).await;
-                let now: Vec<String> = values[key]
-                    .iter()
-                    .filter(|v| !v.is_null())
-                    .take(4)
-                    .map(|v| v.sample())
-                    .collect();
-                first.insert(
-                    question.clone(),
-                    Question::noul(format!(
-                        "The column \"{old}\" used to hold values like {held}. These new \
-                         records do not have \"{old}\" at all; instead they have a field \
-                         \"{key}\" holding values like {now}. \"{key}\" is \"{old}\" \
-                         renamed: the same field under a new name.",
-                        old = column.name,
-                        held = if held.is_empty() {
-                            "nothing yet".to_owned()
-                        } else {
-                            held.join(", ")
-                        },
-                        now = now.join(", "),
-                    )),
-                );
-                renames.push((question, key, at));
+            if spelled_alike(key, &column.name) {
+                // Not a judgement: the same name in another case convention.
+                spelled.push(((*key).to_owned(), at));
+                could_be.clear();
+                break;
             }
+            could_be.push(at);
         }
+        if could_be.is_empty() {
+            continue;
+        }
+        // The judge cannot see the table, so show it what each candidate
+        // column already holds, beside what the new field holds.
+        let mut options: Vec<(String, String)> = Vec::new();
+        for at in &could_be {
+            let column = &rule.columns[*at];
+            if !evidence.contains_key(at) {
+                evidence.insert(*at, held(engine, &rule.table, &column.name).await);
+            }
+            let held = &evidence[at];
+            options.push((
+                column.name.clone(),
+                format!(
+                    "the existing column \"{}\" under a new name; it holds {}{}",
+                    column.name,
+                    Kind::from_name(&column.kind).map_or("text", |k| k.meaning()),
+                    if held.is_empty() {
+                        String::new()
+                    } else {
+                        format!(", with values like {}", held.join(", "))
+                    }
+                ),
+            ));
+        }
+        options.push((
+            NEW_FIELD.to_owned(),
+            "a new field that is none of these columns".to_owned(),
+        ));
+        let now: Vec<String> = values[key]
+            .iter()
+            .filter(|v| !v.is_null())
+            .take(4)
+            .map(|v| v.sample())
+            .collect();
+        let question = format!("rename_{}", renames.len());
+        first.insert(
+            question.clone(),
+            Question::choice(
+                format!(
+                    "These records have a field \"{key}\" the table has never seen, holding \
+                     values like {}, and they do not have the columns offered here. Is \
+                     \"{key}\" one of those columns under a new name - the same thing, now \
+                     spelled differently - or a new field?",
+                    now.join(", ")
+                ),
+                options,
+            ),
+        );
+        renames.push((question, key, could_be));
     }
     let state = describe(source, records);
     let answers = ask(&state, first).await;
@@ -1160,9 +1196,6 @@ async fn evolve(
     let mut renamed: BTreeSet<&str> = BTreeSet::new();
     if !rule.keys_are_data {
         for (key, at) in &spelled {
-            if renamed.contains(key.as_str()) {
-                continue;
-            }
             let column = &mut rule.columns[*at];
             if !column.aliases.iter().any(|a| a == key) {
                 column.aliases.push(key.clone());
@@ -1176,23 +1209,48 @@ async fn evolve(
                 renamed.insert(unknown_key);
             }
         }
-        for (question, key, at) in &renames {
-            if renamed.contains(key) {
+        // Merged on the lean, not on conviction. Both mistakes are recoverable
+        // from bronze, and the one this avoids is the worse of the two: a
+        // missed rename splits a field across two half-empty columns, and a
+        // missed key rename refuses every record from the rename on. Where two
+        // new fields lean towards the same column, the surer one has it.
+        let mut leans: Vec<(f64, &str, usize)> = renames
+            .iter()
+            .filter_map(|(question, key, could_be)| {
+                let answer = answers.get(question)?;
+                let label = answer.label()?;
+                let at = could_be
+                    .iter()
+                    .copied()
+                    .find(|at| rule.columns[*at].name == label)?;
+                Some((answer.confidence(), *key, at))
+            })
+            .collect();
+        leans.sort_by(|a, b| b.0.total_cmp(&a.0));
+        let mut taken: BTreeSet<usize> = BTreeSet::new();
+        for (confidence, key, at) in leans {
+            if renamed.contains(key) || !taken.insert(at) {
                 continue;
             }
-            if let Some((true, confidence)) = decided(&answers, question) {
-                let column = &mut rule.columns[*at];
-                if column.aliases.iter().any(|a| a == key) {
-                    continue;
-                }
-                column.aliases.push((*key).to_owned());
+            let column = &mut rule.columns[at];
+            column.aliases.push(key.to_owned());
+            out.changes.push(by_judge(
+                format!("{key} is {} renamed", column.name),
+                "true".into(),
+                confidence,
+            ));
+            renamed.insert(key);
+            out.reshaped = true;
+        }
+        for (question, key, _) in &renames {
+            if !renamed.contains(key)
+                && let Some(answer) = answers.get(question)
+            {
                 out.changes.push(by_judge(
-                    format!("{key} is {} renamed", column.name),
+                    format!("{key} is a new field"),
                     "true".into(),
-                    confidence,
+                    answer.confidence(),
                 ));
-                renamed.insert(key);
-                out.reshaped = true;
             }
         }
     }

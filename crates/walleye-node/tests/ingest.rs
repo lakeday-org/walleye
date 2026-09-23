@@ -552,3 +552,123 @@ async fn a_column_typed_too_narrowly_is_widened_and_rebuilt() {
     );
     service.close().await;
 }
+
+/// A rename that changes the word, not just the spelling: `customer` becomes
+/// `client`. Only a judge can say that, and it is asked with what the old
+/// column held beside what the new field holds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_field_renamed_to_another_word_is_merged_into_its_column() {
+    if !keyed() {
+        eprintln!("skipping: no decision service key configured");
+        return;
+    }
+    let d = tempfile::tempdir().unwrap();
+    let (service, app) = node(d.path()).await;
+    let before: Vec<Value> = ["acme corp", "globex", "initech", "umbrella", "hooli"]
+        .iter()
+        .enumerate()
+        .map(|(n, c)| json!({"ticket": format!("t{n}"), "customer": c, "priority": "low"}))
+        .collect();
+    ingest(&app, "support", Value::Array(before)).await;
+    let report = ingest(
+        &app,
+        "support",
+        json!([
+            {"ticket": "t8", "client": "stark industries", "priority": "high"},
+            {"ticket": "t9", "client": "wayne enterprises", "priority": "low"}
+        ]),
+    )
+    .await;
+    let merged = changed(&report, "client is customer renamed").expect("{report}");
+    assert_eq!(merged["by"], "jev", "{report}");
+    let rows = sql(&app, "SELECT customer FROM support WHERE ticket = 't9'").await;
+    assert_eq!(rows[0]["customer"], "wayne enterprises", "{rows:?}");
+    assert_eq!(
+        sql(&app, "SELECT count(*) AS n FROM support").await[0]["n"],
+        7,
+        "one column, every row: {report}"
+    );
+    service.close().await;
+}
+
+/// A key renamed to another word is still the key. Missing it would refuse
+/// every record from the rename on, which is why renames lean towards merging.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_key_renamed_to_another_word_is_still_the_key() {
+    if !keyed() {
+        eprintln!("skipping: no decision service key configured");
+        return;
+    }
+    let d = tempfile::tempdir().unwrap();
+    let (service, app) = node(d.path()).await;
+    let before: Vec<Value> = (0..6)
+        .map(|n| json!({"order_id": format!("ord_{n}"), "total": format!("{n}.50"), "status": "paid"}))
+        .collect();
+    let created = ingest(&app, "fulfilment", Value::Array(before)).await;
+    assert_eq!(
+        changed(&created, "primary key").unwrap()["chose"],
+        "order_id",
+        "{created}"
+    );
+    let report = ingest(
+        &app,
+        "fulfilment",
+        json!([{"order_number": "ord_7", "total": "8.50", "status": "shipped"}]),
+    )
+    .await;
+    assert!(
+        changed(&report, "order_number is order_id renamed").is_some(),
+        "{report}"
+    );
+    assert_eq!(
+        report["quarantined"], 0,
+        "the renamed key placed the record: {report}"
+    );
+    let rows = sql(
+        &app,
+        "SELECT status FROM fulfilment WHERE order_id = 'ord_7'",
+    )
+    .await;
+    assert_eq!(rows[0]["status"], "shipped", "{rows:?}");
+    service.close().await;
+}
+
+/// Leaning towards a merge must not mean merging anything that fits. A new
+/// field whose values would fit a column that happens to be missing, but
+/// which means something else, is a new column.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unrelated_new_field_is_not_merged_into_a_missing_column() {
+    if !keyed() {
+        eprintln!("skipping: no decision service key configured");
+        return;
+    }
+    let d = tempfile::tempdir().unwrap();
+    let (service, app) = node(d.path()).await;
+    let before: Vec<Value> = ["red", "blue", "green", "black", "white"]
+        .iter()
+        .enumerate()
+        .map(|(n, c)| json!({"sku": format!("s{n}"), "colour": c}))
+        .collect();
+    ingest(&app, "catalogue", Value::Array(before)).await;
+    // Weights would fit a text column; they are not colours.
+    let report = ingest(
+        &app,
+        "catalogue",
+        json!([{"sku": "s8", "weight_kg": "2.5"}, {"sku": "s9", "weight_kg": "0.75"}]),
+    )
+    .await;
+    assert!(
+        changed(&report, "weight_kg is colour renamed").is_none(),
+        "{report}"
+    );
+    assert!(
+        changed(&report, "new column weight_kg").is_some(),
+        "{report}"
+    );
+    let rows = sql(&app, "SELECT colour FROM catalogue WHERE sku = 's9'").await;
+    assert!(
+        rows[0]["colour"].is_null(),
+        "no weight became a colour: {rows:?}"
+    );
+    service.close().await;
+}
