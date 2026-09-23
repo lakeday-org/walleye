@@ -264,6 +264,11 @@ table clicks already exists with a different definition
 - a write while the quorum is unreachable is a 503. The LanceDB routes carry
   `Retry-After`; the native write routes return a bare 503 with the reason in
   the body
+- a request for a table whose owner is changing is refused with an
+  `x-walleye-route-error` header: `stale-owner` (409, nothing was done; retry),
+  `lost-ownership` (409, the owner changed before the write was acknowledged,
+  so its outcome is unknown; a retry of keyed rows is safe), `no-owner` or
+  `owner-unreachable` (503 with `Retry-After`, nothing was done)
 - not implemented anywhere: `update`, `delete` and `merge_insert` (404, no
   body), full-text search and full-text indexes, scalar indexes, ordering on a
   search, and column expressions in a projection. [Refusals](#refusals) has

@@ -50,8 +50,9 @@ which is the honest way to find out whether compaction is keeping up.
 
 ## A node stops and starts
 
-Stopping a node cleanly finishes what is in flight and checkpoints every open
-table before the process exits. Starting it again brings the tables back from
+Stopping a node cleanly finishes what is in flight, checkpoints every table it
+owns and hands each one over before the process exits, so another node can
+serve it at once. Starting it again brings the tables back from
 object storage and rebuilds the cache as queries arrive: correct immediately,
 warm shortly after.
 
@@ -61,13 +62,17 @@ That is all a resize is.
 
 In a cluster, roll one node at a time and watch `/readyz?require=all`. A quorum
 of two of three means the other two go on acknowledging writes while one is
-away — but ownership does not move, so the node you are restarting stops
-answering for its own tables until it is back. A restart inside the
-fifteen-second forward-retry budget is invisible to a client; one slower than
-that is a 502 on that node's tables. Waiting for every member to be serving
-again before taking the next node out is what keeps that to one node's share at
-a time. [Losing a node](shapes.md#losing-a-node) is the same mechanism without
-the plan.
+away, and the node being restarted hands its tables to them as it stops, so a
+client sees at most a retried request. The restarted node comes back owning
+nothing and takes tables only as other nodes leave. Waiting for every member
+to be serving again before taking the next node out keeps two replicas
+answering throughout. [Losing a node](shapes.md#losing-a-node) is the same
+handover without the plan.
+
+On one node, an upgrade can start the replacement beside the original. The
+replacement forwards everything to the original until the original is stopped
+and hands its tables over, then serves them itself. Set
+`WALLEYE_ADVERTISE_URL` so the replacement can reach the original.
 
 ## Tokens
 

@@ -57,9 +57,24 @@ holds back from them.
 | `WALLEYE_MEMBERS` | `id=http://host:8080,id=http://host:8080,…` |
 | `WALLEYE_NODE_ID` | Which member in that list this process is. Required with `WALLEYE_MEMBERS`. |
 | `WALLEYE_BITR_URL` | The local replica gateway. Setting it turns on quorum durability. |
+| `WALLEYE_ADVERTISE_URL` | Without `WALLEYE_MEMBERS`, where other processes reach this one. `http://localhost:<port>` by default. Set it when a replacement may start beside a running node. |
 
-Membership is static. A stream's owner is its rendezvous winner over that
-list, so the same list on every node means ownership never moves on restart.
+The member list says where each node answers and where the replicas are. It
+does not decide who owns a table; ownership is recorded in the bucket and
+moves by itself when a node stops or dies. [A cluster](cluster.md#ownership-in-the-bucket)
+describes it.
+
+## Ownership leases
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `WALLEYE_LEASE_TTL_MS` | `10000` | How long a node owns its tables after its last renewal. Renewed every third of it. |
+| `WALLEYE_LEASE_SKEW_MS` | `2000` | Slack a peer allows beyond the ttl before it calls a lease dead, and the longest a renewal may take to land. Below a third of the ttl. |
+| `WALLEYE_OWNERSHIP_SAMPLE_MS` | `2000` | How often the leases and ownership records are read. |
+
+A dead node's tables move after about ttl plus skew plus one sample, 14
+seconds by default, plus the time to replay the log. A shorter ttl moves them
+sooner and renews more often.
 
 ## Workers
 

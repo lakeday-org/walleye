@@ -110,27 +110,50 @@
     names no log. Without the record a successor cannot tell an empty stream
     from one whose tail it simply cannot reach.
 
-- name: a-handover-request-does-not-assume-one-ring
-  where: callers of ask_to_flush
-  each: method
-  min: 70
-  ensure: >
-    A request asking another process to flush a stream it holds does not
-    require that process to share this one's view of cluster membership, and
-    does not send a membership fingerprint that would make it refuse. The
-    writer being asked may belong to a different deployment entirely, which is
-    the case the request exists for; two deployments agree about the object
-    store and about nothing else.
-
 - name: a-fenced-writer-is-not-out-for-good
   where: "crates/walleye-node/src/**/*.rs"
   ensure_absent: >
     State that records a stream as taken by a peer and is then used to refuse
-    every later open of it for the life of the process. The writer claim is a
-    compare-and-swap any live process may win, so a fenced writer takes the
-    stream back on its next write, and several ingestors share one stream by
-    taking turns. A flag that never clears turns a rota into a one-way door and
-    sends clients to retry a process that will never serve them again.
+    every later open of it for the life of the process. Whether this process
+    may open a table's writer is decided by the table's ownership record, which
+    moves: an owner whose writer was fenced reopens it, and a process that
+    loses a table and later claims it again serves it again. A flag that never
+    clears sends clients to retry a process that will never serve them.
+
+- name: acknowledge-only-as-owner
+  where: callers of append
+  each: method
+  min: 75
+  ensure: >
+    A write is acknowledged only if, after its rows are durable, this process
+    still owns the table at the epoch of the writer that took them. Checking
+    ownership only before the write lets a process that lost the table while
+    the write was in flight tell a client it succeeded.
+
+- name: a-lapsed-lease-is-not-revived
+  where: "crates/walleye-node/src/ownership.rs"
+  ensure_absent: >
+    A lease renewal that extends this process's authority although it was
+    issued after that authority had lapsed, or although it took longer than the
+    skew allowance to land. Peers call a lease dead from what they have seen
+    of it, so a renewal that revives a lapsed session lets a process act as the
+    owner of tables a peer has already taken.
+
+- name: ownership-is-judged-on-the-monotonic-clock
+  where: "crates/walleye-node/src/ownership.rs"
+  ensure_absent: >
+    A decision about whether a lease is live, or whether this process is still
+    an owner, that reads the wall clock. Two machines' wall clocks disagree and
+    either can step; each side may trust only its own monotonic clock, with the
+    skew allowance covering the difference in rate.
+
+- name: a-claim-never-displaces-a-live-owner
+  where: "crates/walleye-node/src/ownership.rs"
+  ensure_absent: >
+    A claim of a table whose record names another process with a lease that
+    this process has not seen lapse, or a decision to claim made from the last
+    sample rather than from a fresh read of the record and the owner's lease.
+    A sample can be a renewal behind, and a live owner displaced is two writers.
 
 - name: a-reclaim-waits-before-it-races
   where: mentions discard_fenced_writer
