@@ -7,46 +7,7 @@ mod common;
 
 use common::*;
 use serde_json::{Value, json};
-use std::{
-    collections::BTreeMap,
-    time::{Duration, Instant},
-};
-
-async fn view(base: &str, name: &str, definition: Value) {
-    let answer = post(base, &format!("/v1/view/{name}/create/"), definition, false).await;
-    assert_eq!(answer.status, 200, "create view {name}: {}", answer.body);
-}
-
-/// Rows of a query, or none while the table does not exist yet.
-async fn rows(base: &str, sql: &str) -> Vec<Value> {
-    let answer = post(base, "/v1/query", json!({ "sql": sql }), false).await;
-    match answer.body {
-        Value::Array(rows) if answer.status == 200 => rows,
-        _ => Vec::new(),
-    }
-}
-
-async fn wait_for<F, Fut>(what: &str, limit: Duration, mut check: F)
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = bool>,
-{
-    let started = Instant::now();
-    while !check().await {
-        assert!(started.elapsed() < limit, "{what} within {limit:?}");
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-}
-
-/// Which of `bases` holds `key`.
-async fn holder(bases: &[&str], key: &str) -> Option<usize> {
-    for (index, base) in bases.iter().enumerate() {
-        if held(base).await.contains_key(key) {
-            return Some(index);
-        }
-    }
-    None
-}
+use std::time::{Duration, Instant};
 
 /// A view over `events` whose worker sets its own alarm `delay_ms` after each
 /// batch, and whose `alarm` handler records that it was woken.
@@ -65,45 +26,6 @@ fn waker(delay_ms: u64) -> Value {
     })
 }
 
-/// A view on a one-second clock whose worker records which occurrence each
-/// run stands for and how many it covered.
-fn ticker() -> Value {
-    json!({
-        "every_seconds": 1,
-        "target": "ticks",
-        "worker": "export default (rows, ctx) => [{ at: ctx.scheduled.scheduledTime, \
-                   missed: ctx.scheduled.missed, nonce: Math.random() }]",
-    })
-}
-
-/// Every run of the ticker, as (scheduled time, missed), ordered.
-async fn ticks(base: &str) -> Vec<(u64, u64)> {
-    let mut runs: Vec<(u64, u64)> = rows(base, "SELECT at, missed FROM ticks")
-        .await
-        .iter()
-        .map(|row| (row["at"].as_u64().unwrap(), row["missed"].as_u64().unwrap()))
-        .collect();
-    runs.sort_unstable();
-    runs
-}
-
-/// Each occurrence of a one-second schedule is accounted for exactly once:
-/// run by one run, or covered by the next run's missed count. No time is run
-/// twice and none is skipped silently.
-fn each_occurrence_once(runs: &[(u64, u64)]) {
-    let mut times: Vec<u64> = runs.iter().map(|(at, _)| *at).collect();
-    times.dedup();
-    assert_eq!(times.len(), runs.len(), "an occurrence ran twice: {runs:?}");
-    for pair in runs.windows(2) {
-        let ((previous, _), (at, missed)) = (pair[0], pair[1]);
-        assert_eq!(
-            at - previous,
-            (missed + 1) * 1000,
-            "occurrences between {previous} and {at} are unaccounted for: {runs:?}"
-        );
-    }
-}
-
 /// An alarm set on the owner of its key fires once on the key's next owner
 /// after the first is killed with the alarm pending.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -111,13 +33,19 @@ async fn an_alarm_on_a_killed_owner_fires_once_on_the_next() {
     let store = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();
     let root = format!("file://{}/store", store.path().display());
-    let a = Proc::start("a", &root, cache.path(), None, fast()).await;
-    let b = Proc::start("b", &root, cache.path(), None, fast()).await;
-    let c = Proc::start("c", &root, cache.path(), None, fast()).await;
-    define(&a.base, "events").await;
-    view(&a.base, "waker", waker(4_000)).await;
-    assert_eq!(write(&a.base, "events", 1).await.status, 200);
-    let bases = [a.base.as_str(), b.base.as_str(), c.base.as_str()];
+    let mut procs = vec![
+        Proc::start("a", &root, cache.path(), None, fast()).await,
+        Proc::start("b", &root, cache.path(), None, fast()).await,
+        Proc::start("c", &root, cache.path(), None, fast()).await,
+    ];
+    define(&procs[0].base, "events").await;
+    view(&procs[0].base, "waker", waker(4_000)).await;
+    assert_eq!(write(&procs[0].base, "events", 1).await.status, 200);
+    // A is whichever owns the source, and so the view's alarms.
+    let bases: Vec<&str> = procs.iter().map(|p| p.base.as_str()).collect();
+    let owner = holder_of(&bases, "events").await;
+    let a = procs.remove(owner);
+    let (b, c) = (procs.remove(0), procs.remove(0));
     wait_for(
         "the worker set its alarm",
         Duration::from_secs(10),
@@ -128,7 +56,6 @@ async fn an_alarm_on_a_killed_owner_fires_once_on_the_next() {
         },
     )
     .await;
-    assert_eq!(holder(&bases, "events").await, Some(0));
 
     a.kill().await;
     let killed = Instant::now();
@@ -392,64 +319,4 @@ async fn a_worker_wakes_itself() {
         described.body
     );
     node.stop().await;
-}
-
-/// How table ownership is spread after rolling restarts. Measured, not
-/// balanced: a restarted process comes back owning nothing and takes tables
-/// only as others leave.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn ownership_after_rolling_restarts() {
-    let store = tempfile::tempdir().unwrap();
-    let cache = tempfile::tempdir().unwrap();
-    let root = format!("file://{}/store", store.path().display());
-    let mut procs = Vec::new();
-    for id in ["a", "b", "c"] {
-        procs.push(Proc::start(id, &root, cache.path(), None, fast()).await);
-    }
-    let tables: Vec<String> = (0..12).map(|i| format!("r{i}")).collect();
-    for (index, table) in tables.iter().enumerate() {
-        define(&procs[index % 3].base, table).await;
-    }
-    let spread = |counts: &BTreeMap<String, usize>| counts.values().copied().collect::<Vec<_>>();
-    let mut report = Vec::new();
-    for round in 0..3 {
-        for slot in 0..3 {
-            let id = ["a", "b", "c"][slot];
-            let leaving = procs.remove(slot);
-            leaving.stop().await;
-            procs.insert(
-                slot,
-                Proc::start(id, &root, cache.path(), None, fast()).await,
-            );
-            // Every table has an owner again before the next roll.
-            let bases: Vec<String> = procs.iter().map(|p| p.base.clone()).collect();
-            let mut counts = BTreeMap::new();
-            let started = Instant::now();
-            loop {
-                counts.clear();
-                let mut owned = 0;
-                for (index, base) in bases.iter().enumerate() {
-                    let held = held(base).await;
-                    let n = tables.iter().filter(|t| held.contains_key(*t)).count();
-                    owned += n;
-                    counts.insert(["a", "b", "c"][index].to_owned(), n);
-                }
-                if owned == tables.len() {
-                    break;
-                }
-                assert!(started.elapsed() < Duration::from_secs(30), "{counts:?}");
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-            report.push(format!(
-                "round {round} after rolling {id}: {:?}",
-                spread(&counts)
-            ));
-        }
-    }
-    for line in &report {
-        println!("  {line}");
-    }
-    for p in procs {
-        p.stop().await;
-    }
 }

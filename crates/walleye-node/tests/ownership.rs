@@ -12,39 +12,49 @@ use std::{
 };
 use walleye_node::LeaseConfig;
 
-/// Kill the owner of every table, without a release. The survivors take the
-/// tables over - spread between them rather than all to one - within a lease
-/// verdict plus the sampling that notices it, and every acknowledged write is
+/// Kill an owner of a third of the tables, without a release. The survivors
+/// take its tables over within a lease verdict plus the sampling that notices
+/// it, end up sharing all of them evenly, and every acknowledged write is
 /// there exactly once.
 async fn a_killed_owner_is_replaced(bitr_url: Option<&str>) {
     let store = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();
     let root = format!("file://{}/store", store.path().display());
     let lease = fast();
-    let a = Proc::start("a", &root, cache.path(), bitr_url, lease.clone()).await;
-    let b = Proc::start("b", &root, cache.path(), bitr_url, lease.clone()).await;
-    let c = Proc::start("c", &root, cache.path(), bitr_url, lease.clone()).await;
+    let mut procs = vec![
+        Proc::start("a", &root, cache.path(), bitr_url, lease.clone()).await,
+        Proc::start("b", &root, cache.path(), bitr_url, lease.clone()).await,
+        Proc::start("c", &root, cache.path(), bitr_url, lease.clone()).await,
+    ];
 
-    // Twelve tables, all created through A, so A owns them all.
+    // Twelve tables, created through A and placed evenly.
     let tables: Vec<String> = (0..12).map(|i| format!("t{i}")).collect();
     for table in &tables {
-        define(&a.base, table).await;
+        define(&procs[0].base, table).await;
     }
-    assert_eq!(held(&a.base).await.len(), tables.len());
+    let bases: Vec<&str> = procs.iter().map(|p| p.base.as_str()).collect();
+    let spread = settled_spread(&bases, &tables, Duration::from_secs(30)).await;
+    assert_eq!(spread, vec![4, 4, 4], "placed evenly before the kill");
 
     // Rows through every process, acknowledged and never flushed: they exist
-    // only in the write-ahead log when A dies.
+    // only in the write-ahead log when their owner dies.
     let mut acked: BTreeMap<String, Vec<i64>> = BTreeMap::new();
-    let a_session = session(&a.base).await;
+    let doomed = session(&procs[0].base).await;
+    let mut doomed_tables = Vec::new();
     for (index, table) in tables.iter().enumerate() {
         for id in 0..6 {
-            let via = [&a.base, &b.base, &c.base][(index + id as usize) % 3];
+            let via = bases[(index + id as usize) % 3];
             let answer = write(via, table, id).await;
             assert_eq!(answer.status, 200, "write {table}/{id}: {}", answer.body);
-            assert_eq!(answer.owner, a_session, "A owns {table}");
+            if answer.owner == doomed && id == 0 {
+                doomed_tables.push(table.clone());
+            }
             acked.entry(table.clone()).or_default().push(id);
         }
     }
+    assert_eq!(doomed_tables.len(), 4, "{doomed_tables:?}");
+    let a = procs.remove(0);
+    let (b, c) = (procs.remove(0), procs.remove(0));
 
     a.kill().await;
     let killed = Instant::now();
@@ -84,10 +94,8 @@ async fn a_killed_owner_is_replaced(bitr_url: Option<&str>) {
         failover < bound,
         "failover took {failover:?}, bound {bound:?}"
     );
-    assert!(
-        !b_held.is_empty() && !c_held.is_empty(),
-        "a dead owner's tables spread over the survivors: b {b_held:?} c {c_held:?}"
-    );
+    let spread = settled_spread(&[&b.base, &c.base], &tables, Duration::from_secs(30)).await;
+    assert_eq!(spread, vec![6, 6], "the survivors share everything evenly");
 
     // Every acknowledged row is served, once, through either survivor, and
     // new writes land.
@@ -128,9 +136,14 @@ async fn a_paused_owner_is_fenced_and_stands_down() {
     let cache = tempfile::tempdir().unwrap();
     let root = format!("file://{}/store", store.path().display());
     let lease = fast();
-    let a = Proc::start("a", &root, cache.path(), None, lease.clone()).await;
-    let b = Proc::start("b", &root, cache.path(), None, lease.clone()).await;
-    define(&a.base, "p").await;
+    let first = Proc::start("a", &root, cache.path(), None, lease.clone()).await;
+    let second = Proc::start("b", &root, cache.path(), None, lease.clone()).await;
+    define(&first.base, "p").await;
+    // A is whichever owns the table.
+    let (a, b) = match holder_of(&[&first.base, &second.base], "p").await {
+        0 => (first, second),
+        _ => (second, first),
+    };
     for id in 0..5 {
         assert_eq!(write(&a.base, "p", id).await.status, 200);
     }
@@ -217,8 +230,9 @@ async fn two_processes_racing_for_a_table_leave_one_owner() {
 }
 
 /// The ramp upgrade: a replacement starts beside the original under the same
-/// configured id. It serves nothing it does not own - every request goes to
-/// the original - until the original releases, and then it takes everything.
+/// configured id. It serves only what it owns - its share, handed back by the
+/// original one key at a time - and sends everything else to the original,
+/// and once the original releases it takes everything.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_replacement_takes_over_when_the_original_leaves() {
     let store = tempfile::tempdir().unwrap();
@@ -240,20 +254,31 @@ async fn a_replacement_takes_over_when_the_original_leaves() {
     let replacement = Proc::start("single", &root, cache.path(), None, lease.clone()).await;
     let replacement_session = session(&replacement.base).await;
     assert_ne!(original_session, replacement_session);
-    // Long enough for the replacement to have judged every lease it found
-    // and swept twice: it still takes nothing from a live original.
-    tokio::time::sleep(Duration::from_millis(
-        lease.ttl_ms + lease.skew_ms + 3 * lease.sample_ms,
-    ))
+    // The two share the tables once the original has handed back its
+    // surplus, and a write through either lands where the table is held.
+    let spread = settled_spread(
+        &[&original.base, &replacement.base],
+        &tables,
+        Duration::from_secs(30),
+    )
     .await;
-    assert_eq!(held(&replacement.base).await, BTreeMap::new());
+    assert_eq!(spread.iter().sum::<usize>(), tables.len());
+    assert!(spread.iter().all(|n| (2..=3).contains(n)), "{spread:?}");
+    let on_replacement = held(&replacement.base).await;
     for table in &tables {
         let answer = write(&replacement.base, table, 10).await;
         assert_eq!(answer.status, 200, "{}", answer.body);
-        assert_eq!(answer.owner, original_session, "forwarded to the original");
+        let expected = if on_replacement.contains_key(table) {
+            &replacement_session
+        } else {
+            &original_session
+        };
+        assert_eq!(
+            &answer.owner, expected,
+            "{table} is served where it is held"
+        );
         acked.get_mut(table).unwrap().push(10);
     }
-    assert_eq!(held(&replacement.base).await, BTreeMap::new());
 
     let leaving = Instant::now();
     original.stop().await;
@@ -301,9 +326,14 @@ async fn requests_are_forwarded_held_off_or_refused() {
         skew_ms: 1_000,
         sample_ms: 250,
     };
-    let a = Proc::start("a", &root, cache.path(), None, lease.clone()).await;
-    let b = Proc::start("b", &root, cache.path(), None, lease.clone()).await;
-    define(&a.base, "q").await;
+    let first = Proc::start("a", &root, cache.path(), None, lease.clone()).await;
+    let second = Proc::start("b", &root, cache.path(), None, lease.clone()).await;
+    define(&first.base, "q").await;
+    // A is whichever owns the table.
+    let (a, b) = match holder_of(&[&first.base, &second.base], "q").await {
+        0 => (first, second),
+        _ => (second, first),
+    };
     let a_session = session(&a.base).await;
 
     let forwarded = write(&b.base, "q", 1).await;

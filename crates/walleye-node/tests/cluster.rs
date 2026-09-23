@@ -120,14 +120,6 @@ async fn every_member_serves_every_stream_with_one_owner() {
     for member in &members {
         sessions.push(session(member).await);
     }
-    // A table belongs to the process that claims it first, so creating table
-    // i through member i % 3 spreads them over all three.
-    let owner_of = |table: &str| -> String {
-        let index: usize = table[1..].parse().unwrap();
-        sessions[index % members.len()].clone()
-    };
-    let owners: BTreeSet<String> = tables.iter().map(|t| owner_of(t)).collect();
-    assert_eq!(owners.len(), 3, "six tables over three owners: {owners:?}");
 
     for (index, table) in tables.iter().enumerate() {
         let r = client
@@ -145,6 +137,8 @@ async fn every_member_serves_every_stream_with_one_owner() {
     }
 
     // Write 30 rows per table, round-robin across members; every id is unique.
+    // Whichever member a write arrives at, one process answers for a table.
+    let mut owner_of: std::collections::BTreeMap<String, String> = Default::default();
     for table in &tables {
         for i in 0..30i64 {
             let member = &members[(i as usize) % members.len()];
@@ -156,7 +150,6 @@ async fn every_member_serves_every_stream_with_one_owner() {
                 .send()
                 .await
                 .unwrap();
-            let expected_owner = owner_of(table);
             let served_by = r
                 .headers()
                 .get(cluster::OWNER_HEADER)
@@ -166,9 +159,18 @@ async fn every_member_serves_every_stream_with_one_owner() {
             let status = r.status();
             let body = r.text().await.unwrap();
             assert_eq!(status, 200, "{table} via {}: {body}", member.id);
-            assert_eq!(served_by, expected_owner, "{table} via {}", member.id);
+            let expected_owner = owner_of
+                .entry(table.clone())
+                .or_insert_with(|| served_by.clone());
+            assert_eq!(&served_by, expected_owner, "{table} via {}", member.id);
+            assert!(sessions.contains(&served_by), "{served_by}");
         }
     }
+    let owners: BTreeSet<&String> = owner_of.values().collect();
+    assert!(
+        owners.len() >= 2,
+        "six tables over several owners: {owners:?}"
+    );
 
     // Every member reports the same complete, duplicate-free contents.
     for table in &tables {
@@ -206,9 +208,14 @@ async fn every_member_serves_every_stream_with_one_owner() {
         }
     }
 
-    // SQL over one table routes to its owner from any member. t0 and t1 have
-    // different owners.
-    let (a, b) = (tables[0].clone(), tables[1].clone());
+    // SQL over one table routes to its owner from any member. Two tables with
+    // different owners:
+    let a = tables[0].clone();
+    let b = tables
+        .iter()
+        .find(|t| owner_of[*t] != owner_of[&a])
+        .expect("tables on two owners")
+        .clone();
     for member in &members {
         let r = client
             .post(format!("{}/v1/query", member.base))
@@ -256,7 +263,12 @@ async fn every_member_serves_every_stream_with_one_owner() {
     // A forwarded request that lands on a non-owner is refused, and says why,
     // instead of bouncing around.
     let table = &tables[0];
-    let non_owner = &members[1];
+    let non_owner = members
+        .iter()
+        .zip(&sessions)
+        .find(|(_, session)| **session != owner_of[table])
+        .map(|(member, _)| member)
+        .expect("a member that does not own it");
     let r = client
         .post(format!("{}/v1/table/{table}/count_rows/", non_owner.base))
         .header("x-api-key", TOKEN)
@@ -312,11 +324,24 @@ async fn a_write_to_a_non_owner_is_a_conflict_rather_than_a_bad_request() {
         .await
         .unwrap();
     assert_eq!(defined.status(), reqwest::StatusCode::OK);
+    let owner = defined
+        .headers()
+        .get(cluster::OWNER_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_owned();
 
     // Ask a non-owner directly, with the forwarding middleware told this
     // request was already forwarded once so it refuses to hop again. That is
     // the path where the engine's own not-owner answer reaches the client.
-    let other = &members[1];
+    let mut other = None;
+    for member in &members {
+        if session(member).await != owner {
+            other = Some(member);
+            break;
+        }
+    }
+    let other = other.expect("a member that does not own it");
     let answered = reqwest::Client::new()
         .post(format!("{}/v1/streams/journal/events", other.base))
         .header("authorization", format!("Bearer {TOKEN}"))
