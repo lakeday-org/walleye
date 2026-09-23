@@ -221,6 +221,62 @@ impl Cluster {
     /// the table across the network so this node can filter it. For a
     /// statement naming a single table, asking its owner to run the statement
     /// moves the answer rather than the table.
+    /// Append rows to a table another process owns, through that process's
+    /// own insert route. Returns the table version it reports.
+    pub async fn insert(
+        &self,
+        owner: &Peer,
+        table: &str,
+        batches: &[arrow_array::RecordBatch],
+    ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+        let Some(first) = batches.first() else {
+            return Err("nothing to insert".into());
+        };
+        let mut body = Vec::new();
+        {
+            let mut writer = arrow_ipc::writer::StreamWriter::try_new(&mut body, &first.schema())?;
+            for batch in batches {
+                writer.write(batch)?;
+            }
+            writer.finish()?;
+        }
+        let url = format!(
+            "{}/v1/table/{table}/insert/",
+            owner.addr.trim_end_matches('/')
+        );
+        let response = self
+            .client
+            .post(url)
+            .bearer_auth(&self.token)
+            .header(FORWARDED_HEADER, "1")
+            .header("content-type", "application/vnd.apache.arrow.stream")
+            .body(body)
+            .send()
+            .await
+            .map_err(|error| format!("owner {} is unreachable: {error}", owner.node))?;
+        let status = response.status();
+        let route_error = response
+            .headers()
+            .get(ROUTE_ERROR_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        let text = response.text().await.unwrap_or_default();
+        if status.is_success() {
+            let answer: serde_json::Value = serde_json::from_str(&text)?;
+            return Ok(answer["version"].as_u64().unwrap_or(0));
+        }
+        if route_error.as_deref() == Some("stale-owner") {
+            return Err(Box::new(NotOwner {
+                table: table.to_owned(),
+                owner: None,
+            }));
+        }
+        Err(format!(
+            "owner {} refused the insert into {table} with {status}: {text}",
+            owner.node
+        )
+        .into())
+    }
     pub async fn run_sql(&self, owner: &Peer, sql: &str) -> Result<bytes::Bytes, String> {
         let url = format!("{}/v1/query", owner.addr.trim_end_matches('/'));
         let response = self
@@ -417,7 +473,11 @@ pub async fn route_to_owner(
     let segments: Vec<&str> = path.trim_matches('/').split('/').collect();
     let routed = matches!(
         segments.as_slice(),
-        ["v1", "table", _, ..] | ["v1", "streams", ..] | ["v1", "query"]
+        ["v1", "table", _, ..]
+            | ["v1", "streams", ..]
+            | ["v1", "query"]
+            | ["v1", "view", _, "refresh"]
+            | ["v1", "worker", _, ..]
     );
     if !routed {
         return next.run(request).await;
@@ -443,6 +503,14 @@ pub async fn route_to_owner(
     };
     let target = match segments.as_slice() {
         ["v1", "table", name, ..] => Target::Table((*name).to_string()),
+        // A view's refresh and its worker's requests run where its alarms
+        // live: on the owner of the view's key.
+        ["v1", "view", name, "refresh"] | ["v1", "worker", name, ..] => {
+            match engine.view(name).await {
+                Ok(view) => Target::Table(crate::engine::driver_key(&view)),
+                Err(_) => Target::Local,
+            }
+        }
         ["v1", "streams", name, ..] => Target::Table((*name).to_string()),
         ["v1", "streams"] => match serde_json::from_slice::<serde_json::Value>(&bytes)
             .ok()
@@ -481,7 +549,7 @@ pub async fn route_to_owner(
     // A name that cannot be a table is the handler's to refuse; it must not
     // become an ownership record.
     let table = match target {
-        Target::Table(table) if crate::engine::valid_name(&table) => table,
+        Target::Table(table) if crate::engine::valid_key(&table) => table,
         _ => return local(parts, bytes).await,
     };
     // A request that finds the table moved - a forward that reaches a former

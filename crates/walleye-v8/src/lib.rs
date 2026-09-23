@@ -10,6 +10,12 @@
 //! }
 //! ```
 //!
+//! A worker may also export `alarm`, which the host calls when an alarm the
+//! worker set for itself with `ctx.setAlarm(when)` comes due; `ctx.getAlarm()`
+//! and `ctx.deleteAlarm()` read and cancel it. The host keeps the alarm; the
+//! worker only says what it wants, and nothing changes unless the turn ends
+//! without throwing.
+//!
 //! Everything a worker could use to reach the outside world is absent rather
 //! than forbidden. There is no network, no clock beyond the built-ins, no
 //! imports, and no way to keep state between batches, because each batch gets
@@ -61,7 +67,32 @@ pub struct Outcome {
     pub returned: String,
     /// Rows the worker wrote, in the order it wrote them, as (stream, JSON).
     pub writes: Vec<(String, String)>,
+    /// What the worker asked of its alarm, if anything. The last call wins.
+    pub alarm: Option<AlarmChange>,
 }
+
+/// A worker's request about its own alarm.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AlarmChange {
+    /// Fire at this many milliseconds since the Unix epoch.
+    Set(u64),
+    /// Cancel it.
+    Delete,
+}
+
+/// What the host tells a turn about its schedule.
+#[derive(Clone, Debug, Default)]
+pub struct Turn {
+    /// When the worker's alarm is set to fire, in milliseconds since the Unix
+    /// epoch, which `ctx.getAlarm()` answers.
+    pub alarm: Option<u64>,
+    /// For a turn run because a schedule came due, what it stands for, as a
+    /// JSON object: `ctx.scheduled` in a batch turn.
+    pub scheduled: Option<String>,
+}
+
+/// The alarm as the turn sees it, and what the worker asked for.
+struct AlarmSlot(std::sync::Mutex<(Option<u64>, Option<AlarmChange>)>);
 
 /// Rows a worker wrote during one turn, collected for the host.
 #[derive(Default)]
@@ -191,7 +222,13 @@ impl Drop for Deadline {
 /// This blocks the calling thread for as long as the worker runs, so call it
 /// from a thread that is allowed to block.
 pub fn run(worker: &str, rows: &str, limits: Limits) -> Result<Outcome, Error> {
-    run_with_host(worker, rows, limits, std::sync::Arc::new(Sealed))
+    run_with_host(
+        worker,
+        rows,
+        limits,
+        std::sync::Arc::new(Sealed),
+        Turn::default(),
+    )
 }
 
 /// Run a worker that may reach the host it was given.
@@ -200,8 +237,9 @@ pub fn run_with_host(
     rows: &str,
     limits: Limits,
     host: std::sync::Arc<dyn Host>,
+    turn: Turn,
 ) -> Result<Outcome, Error> {
-    run_entry(worker, rows, limits, host, Entry::Batch)
+    run_entry(worker, rows, limits, host, Entry::Batch, turn)
 }
 
 /// Answer one request with a worker's `fetch` handler. The request and the
@@ -212,8 +250,22 @@ pub fn run_request(
     request: &str,
     limits: Limits,
     host: std::sync::Arc<dyn Host>,
+    turn: Turn,
 ) -> Result<Outcome, Error> {
-    run_entry(worker, request, limits, host, Entry::Fetch)
+    run_entry(worker, request, limits, host, Entry::Fetch, turn)
+}
+
+/// Run a worker's `alarm` handler because its alarm came due. `info` is a
+/// JSON object - when it was scheduled for and which attempt this is - and
+/// the handler may write rows, return rows, or set its alarm again.
+pub fn run_alarm(
+    worker: &str,
+    info: &str,
+    limits: Limits,
+    host: std::sync::Arc<dyn Host>,
+    turn: Turn,
+) -> Result<Outcome, Error> {
+    run_entry(worker, info, limits, host, Entry::Alarm, turn)
 }
 
 fn run_entry(
@@ -222,12 +274,16 @@ fn run_entry(
     limits: Limits,
     host: std::sync::Arc<dyn Host>,
     entry: Entry,
+    turn: Turn,
 ) -> Result<Outcome, Error> {
     start();
     let heap = limits.heap_bytes.max(8 * 1024 * 1024);
     let mut isolate = v8::Isolate::new(v8::CreateParams::default().heap_limits(0, heap));
     isolate.set_slot(std::sync::Arc::new(Written::default()));
     isolate.set_slot(Reach(host));
+    isolate.set_slot(std::sync::Arc::new(AlarmSlot(std::sync::Mutex::new((
+        turn.alarm, None,
+    )))));
 
     // Running out of heap has to stop the worker, not grow the host. The
     // small grant is headroom for V8 to unwind in; returning a bigger limit
@@ -241,7 +297,7 @@ fn run_entry(
     );
 
     let deadline = Deadline::arm(isolate.thread_safe_handle(), limits.deadline);
-    let outcome = evaluate(&mut isolate, worker, rows, entry);
+    let outcome = evaluate(&mut isolate, worker, rows, entry, turn.scheduled.as_deref());
     let stopped_late = deadline.fired();
     let stopped_big = over.load(std::sync::atomic::Ordering::Acquire);
     drop(deadline);
@@ -358,6 +414,66 @@ fn call_callback(
     }
 }
 
+fn alarm_slot(scope: &mut v8::PinScope<'_, '_>) -> Option<std::sync::Arc<AlarmSlot>> {
+    scope.get_slot::<std::sync::Arc<AlarmSlot>>().cloned()
+}
+
+/// `ctx.setAlarm(when)`: fire this worker's `alarm` handler at `when`, a Date
+/// or milliseconds since the Unix epoch. Replaces any alarm already set.
+fn set_alarm_callback(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue,
+) {
+    let throw = |scope: &mut v8::PinScope<'_, '_>, message: &str| {
+        if let Some(message) = v8::String::new(scope, message) {
+            let exception = v8::Exception::error(scope, message);
+            scope.throw_exception(exception);
+        }
+    };
+    let when = args.get(0);
+    let Some(ms) = when.number_value(scope) else {
+        return throw(scope, "setAlarm needs a Date or a number of milliseconds");
+    };
+    if !ms.is_finite() || ms < 0.0 || !(when.is_number() || when.is_date()) {
+        return throw(scope, "setAlarm needs a Date or a number of milliseconds");
+    }
+    let Some(slot) = alarm_slot(scope) else {
+        return throw(scope, "this worker cannot set an alarm");
+    };
+    if let Ok(mut held) = slot.0.lock() {
+        let at = ms as u64;
+        *held = (Some(at), Some(AlarmChange::Set(at)));
+    }
+}
+
+/// `ctx.deleteAlarm()`: cancel this worker's alarm, if one is set.
+fn delete_alarm_callback(
+    scope: &mut v8::PinScope<'_, '_>,
+    _args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue,
+) {
+    if let Some(slot) = alarm_slot(scope)
+        && let Ok(mut held) = slot.0.lock()
+    {
+        *held = (None, Some(AlarmChange::Delete));
+    }
+}
+
+/// `ctx.getAlarm()`: when this worker's alarm fires, in milliseconds since
+/// the Unix epoch, or null.
+fn get_alarm_callback(
+    scope: &mut v8::PinScope<'_, '_>,
+    _args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue,
+) {
+    let at = alarm_slot(scope).and_then(|slot| slot.0.lock().ok().and_then(|held| held.0));
+    match at {
+        Some(at) => rv.set(v8::Number::new(scope, at as f64).into()),
+        None => rv.set_null(),
+    }
+}
+
 /// The function to call for this kind of turn.
 ///
 /// A worker may default-export a function, which is the whole of it, or an
@@ -375,6 +491,11 @@ fn handler<'s>(
             Entry::Fetch => Err(Error::Invalid(
                 "it default-exports a plain function, so it has no fetch handler; \
                  export default { fetch } to answer requests"
+                    .into(),
+            )),
+            Entry::Alarm => Err(Error::Invalid(
+                "it default-exports a plain function, so it has no alarm handler; \
+                 export default { alarm } to be woken"
                     .into(),
             )),
         };
@@ -402,12 +523,15 @@ pub enum Entry {
     Batch,
     /// One request to answer.
     Fetch,
+    /// The worker's alarm came due.
+    Alarm,
 }
 impl Entry {
     fn name(self) -> &'static str {
         match self {
             Self::Batch => "batch",
             Self::Fetch => "fetch",
+            Self::Alarm => "alarm",
         }
     }
 }
@@ -417,6 +541,7 @@ fn evaluate(
     worker: &str,
     rows: &str,
     entry: Entry,
+    scheduled: Option<&str>,
 ) -> Result<Outcome, Error> {
     v8::scope!(let scope, isolate);
     let context = v8::Context::new(scope, Default::default());
@@ -487,6 +612,31 @@ fn evaluate(
     if context_object.set(scope, call_key.into(), call.into()) != Some(true) {
         return Err(Error::Invalid("the runtime could not be prepared".into()));
     }
+    let set_alarm = v8::Function::new(scope, set_alarm_callback);
+    let delete_alarm = v8::Function::new(scope, delete_alarm_callback);
+    let get_alarm = v8::Function::new(scope, get_alarm_callback);
+    for (name, function) in [
+        ("setAlarm", set_alarm),
+        ("deleteAlarm", delete_alarm),
+        ("getAlarm", get_alarm),
+    ] {
+        let key = v8::String::new(scope, name).expect("a short name");
+        let function =
+            function.ok_or_else(|| Error::Invalid("the runtime could not be prepared".into()))?;
+        if context_object.set(scope, key.into(), function.into()) != Some(true) {
+            return Err(Error::Invalid("the runtime could not be prepared".into()));
+        }
+    }
+    if let Some(scheduled) = scheduled {
+        let text = v8::String::new(scope, scheduled)
+            .ok_or_else(|| Error::Invalid("the runtime could not be prepared".into()))?;
+        let value = v8::json::parse(scope, text)
+            .ok_or_else(|| Error::Invalid("the runtime could not be prepared".into()))?;
+        let key = v8::String::new(scope, "scheduled").expect("a short name");
+        if context_object.set(scope, key.into(), value) != Some(true) {
+            return Err(Error::Invalid("the runtime could not be prepared".into()));
+        }
+    }
     let receiver = v8::undefined(scope);
     let Some(returned) = transform.call(scope, receiver.into(), &[input, context_object.into()])
     else {
@@ -523,6 +673,7 @@ fn evaluate(
         .cloned()
         .and_then(|written| written.0.lock().ok().map(|held| held.clone()))
         .unwrap_or_default();
+    let alarm = alarm_slot(scope).and_then(|slot| slot.0.lock().ok().and_then(|held| held.1));
 
     if entry == Entry::Fetch {
         let response = v8::json::stringify(scope, returned)
@@ -530,12 +681,14 @@ fn evaluate(
         return Ok(Outcome {
             returned: response.to_rust_string_lossy(scope),
             writes,
+            alarm,
         });
     }
     // A worker that wrote its rows need not also return them. One that did
-    // neither has done nothing, and saying so beats a silent empty tier.
+    // neither has done nothing, and saying so beats a silent empty tier. An
+    // alarm handler owes nothing: being woken is the point of it.
     if returned.is_null_or_undefined() {
-        if writes.is_empty() {
+        if writes.is_empty() && alarm.is_none() && entry == Entry::Batch {
             return Err(Error::Returned(
                 "nothing: a worker must return rows, write them, or both".into(),
             ));
@@ -543,6 +696,7 @@ fn evaluate(
         return Ok(Outcome {
             returned: String::new(),
             writes,
+            alarm,
         });
     }
     if !returned.is_array() {
@@ -556,6 +710,7 @@ fn evaluate(
     Ok(Outcome {
         returned: output.to_rust_string_lossy(scope),
         writes,
+        alarm,
     })
 }
 
@@ -789,6 +944,7 @@ mod request_tests {
             request,
             Limits::default(),
             std::sync::Arc::new(Sealed),
+            Turn::default(),
         )
         .expect("worker answered")
     }
@@ -836,6 +992,7 @@ mod request_tests {
             "{}",
             Limits::default(),
             std::sync::Arc::new(Sealed),
+            Turn::default(),
         )
         .expect_err("it transforms rows, it does not answer");
         assert!(
@@ -865,8 +1022,122 @@ mod request_tests {
                 deadline: Duration::from_millis(300),
             },
             std::sync::Arc::new(Sealed),
+            Turn::default(),
         )
         .expect_err("it never returns");
         assert!(matches!(error, Error::Stopped(_)), "{error}");
+    }
+}
+
+#[cfg(test)]
+mod alarm_tests {
+    use super::*;
+
+    fn turn(alarm: Option<u64>) -> Turn {
+        Turn {
+            alarm,
+            scheduled: None,
+        }
+    }
+
+    #[test]
+    fn a_worker_sets_reads_and_cancels_its_own_alarm() {
+        let set = run_with_host(
+            "export default (rows, ctx) => { \
+               const before = ctx.getAlarm(); \
+               ctx.setAlarm(new Date(5000)); \
+               return [{ before, after: ctx.getAlarm() }]; }",
+            "[]",
+            Limits::default(),
+            std::sync::Arc::new(Sealed),
+            turn(Some(1000)),
+        )
+        .expect("worker ran");
+        assert_eq!(set.alarm, Some(AlarmChange::Set(5000)));
+        assert_eq!(set.returned, r#"[{"before":1000,"after":5000}]"#);
+
+        let cancelled = run_with_host(
+            "export default (rows, ctx) => { ctx.deleteAlarm(); return [{ now: ctx.getAlarm() }]; }",
+            "[]",
+            Limits::default(),
+            std::sync::Arc::new(Sealed),
+            turn(Some(1000)),
+        )
+        .expect("worker ran");
+        assert_eq!(cancelled.alarm, Some(AlarmChange::Delete));
+        assert_eq!(cancelled.returned, r#"[{"now":null}]"#);
+
+        let refused = run_with_host(
+            "export default (rows, ctx) => { ctx.setAlarm('soon'); return []; }",
+            "[]",
+            Limits::default(),
+            std::sync::Arc::new(Sealed),
+            turn(None),
+        )
+        .expect_err("a string is not a time");
+        assert!(matches!(refused, Error::Threw(_)), "{refused}");
+    }
+
+    #[test]
+    fn an_alarm_handler_is_told_what_woke_it() {
+        let woken = run_alarm(
+            "export default { alarm(info, ctx) { \
+               ctx.write('log', { at: info.scheduledTime, attempt: info.attempt }); } }",
+            r#"{"scheduledTime":42,"attempt":2}"#,
+            Limits::default(),
+            std::sync::Arc::new(Sealed),
+            turn(None),
+        )
+        .expect("handler ran");
+        assert_eq!(woken.writes.len(), 1);
+        assert_eq!(woken.writes[0].1, r#"{"at":42,"attempt":2}"#);
+        assert_eq!(
+            woken.alarm, None,
+            "an alarm handler that sets nothing leaves it to the host"
+        );
+
+        let missing = run_alarm(
+            "export default rows => rows",
+            "{}",
+            Limits::default(),
+            std::sync::Arc::new(Sealed),
+            turn(None),
+        )
+        .expect_err("no alarm handler");
+        assert!(
+            matches!(missing, Error::Invalid(ref d) if d.contains("alarm")),
+            "{missing}"
+        );
+    }
+
+    #[test]
+    fn a_scheduled_turn_sees_what_it_stands_for() {
+        let outcome = run_with_host(
+            "export default (rows, ctx) => [{ at: ctx.scheduled.scheduledTime, missed: ctx.scheduled.missed }]",
+            "[]",
+            Limits::default(),
+            std::sync::Arc::new(Sealed),
+            Turn {
+                alarm: None,
+                scheduled: Some(r#"{"scheduledTime":7,"missed":3}"#.into()),
+            },
+        )
+        .expect("worker ran");
+        assert_eq!(outcome.returned, r#"[{"at":7,"missed":3}]"#);
+    }
+
+    #[test]
+    fn a_worker_that_throws_changes_no_alarm() {
+        // The host applies an alarm change only from an outcome, and a turn
+        // that throws has none.
+        let error = run_with_host(
+            "export default (rows, ctx) => { ctx.setAlarm(1); throw new Error('no'); }",
+            "[]",
+            Limits::default(),
+            std::sync::Arc::new(Sealed),
+            turn(None),
+        )
+        .expect_err("it threw");
+        assert!(matches!(error, Error::Threw(_)), "{error}");
     }
 }

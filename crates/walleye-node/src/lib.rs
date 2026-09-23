@@ -1,17 +1,16 @@
 //! Single-deployment stream API, Foyer peer service, and Bitr node composition.
 pub mod access;
+pub(crate) mod alarms;
 pub mod ask;
 pub mod cluster;
 pub mod cron;
 mod engine;
 pub mod ingest;
+pub mod kubernetes;
 mod lancedb;
-mod processor;
+pub mod ownership;
 pub mod reach;
 pub mod values;
-pub use processor::ProcessorConfig;
-pub mod kubernetes;
-pub mod ownership;
 use axum::{
     Json, Router,
     body::Bytes,
@@ -50,8 +49,6 @@ pub struct Config {
     pub api: Option<ApiConfig>,
     #[serde(default)]
     pub kubernetes: Option<kubernetes::DiscoveryConfig>,
-    #[serde(default)]
-    pub processor: Option<ProcessorConfig>,
     /// Lease timing for table ownership.
     #[serde(default)]
     pub lease: LeaseConfig,
@@ -159,7 +156,6 @@ impl Config {
             members,
             api: Some(ApiConfig { root_uri, bitr_url }),
             kubernetes: None,
-            processor: None,
             lease,
         })
     }
@@ -239,6 +235,8 @@ pub struct Service {
     access: Arc<access::Access>,
     ring: Arc<Membership>,
     engine: Option<engine::Engine>,
+    /// Socket views this process holds a connection for.
+    sockets: tokio::sync::Mutex<std::collections::HashSet<String>>,
     hits: AtomicU64,
     misses: AtomicU64,
     stores: AtomicU64,
@@ -391,6 +389,7 @@ impl Service {
             access,
             ring,
             engine,
+            sockets: tokio::sync::Mutex::new(std::collections::HashSet::new()),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
             stores: AtomicU64::new(0),
@@ -414,10 +413,76 @@ impl Service {
         service.clone().spawn_disk_sampler();
         service.clone().spawn_idle_sweeper();
         service.clone().spawn_view_driver();
-        service.clone().spawn_socket_driver();
+        service.clone().spawn_alarms();
         service.clone().spawn_readiness();
         service.clone().spawn_ownership();
         Ok(service)
+    }
+
+    /// Fire alarms on the keys this process owns, each when it comes due.
+    ///
+    /// This is the one scheduler. It sleeps until the earliest pending alarm
+    /// or until an alarm or an ownership changes, and fires each due alarm
+    /// once; the firing itself proves ownership by writing to the key's
+    /// record, so a process that has lost a key cannot fire its alarms.
+    fn spawn_alarms(self: Arc<Self>) {
+        let Some(engine) = &self.engine else { return };
+        let _ = engine;
+        tokio::spawn(async move {
+            let in_flight: Arc<std::sync::Mutex<std::collections::HashSet<(String, String)>>> =
+                Arc::default();
+            loop {
+                if self.quiescing.load(Ordering::Acquire) {
+                    return;
+                }
+                let Some(engine) = &self.engine else { return };
+                let owners = engine.ownership();
+                let changed = owners.alarms_changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                let mut next: Option<u64> = None;
+                for (key, name, alarm) in owners.held_alarms() {
+                    let slot = (key.clone(), name.clone());
+                    if in_flight.lock().expect("in-flight set").contains(&slot) {
+                        continue;
+                    }
+                    if alarm.at_ms > now {
+                        next = Some(next.map_or(alarm.at_ms, |next| next.min(alarm.at_ms)));
+                        continue;
+                    }
+                    in_flight
+                        .lock()
+                        .expect("in-flight set")
+                        .insert(slot.clone());
+                    let service = Arc::clone(&self);
+                    let in_flight = Arc::clone(&in_flight);
+                    tokio::spawn(async move {
+                        if let Some(engine) = &service.engine {
+                            if let Err(error) = engine.fire(&key, &name).await {
+                                eprintln!(
+                                    "walleye.alarm fire key={key} alarm={name} outcome=refused error={error}"
+                                );
+                            }
+                            in_flight.lock().expect("in-flight set").remove(&slot);
+                            engine.ownership().alarms_changed.notify_waiters();
+                        }
+                    });
+                }
+                // A wall clock that jumps is caught within a minute.
+                let wait = next
+                    .map(|next| next.saturating_sub(now))
+                    .unwrap_or(60_000)
+                    .min(60_000);
+                tokio::select! {
+                    _ = &mut changed => {}
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(wait)) => {}
+                }
+            }
+        });
     }
 
     /// Claim what dead or departed owners left, spread across the live
@@ -435,8 +500,11 @@ impl Service {
                     let claimed = engine.sweep().await;
                     if !claimed.is_empty() {
                         eprintln!("walleye.ownership sweep claimed={}", claimed.join(","));
+                        // Views over what was just taken may be behind.
+                        self.changed.notify_one();
                     }
                 }
+                self.reconcile_sockets().await;
             }
         });
     }
@@ -483,23 +551,16 @@ impl Service {
         });
     }
 
-    /// Keep every view this node owns caught up, without anybody asking.
+    /// Keep every view whose source this node owns caught up, without
+    /// anybody asking.
     ///
     /// The loop advances views until a whole pass moves nothing, then waits
-    /// to be woken by an append or by a slow tick. A pipeline is therefore
-    /// idle when its sources are idle: there is no timer ticking over an
-    /// empty stream, and no refresh anyone has to remember to call.
+    /// to be woken: by an append, or by this process taking over a source
+    /// whose views may be behind. There is no timer. Rows reach a source only
+    /// through its owner, so the owner always hears of them, and a pass that
+    /// fails is retried by an alarm rather than by the next tick.
     fn spawn_view_driver(self: Arc<Self>) {
         tokio::spawn(async move {
-            // A first pass on boot catches up anything that arrived while the
-            // node was down.
-            let idle = std::time::Duration::from_secs(
-                std::env::var("WALLEYE_VIEW_IDLE_SECONDS")
-                    .ok()
-                    .and_then(|value| value.parse().ok())
-                    .filter(|value| *value > 0)
-                    .unwrap_or(30),
-            );
             loop {
                 if self.quiescing.load(Ordering::Acquire) {
                     return;
@@ -528,64 +589,67 @@ impl Service {
                         }
                     }
                 }
-                // Woken by a write, or by the tick that covers a write this
-                // node did not see.
-                tokio::select! {
-                    _ = self.changed.notified() => {}
-                    _ = tokio::time::sleep(idle) => {}
-                }
+                self.changed.notified().await;
             }
         });
     }
 
-    /// Hold open a socket for every view that names one, and hand what
-    /// arrives to that view's worker.
+    /// Hold open a socket for every socket view whose key this process owns,
+    /// and hand what arrives to that view's worker. Called from the ownership
+    /// sweep, so a socket follows its view's owner rather than being held by
+    /// every node.
     ///
     /// The connection lives here rather than in the isolate, because an
     /// isolate is a bounded turn and a socket is not. A worker stays a
     /// stoppable batch of frames while the stream itself keeps running, and
     /// a worker that fails costs its batch rather than the connection.
-    fn spawn_socket_driver(self: Arc<Self>) {
-        tokio::spawn(async move {
-            let mut held: std::collections::HashSet<String> = std::collections::HashSet::new();
-            loop {
-                if self.quiescing.load(Ordering::Acquire) {
-                    return;
-                }
-                if let Some(engine) = &self.engine {
-                    for name in engine.view_names().await.unwrap_or_default() {
-                        if held.contains(&name) {
-                            continue;
-                        }
-                        let Ok(view) = engine.view(&name).await else {
-                            continue;
-                        };
-                        let Some(socket) = view.websocket.clone() else {
-                            continue;
-                        };
-                        held.insert(name.clone());
-                        tokio::spawn(Arc::clone(&self).hold_socket(name, socket));
-                    }
-                }
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    async fn reconcile_sockets(self: &Arc<Self>) {
+        let Some(engine) = &self.engine else { return };
+        for name in engine.view_names().await.unwrap_or_default() {
+            if self.sockets.lock().await.contains(&name) {
+                continue;
             }
-        });
+            let Ok(view) = engine.view(&name).await else {
+                continue;
+            };
+            let Some(socket) = view.websocket.clone() else {
+                continue;
+            };
+            if engine
+                .ownership()
+                .holds(&engine::driver_key(&view))
+                .is_none()
+            {
+                continue;
+            }
+            self.sockets.lock().await.insert(name.clone());
+            tokio::spawn(Arc::clone(self).hold_socket(name, view, socket));
+        }
     }
 
     /// One socket, reconnected for as long as the view exists.
-    async fn hold_socket(self: Arc<Self>, name: String, socket: engine::Socket) {
+    async fn hold_socket(
+        self: Arc<Self>,
+        name: String,
+        view: engine::ViewDefinition,
+        socket: engine::Socket,
+    ) {
+        let key = engine::driver_key(&view);
         let mut backoff = std::time::Duration::from_secs(1);
         loop {
-            if self.quiescing.load(Ordering::Acquire) {
-                return;
-            }
-            // A view that has been dropped takes its socket with it.
+            // A view that has been dropped takes its socket with it, and one
+            // this process no longer owns is its new owner's to hold.
             let Some(engine) = &self.engine else { return };
-            if engine.view(&name).await.is_err() {
-                eprintln!("walleye.socket view={name} outcome=gone");
+            let gone = engine.view(&name).await.is_err();
+            if self.quiescing.load(Ordering::Acquire)
+                || gone
+                || engine.ownership().holds(&key).is_none()
+            {
+                eprintln!("walleye.socket view={name} outcome=released gone={gone}");
+                self.sockets.lock().await.remove(&name);
                 return;
             }
-            match self.read_socket(&name, &socket).await {
+            match self.read_socket(&name, &key, &socket).await {
                 Ok(frames) => {
                     eprintln!("walleye.socket view={name} outcome=closed frames={frames}");
                     backoff = std::time::Duration::from_secs(1);
@@ -605,6 +669,7 @@ impl Service {
     async fn read_socket(
         &self,
         name: &str,
+        key: &str,
         socket: &engine::Socket,
     ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
         use futures::{SinkExt, StreamExt};
@@ -663,7 +728,11 @@ impl Service {
                     eprintln!("walleye.socket view={name} outcome=batch_error error={error}");
                 }
             }
-            if full || self.quiescing.load(Ordering::Acquire) {
+            let owned = self
+                .engine
+                .as_ref()
+                .is_some_and(|engine| engine.ownership().holds(key).is_some());
+            if full || !owned || self.quiescing.load(Ordering::Acquire) {
                 return Ok(handled);
             }
         }
@@ -818,6 +887,7 @@ pub(crate) fn routes() -> access::Routes<Arc<Service>> {
         .route(Method::GET, "/internal/snapshot/{name}", System, snapshot)
         .route(Method::POST, "/internal/cache/flush", System, flush)
         .route(Method::GET, "/internal/ownership", System, ownership)
+        .route(Method::GET, "/internal/alarms", System, alarms)
         .route(Method::POST, "/v1/streams", Data(Manage), define)
         .route(
             Method::POST,
@@ -980,6 +1050,11 @@ async fn stats(State(s): State<Arc<Service>>) -> Json<serde_json::Value> {
 /// What this process believes about table ownership: its session, whether it
 /// is authoritative, the tables it holds and at which epoch, and the leases
 /// it has seen.
+/// Every alarm pending on the keys this process owns.
+async fn alarms(State(s): State<Arc<Service>>) -> Result<Json<serde_json::Value>, StatusCode> {
+    let engine = s.engine.as_ref().ok_or(StatusCode::NOT_FOUND)?;
+    Ok(Json(engine.pending_alarms()))
+}
 async fn ownership(State(s): State<Arc<Service>>) -> Result<Json<serde_json::Value>, StatusCode> {
     let engine = s.engine.as_ref().ok_or(StatusCode::NOT_FOUND)?;
     Ok(Json(engine.ownership().status()))
@@ -1147,7 +1222,7 @@ async fn ingest(
                 Json(serde_json::json!({"error":"stream snapshot changed"})),
             ));
         }
-        // Conditional processor commits fit one atomic Lance WAL batch.
+        // A conditional commit has to fit one atomic Lance WAL batch.
         if input.rows.len() > 1024 {
             return Err((
                 StatusCode::BAD_REQUEST,

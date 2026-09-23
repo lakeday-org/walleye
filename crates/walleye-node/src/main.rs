@@ -66,18 +66,9 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
             std::future::pending::<Result<(), Box<dyn std::error::Error>>>().await
         }
     };
-    let processor = async {
-        match service.config.processor.clone() {
-            Some(config) => service
-                .process(config)
-                .await
-                .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() }),
-            None => std::future::pending().await,
-        }
-    };
-    tokio::pin!(server, processor, bitr);
+    tokio::pin!(server, bitr);
     let (result, closed) = tokio::select! {
-        r=&mut server=>(r.map_err(Into::into), false),r=&mut bitr=>(r, false),r=service.discover()=>(r, false),r=&mut processor=>(r, false),
+        r=&mut server=>(r.map_err(Into::into), false),r=&mut bitr=>(r, false),r=service.discover()=>(r, false),
         _=shutdown()=> {
             // Everything from here runs with the embedded replica still
             // serving: the release flushes each table through it, and a write
@@ -104,10 +95,7 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
                         return r.map_err(Into::into);
                     }
                 }
-                // Keep serving state commits until the outstanding HTTP processors return.
-                let result = if service.config.processor.is_some() {
-                    tokio::select! {r=&mut processor=>r, r=&mut server=>{service.close().await; return r.map_err(Into::into);}}
-                } else { Ok(()) };
+                let result: Result<(), Box<dyn std::error::Error>> = Ok(());
                 let _ = stop_server.send(());
                 server.await?;
                 // Closing flushes too, so it happens while the replica serves.

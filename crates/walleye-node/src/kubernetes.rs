@@ -61,7 +61,6 @@ pub fn config_from_env() -> Result<Config, Box<dyn std::error::Error>> {
         members: vec![Node::new(node_id, endpoint, 1.0)?],
         api,
         kubernetes: Some(discovery),
-        processor: None,
         lease: crate::LeaseConfig::default(),
     })
 }

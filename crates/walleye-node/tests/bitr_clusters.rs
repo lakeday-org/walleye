@@ -105,7 +105,6 @@ fn config(
         bitr: true,
         members,
         kubernetes: None,
-        processor: None,
         lease: Default::default(),
         api: Some(ApiConfig {
             root_uri: root.to_owned(),

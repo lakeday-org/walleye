@@ -65,6 +65,8 @@ const RECLAIM_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_milli
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
 
+/// An alarm by the key that owns it and its name.
+type AlarmSlot = (String, String);
 /// Server-managed primary key for tables created without one. It is an xxh3
 /// hash of the row's full contents, so an identical row (including a retried
 /// insert) collapses to one visible row and every memshard stays idempotent.
@@ -209,6 +211,14 @@ pub(crate) fn storage_type(kind: &str) -> Option<DataType> {
         _ => return None,
     })
 }
+/// Whether `key` can own things: a table name, or `view.<name>` for a view
+/// with no source table.
+pub(crate) fn valid_key(key: &str) -> bool {
+    valid_name(key) || key.strip_prefix(VIEW_KEY).is_some_and(valid_name)
+}
+/// The prefix of the ownership key of a view that has no source table. A dot
+/// cannot appear in a table name, so no table shares it.
+pub(crate) const VIEW_KEY: &str = "view.";
 pub(crate) fn valid_name(name: &str) -> bool {
     !name.is_empty()
         && name
@@ -705,6 +715,14 @@ pub struct Engine {
     // for every SQL request, while still allowing the query path to refresh
     // once when another node has published a previously unknown stream.
     catalog_loaded: Mutex<bool>,
+    /// View definitions by name with the object version they were read at,
+    /// so the ownership sweep reads only the ones that changed.
+    view_defs: Mutex<HashMap<String, (String, ViewDefinition)>>,
+    /// One firing of an alarm at a time on this process.
+    firing_locks: Mutex<HashMap<AlarmSlot, Arc<Mutex<()>>>>,
+    /// Held by every firing for its length, and taken outright by a release,
+    /// so a process hands a key over only between firings, never during one.
+    firings: RwLock<()>,
     // Requests share this read lock; shutdown waits for all active requests.
     closed: RwLock<bool>,
     writer: Option<Arc<QuorumWriter>>,
@@ -808,6 +826,9 @@ impl Engine {
             streams: Mutex::new(BTreeMap::new()),
             dropping: Mutex::new(BTreeSet::new()),
             catalog_loaded: Mutex::new(false),
+            view_defs: Mutex::new(HashMap::new()),
+            firing_locks: Mutex::new(HashMap::new()),
+            firings: RwLock::new(()),
             closed: RwLock::new(false),
             writer,
             cluster,
@@ -1002,7 +1023,22 @@ impl Engine {
             eprintln!("walleye.ownership sweep stage=catalog outcome=error error={error}");
             return Vec::new();
         }
-        let names: Vec<String> = self.streams.lock().await.keys().cloned().collect();
+        let mut names: Vec<String> = self.streams.lock().await.keys().cloned().collect();
+        let views = match self.view_definitions().await {
+            Ok(views) => views,
+            Err(error) => {
+                eprintln!("walleye.ownership sweep stage=views outcome=error error={error}");
+                return Vec::new();
+            }
+        };
+        // A view's key is owned like a table, so its schedule and its worker's
+        // alarm have exactly one process to run them.
+        for view in &views {
+            let key = driver_key(view);
+            if !names.contains(&key) {
+                names.push(key);
+            }
+        }
         let mut claimed = Vec::new();
         for name in self.owners.orphaned(&names) {
             match self.owners.claim(&name).await {
@@ -1016,6 +1052,7 @@ impl Engine {
         if !claimed.is_empty() {
             self.warm_tables(claimed.clone()).await;
         }
+        self.reconcile_views(&views).await;
         claimed
     }
     /// The registered definition, loading it from the catalog if needed.
@@ -1299,11 +1336,25 @@ impl Engine {
         stream.version.fetch_add(1, Ordering::AcqRel);
         Ok(count)
     }
-    /// Append Arrow batches from a LanceDB client. Returns the new table version.
+    /// Append Arrow batches. Returns the new table version. A table another
+    /// process owns is appended to through that process, which is how a view,
+    /// a worker or an alarm handler running here writes wherever it names.
     pub async fn append(&self, name: &str, batches: Vec<RecordBatch>) -> Result<u64, Error> {
         let closed = self.closed.read().await;
         if *closed {
             return Err("engine is closed".into());
+        }
+        let mut fresh = false;
+        loop {
+            let Route::Remote { peer, .. } = self.route(name, fresh).await? else {
+                break;
+            };
+            match self.cluster.insert(&peer, name, &batches).await {
+                Err(error) if !fresh && error.downcast_ref::<NotOwner>().is_some() => {
+                    fresh = true;
+                }
+                answer => return answer,
+            }
         }
         let stream = self.stream(name).await?;
         let full = stream.config.schema.clone();
@@ -1905,6 +1956,7 @@ impl Engine {
         }
         let started = Instant::now();
         self.owners.drain().await;
+        self.quiesce_alarms().await;
         let held = self.owners.held_tables();
         let count = held.len();
         futures::stream::iter(held)
@@ -2938,6 +2990,11 @@ impl Engine {
         let path = self.views_path.clone().join(format!("{}.json", view.name));
         let bytes = serde_json::to_vec(&view)?;
         self.catalog.inner.put(&path, bytes.into()).await?;
+        // Arm its schedule now if this process owns its key; its owner's next
+        // sweep does otherwise.
+        if self.owners.holds(&driver_key(&view)).is_some() {
+            self.reconcile_view(&view).await?;
+        }
         Ok(())
     }
     pub async fn view(&self, name: &str) -> Result<ViewDefinition, Error> {
@@ -2979,8 +3036,10 @@ impl Engine {
             Err(error) => return Err(error.into()),
         }
         // Leave the target and its rows: dropping a definition is not a
-        // licence to delete data somebody may still be reading.
-        let _ = view;
+        // licence to delete data somebody may still be reading. Its alarms go
+        // with it, here if this process owns its key and otherwise at the
+        // owner's next sweep.
+        self.clear_view_alarms(&view).await;
         Ok(())
     }
 
@@ -2992,8 +3051,34 @@ impl Engine {
     /// holds only while the query is a deterministic function of its input,
     /// which is the contract a view signs.
     pub async fn refresh_view(&self, name: &str) -> Result<Progress, Error> {
-        // Held from before the cursor is read until after it moves, so a pass
-        // that waited here starts from wherever the one before it finished.
+        let view = self.view(name).await?;
+        if view.source.is_none() && view.websocket.is_none() {
+            // A view on a clock runs when its schedule is due, and asking
+            // runs it now only if it is: the schedule is the one thing that
+            // decides, whoever asks.
+            self.reconcile_view(&view).await?;
+            let fired = self
+                .fire(&driver_key(&view), &schedule_alarm(&view.name))
+                .await?;
+            return Ok(fired.unwrap_or(Progress {
+                rows: 0,
+                written: 0,
+                delivered: 0,
+                through: 0,
+                caught_up: true,
+            }));
+        }
+        self.refresh_rows(&view).await
+    }
+
+    /// One pass of a view driven by rows: its source's, or its socket's.
+    async fn refresh_rows(&self, view: &ViewDefinition) -> Result<Progress, Error> {
+        let name = view.name.as_str();
+        // One pass at a time per view, however it started - a caller's
+        // refresh, a retry alarm, a worker's alarm catching its view up. Held
+        // from before the cursor is read until after it moves, so a pass that
+        // waited here starts from wherever the one before it finished. Every
+        // pass is here: `advance_from` is reached only through this.
         let pass = self
             .view_passes
             .lock()
@@ -3002,74 +3087,65 @@ impl Engine {
             .or_default()
             .clone();
         let _only_pass = pass.lock().await;
-        let view = self.view(name).await?;
         let consumer = format!("view:{name}");
         let cursor = self.cursor(&consumer).await?;
         match (&view.source, &view.websocket) {
+            (Some(source), None) => self.advance_from(view, source, &consumer, cursor).await,
             // A socket view is driven by what arrives on its socket.
-            (_, Some(_)) => Ok(Progress {
+            _ => Ok(Progress {
                 rows: 0,
                 written: 0,
                 delivered: 0,
                 through: cursor,
                 caught_up: true,
             }),
-            (Some(source), None) => self.advance_from(&view, source, &consumer, cursor).await,
-            (None, None) => self.run_on_schedule(&view, &consumer, cursor).await,
         }
     }
 
-    /// A worker that goes and gets its own rows, run no more often than its
-    /// view asked for. The cursor holds when it last ran, so a restart does
-    /// not make it run again immediately, and a node that was down does not
-    /// come back and fire every interval it missed at once.
-    async fn run_on_schedule(
+    /// Passes of a view driven by rows until it is caught up.
+    async fn drain_rows(&self, view: &ViewDefinition, passes: usize) -> Result<Progress, Error> {
+        let mut total = Progress {
+            rows: 0,
+            written: 0,
+            delivered: 0,
+            through: 0,
+            caught_up: false,
+        };
+        for _ in 0..passes.clamp(1, 1000) {
+            let pass = self.refresh_rows(view).await?;
+            total.rows += pass.rows;
+            total.written += pass.written;
+            total.delivered += pass.delivered;
+            total.through = pass.through;
+            total.caught_up = pass.caught_up;
+            if pass.caught_up {
+                break;
+            }
+        }
+        Ok(total)
+    }
+
+    /// One occurrence of a view on a clock: its worker goes and gets its own
+    /// rows, told which scheduled time this run stands for and how many
+    /// earlier ones it also covers.
+    async fn run_scheduled(
         &self,
         view: &ViewDefinition,
-        consumer: &str,
-        last_run: u64,
+        firing: &crate::alarms::Firing,
     ) -> Result<Progress, Error> {
-        let now = now_micros();
-        let due = match &view.cron {
-            Some(expression) => {
-                let schedule = crate::cron::Schedule::parse(expression)
-                    .map_err(|reason| -> Error { reason.into() })?;
-                // A view that has never run is due at its next named time, so
-                // declaring one does not fire it immediately.
-                let from = if last_run == 0 {
-                    (now / 1_000_000) as i64
-                } else {
-                    (last_run / 1_000_000) as i64
-                };
-                match schedule.next_after(from) {
-                    Some(next) => (next as u64).saturating_mul(1_000_000),
-                    None => u64::MAX,
-                }
-            }
-            None => {
-                let every = view.every_seconds.unwrap_or(60).max(1);
-                last_run.saturating_add(every.saturating_mul(1_000_000))
-            }
-        };
-        if now < due {
-            if last_run == 0 {
-                // Remember when it was declared, so the first run lands at
-                // the next named time rather than never.
-                self.set_cursor(consumer, now).await?;
-            }
-            return Ok(Progress {
-                rows: 0,
-                written: 0,
-                delivered: 0,
-                through: last_run,
-                caught_up: true,
-            });
-        }
         let Some(worker) = view.worker.as_deref().filter(|w| !w.trim().is_empty()) else {
             return Err("a view with no source needs a worker".into());
         };
+        let scheduled = serde_json::json!({
+            "scheduledTime": firing.scheduled_ms,
+            "missed": firing.missed,
+            "attempt": firing.attempt,
+        })
+        .to_string();
         // It is handed an empty batch: its rows come from wherever it goes.
-        let (produced, elsewhere) = self.invoke_worker(view, worker, &[]).await?;
+        let (produced, elsewhere, alarm) = self
+            .invoke_worker(view, worker, &[], Some(scheduled))
+            .await?;
         let mut written = self.land(view, elsewhere).await?;
         let made: usize = produced.iter().map(RecordBatch::num_rows).sum();
         let mut delivered = 0;
@@ -3086,12 +3162,12 @@ impl Engine {
             self.append(target, produced).await?;
             written += made;
         }
-        self.set_cursor(consumer, now).await?;
+        self.apply_worker_alarm(view, alarm).await?;
         Ok(Progress {
             rows: 0,
             written,
             delivered,
-            through: now,
+            through: firing.scheduled_ms.saturating_mul(1000),
             caught_up: true,
         })
     }
@@ -3147,9 +3223,12 @@ impl Engine {
                 .collect::<Result<Vec<_>, _>>()?,
         };
         let mut written = 0;
+        let mut alarm = None;
         if let Some(worker) = view.worker.as_deref().filter(|w| !w.trim().is_empty()) {
-            let (target_rows, elsewhere) = self.invoke_worker(view, worker, &produced).await?;
+            let (target_rows, elsewhere, change) =
+                self.invoke_worker(view, worker, &produced, None).await?;
             produced = target_rows;
+            alarm = change;
             written += self.land(view, elsewhere).await?;
         }
         let made: usize = produced.iter().map(RecordBatch::num_rows).sum();
@@ -3171,6 +3250,10 @@ impl Engine {
             self.append(target, produced).await?;
             written += made;
         }
+        // The alarm before the cursor: a pass that dies between the two is
+        // replayed, and sets the same alarm again, rather than moving on
+        // without it.
+        self.apply_worker_alarm(view, alarm).await?;
         self.set_cursor(consumer, through).await?;
         Ok(Progress {
             rows,
@@ -3188,6 +3271,7 @@ impl Engine {
         view: &ViewDefinition,
         worker: &str,
         batch: &[RecordBatch],
+        scheduled: Option<String>,
     ) -> Result<WorkerOutput, Error> {
         let limits = view.limits();
         // A worker's heap is part of the machine's memory, not extra to it.
@@ -3208,9 +3292,15 @@ impl Engine {
         let host = self.reach.clone();
         let worker = worker.to_owned();
         let handed = batch.to_vec();
-        tokio::task::spawn_blocking(move || run_worker(&worker, &handed, limits, expected, host))
-            .await
-            .map_err(|error| -> Error { error.to_string().into() })?
+        let turn = walleye_v8::Turn {
+            alarm: self.worker_alarm_at(view).await,
+            scheduled,
+        };
+        tokio::task::spawn_blocking(move || {
+            run_worker(&worker, &handed, limits, expected, host, turn)
+        })
+        .await
+        .map_err(|error| -> Error { error.to_string().into() })?
     }
 
     /// Write the rows a worker sent to streams it named itself.
@@ -3242,11 +3332,27 @@ impl Engine {
     /// Create a stream from the shape of what is about to be written, if it
     /// is not there yet.
     async fn ensure_target(&self, name: &str, batches: &[RecordBatch]) -> Result<(), Error> {
-        if self.definition(name).await.is_ok() {
+        let definition = StreamDefinition::from_arrow(name, &batches[0].schema())?;
+        self.ensure_table(definition).await
+    }
+
+    /// Create a table unless it is in the catalog. One that another process
+    /// created and owns meanwhile exists, which is all this asks.
+    async fn ensure_table(&self, definition: StreamDefinition) -> Result<(), Error> {
+        if self.definition(&definition.name).await.is_ok() {
             return Ok(());
         }
-        let definition = StreamDefinition::from_arrow(name, &batches[0].schema())?;
-        self.define_with(definition, true).await
+        let name = definition.name.clone();
+        match self.define_with(definition, true).await {
+            Err(error)
+                if (error.downcast_ref::<NotOwner>().is_some()
+                    || error.downcast_ref::<NoOwner>().is_some())
+                    && self.definition(&name).await.is_ok() =>
+            {
+                Ok(())
+            }
+            other => other,
+        }
     }
 
     /// Send produced rows to an alert endpoint as a JSON array.
@@ -3313,7 +3419,7 @@ impl Engine {
             .map(|data| serde_json::json!({ "data": data }))
             .collect();
         let batch = rows_to_batches(rows, None)?;
-        let (produced, elsewhere) = self.invoke_worker(&view, worker, &batch).await?;
+        let (produced, elsewhere, alarm) = self.invoke_worker(&view, worker, &batch, None).await?;
         let mut written = self.land(&view, elsewhere).await?;
         let made: usize = produced.iter().map(RecordBatch::num_rows).sum();
         if let Some(alert) = &view.alert
@@ -3328,6 +3434,7 @@ impl Engine {
             self.append(target, produced).await?;
             written += made;
         }
+        self.apply_worker_alarm(&view, alarm).await?;
         Ok(written)
     }
 
@@ -3354,11 +3461,16 @@ impl Engine {
         let host = self.reach.clone();
         let body = serde_json::to_string(&request)?;
         let source = worker.to_owned();
+        let turn = walleye_v8::Turn {
+            alarm: self.worker_alarm_at(&view).await,
+            scheduled: None,
+        };
         let outcome = tokio::task::spawn_blocking(move || {
-            walleye_v8::run_request(&source, &body, limits, host)
+            walleye_v8::run_request(&source, &body, limits, host, turn)
         })
         .await
         .map_err(|error| -> Error { error.to_string().into() })??;
+        let alarm = outcome.alarm;
 
         let mut landed = Vec::new();
         for (stream, written) in outcome.writes {
@@ -3380,6 +3492,7 @@ impl Engine {
             self.ensure_target(&stream, &batches).await?;
             self.append(&stream, batches).await?;
         }
+        self.apply_worker_alarm(&view, alarm).await?;
         if outcome.returned.is_empty() {
             return Ok(serde_json::json!({ "status": 204 }));
         }
@@ -3413,11 +3526,13 @@ impl Engine {
                 let Ok(view) = self.view(name).await else {
                     continue;
                 };
-                // The owner of a view's source drives it, and the owner of the
-                // cursors table drives the views with no source, so exactly
-                // one process runs each.
-                let driver = view.source.as_deref().unwrap_or(CURSORS);
-                if !matches!(self.route(driver, false).await, Ok(Route::Local { .. })) {
+                // The owner of a view's source drives it, so exactly one
+                // process runs each. A view on a clock or a socket is not
+                // driven by rows arriving, and is not driven here.
+                let Some(source) = view.source.as_deref() else {
+                    continue;
+                };
+                if self.owners.holds(source).is_none() {
                     continue;
                 }
                 let outcome = self.refresh_view(name).await;
@@ -3429,6 +3544,13 @@ impl Engine {
                     moved = true;
                 }
                 let failed = outcome.is_err();
+                if failed {
+                    // The retry is an alarm, so it survives this process and
+                    // backs off, rather than waiting for the next row.
+                    if let Err(error) = self.arm_pass_retry(&view).await {
+                        eprintln!("walleye.alarm arm view={name} outcome=error error={error}");
+                    }
+                }
                 reports.push((name.clone(), outcome));
                 if failed {
                     // A failing view stops being retried this round rather
@@ -3447,32 +3569,23 @@ impl Engine {
         if self.definition(CURSORS).await.is_err() {
             return Ok(0);
         }
-        self.stream(CURSORS).await?;
+        // The cursors table may be owned anywhere; a query gathers it from
+        // its owner.
         let sql = format!(
             "SELECT position FROM \"{CURSORS}\" WHERE consumer = '{}'",
             consumer.replace('\'', "''")
         );
-        let batches = self.query_batches(&sql, &[]).await?;
-        for batch in batches.iter() {
-            if batch.num_rows() == 0 {
-                continue;
-            }
-            if let Some(column) = batch.column(0).as_any().downcast_ref::<UInt64Array>()
-                && !column.is_null(0)
-            {
-                return Ok(column.value(0));
-            }
-        }
-        Ok(0)
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(&self.query(&sql).await?)?;
+        Ok(rows
+            .first()
+            .and_then(|row| row["position"].as_u64())
+            .unwrap_or(0))
     }
     /// Record where a consumer reached. The newest row for a consumer wins,
     /// so this supersedes rather than accumulates.
     pub async fn set_cursor(&self, consumer: &str, position: u64) -> Result<(), Error> {
-        self.define_with(
-            StreamDefinition::from_arrow(CURSORS, &cursor_schema())?,
-            true,
-        )
-        .await?;
+        self.ensure_table(StreamDefinition::from_arrow(CURSORS, &cursor_schema())?)
+            .await?;
         let schema = Arc::new(cursor_schema());
         let batch = RecordBatch::try_new(
             schema,
@@ -3484,6 +3597,472 @@ impl Engine {
         )?;
         self.append(CURSORS, vec![batch]).await?;
         Ok(())
+    }
+}
+
+/// The alarm that runs a view on its clock.
+pub(crate) fn schedule_alarm(view: &str) -> String {
+    format!("schedule:{view}")
+}
+/// The alarm a view's worker sets for itself.
+pub(crate) fn worker_alarm(view: &str) -> String {
+    format!("worker:{view}")
+}
+/// The alarm that retries a view's failed pass.
+pub(crate) fn pass_alarm(view: &str) -> String {
+    format!("pass:{view}")
+}
+/// The ownership key whose owner runs a view: its source table, or the view
+/// itself when it has none. Its alarms live in that key's record.
+pub(crate) fn driver_key(view: &ViewDefinition) -> String {
+    match &view.source {
+        Some(source) => source.clone(),
+        None => format!("{VIEW_KEY}{}", view.name),
+    }
+}
+fn wall_ms() -> u64 {
+    now_micros() / 1000
+}
+fn alarm_id() -> u64 {
+    uuid::Uuid::new_v4().as_u64_pair().0
+}
+
+impl Engine {
+    /// Every view definition, reading only those whose object changed.
+    async fn view_definitions(&self) -> Result<Vec<ViewDefinition>, Error> {
+        let objects: Vec<_> = self
+            .catalog
+            .inner
+            .list(Some(&self.views_path))
+            .try_collect()
+            .await?;
+        let mut listed = HashMap::new();
+        for object in objects {
+            let Some(name) = object
+                .location
+                .filename()
+                .and_then(|file| file.strip_suffix(".json"))
+            else {
+                continue;
+            };
+            let version = object
+                .e_tag
+                .clone()
+                .unwrap_or_else(|| object.last_modified.timestamp_micros().to_string());
+            listed.insert(name.to_owned(), version);
+        }
+        let mut cache = self.view_defs.lock().await;
+        cache.retain(|name, _| listed.contains_key(name));
+        for (name, version) in listed {
+            if cache.get(&name).is_some_and(|(seen, _)| *seen == version) {
+                continue;
+            }
+            match self.view(&name).await {
+                Ok(view) => {
+                    cache.insert(name, (version, view));
+                }
+                Err(error) if error.downcast_ref::<TableNotFound>().is_some() => {}
+                Err(error) => return Err(error),
+            }
+        }
+        let mut views: Vec<ViewDefinition> = cache.values().map(|(_, view)| view.clone()).collect();
+        views.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(views)
+    }
+
+    /// Make a view's schedule alarm match its definition, on the process that
+    /// owns its key. A view on a clock gets a repeating alarm; changing the
+    /// clock replaces it; a view without one has none.
+    pub(crate) async fn reconcile_view(&self, view: &ViewDefinition) -> Result<(), Error> {
+        let key = driver_key(view);
+        if !matches!(self.route(&key, false).await?, Route::Local { .. }) {
+            return Ok(());
+        }
+        let name = schedule_alarm(&view.name);
+        let wanted = match (
+            &view.source,
+            &view.websocket,
+            &view.cron,
+            view.every_seconds,
+        ) {
+            (None, None, Some(cron), _) => Some(crate::alarms::Repeat::Cron(cron.clone())),
+            (None, None, None, Some(every)) => Some(crate::alarms::Repeat::Every(every)),
+            _ => None,
+        };
+        let now = wall_ms();
+        let updated = self
+            .owners
+            .update_alarms(&key, |alarms| match (&wanted, alarms.get(&name)) {
+                (Some(repeat), Some(alarm)) if alarm.repeat.as_ref() == Some(repeat) => None,
+                (Some(repeat), _) => {
+                    // An interval runs at once, then on its interval; a cron
+                    // at its next named time, so declaring one does not fire
+                    // it early.
+                    let first = match repeat {
+                        crate::alarms::Repeat::Every(_) => Some(now),
+                        crate::alarms::Repeat::Cron(_) => repeat.next_after(now),
+                    }?;
+                    alarms.insert(
+                        name.clone(),
+                        crate::alarms::Alarm::repeating(repeat.clone(), first, alarm_id()),
+                    );
+                    Some(())
+                }
+                (None, Some(_)) => alarms.remove(&name).map(|_| ()),
+                (None, None) => None,
+            })
+            .await?;
+        if let crate::ownership::AlarmUpdate::Applied(()) = updated {
+            eprintln!("walleye.alarm schedule view={} key={key}", view.name);
+        }
+        Ok(())
+    }
+
+    /// Arm every view whose key this process holds, and drop alarms that
+    /// belong to views gone or moved to another key.
+    async fn reconcile_views(&self, views: &[ViewDefinition]) {
+        for view in views {
+            if self.owners.holds(&driver_key(view)).is_some()
+                && let Err(error) = self.reconcile_view(view).await
+            {
+                eprintln!(
+                    "walleye.alarm reconcile view={} outcome=error error={error}",
+                    view.name
+                );
+            }
+        }
+        let by_name: HashMap<&str, &ViewDefinition> = views
+            .iter()
+            .map(|view| (view.name.as_str(), view))
+            .collect();
+        let mut keys: Vec<String> = self
+            .owners
+            .held_alarms()
+            .into_iter()
+            .map(|(key, _, _)| key)
+            .collect();
+        keys.dedup();
+        for key in keys {
+            let _ = self
+                .owners
+                .update_alarms(&key, |alarms| {
+                    let stale: Vec<String> = alarms
+                        .keys()
+                        .filter(|name| {
+                            let view = name.split_once(':').map(|(_, view)| view);
+                            view.and_then(|view| by_name.get(view))
+                                .is_none_or(|view| driver_key(view) != key)
+                        })
+                        .cloned()
+                        .collect();
+                    if stale.is_empty() {
+                        return None;
+                    }
+                    for name in stale {
+                        alarms.remove(&name);
+                    }
+                    Some(())
+                })
+                .await;
+        }
+    }
+
+    async fn clear_view_alarms(&self, view: &ViewDefinition) {
+        let key = driver_key(view);
+        let names = [
+            schedule_alarm(&view.name),
+            worker_alarm(&view.name),
+            pass_alarm(&view.name),
+        ];
+        let _ = self
+            .owners
+            .update_alarms(&key, |alarms| {
+                let before = alarms.len();
+                for name in &names {
+                    alarms.remove(name);
+                }
+                (alarms.len() != before).then_some(())
+            })
+            .await;
+    }
+
+    /// When a view's worker alarm is set to fire, as this process sees it.
+    async fn worker_alarm_at(&self, view: &ViewDefinition) -> Option<u64> {
+        let key = driver_key(view);
+        let name = worker_alarm(&view.name);
+        self.owners
+            .held_alarms()
+            .into_iter()
+            .find(|(k, n, _)| *k == key && *n == name)
+            .map(|(_, _, alarm)| alarm.at_ms)
+    }
+
+    /// Apply what a worker asked of its alarm, once the turn that asked has
+    /// landed everything it wrote.
+    async fn apply_worker_alarm(
+        &self,
+        view: &ViewDefinition,
+        change: Option<walleye_v8::AlarmChange>,
+    ) -> Result<(), Error> {
+        let Some(change) = change else {
+            return Ok(());
+        };
+        let key = driver_key(view);
+        let name = worker_alarm(&view.name);
+        for _ in 0..2 {
+            let updated = self
+                .owners
+                .update_alarms(&key, |alarms| match change {
+                    walleye_v8::AlarmChange::Set(at) => {
+                        alarms.insert(name.clone(), crate::alarms::Alarm::once(at, alarm_id()));
+                        Some(())
+                    }
+                    walleye_v8::AlarmChange::Delete => alarms.remove(&name).map(|_| ()),
+                })
+                .await?;
+            match updated {
+                crate::ownership::AlarmUpdate::NotOwner => {
+                    // A turn on a key nobody owned yet takes it.
+                    if !matches!(self.route(&key, false).await?, Route::Local { .. }) {
+                        break;
+                    }
+                }
+                _ => return Ok(()),
+            }
+        }
+        Err(Box::new(NotOwner {
+            table: key,
+            owner: None,
+        }))
+    }
+
+    /// After a view's pass failed, try it again on an alarm with backoff.
+    async fn arm_pass_retry(&self, view: &ViewDefinition) -> Result<(), Error> {
+        let name = pass_alarm(&view.name);
+        let at = wall_ms() + crate::alarms::BACKOFF_BASE_MS;
+        self.owners
+            .update_alarms(&driver_key(view), |alarms| {
+                if alarms.contains_key(&name) {
+                    return None;
+                }
+                alarms.insert(name.clone(), crate::alarms::Alarm::once(at, alarm_id()));
+                Some(())
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// Fire one alarm if it is due, as the owner of its key. The firing is
+    /// begun by a write to the key's record, which only the owner can make,
+    /// and is completed by another. `None` when it was not due.
+    pub(crate) async fn fire(&self, key: &str, name: &str) -> Result<Option<Progress>, Error> {
+        let _firing = self.firings.read().await;
+        if self.owners.draining() {
+            return Ok(None);
+        }
+        let lock = self
+            .firing_locks
+            .lock()
+            .await
+            .entry((key.to_owned(), name.to_owned()))
+            .or_default()
+            .clone();
+        let _one = lock.lock().await;
+        let now = wall_ms();
+        let begun = self
+            .owners
+            .update_alarms(key, |alarms| {
+                crate::alarms::begin(alarms.get_mut(name)?, now)
+            })
+            .await?;
+        let firing = match begun {
+            crate::ownership::AlarmUpdate::Applied(firing) => firing,
+            crate::ownership::AlarmUpdate::Skipped => return Ok(None),
+            crate::ownership::AlarmUpdate::NotOwner => {
+                return Err(Box::new(NotOwner {
+                    table: key.to_owned(),
+                    owner: None,
+                }));
+            }
+        };
+        eprintln!(
+            "walleye.alarm fire key={key} alarm={name} scheduled_ms={} attempt={} missed={}",
+            firing.scheduled_ms, firing.attempt, firing.missed
+        );
+        let outcome = self.run_alarm(key, name, &firing).await;
+        if let Err(error) = &outcome {
+            eprintln!(
+                "walleye.alarm fire key={key} alarm={name} attempt={} outcome=error error={error}",
+                firing.attempt
+            );
+        }
+        let ok = outcome.is_ok();
+        let done = wall_ms();
+        let settled = self
+            .owners
+            .update_alarms(key, |alarms| {
+                let alarm = alarms.get_mut(name)?;
+                let before = alarm.clone();
+                match crate::alarms::complete(alarm, &firing, ok, done) {
+                    crate::alarms::Settled::Remove => {
+                        alarms.remove(name);
+                        Some(())
+                    }
+                    crate::alarms::Settled::Keep => (*alarm != before).then_some(()),
+                }
+            })
+            .await?;
+        if settled == crate::ownership::AlarmUpdate::NotOwner {
+            eprintln!("walleye.alarm fire key={key} alarm={name} outcome=lost_before_completion");
+        }
+        outcome.map(Some)
+    }
+
+    /// What an alarm is for, by its name.
+    async fn run_alarm(
+        &self,
+        key: &str,
+        name: &str,
+        firing: &crate::alarms::Firing,
+    ) -> Result<Progress, Error> {
+        let idle = Progress {
+            rows: 0,
+            written: 0,
+            delivered: 0,
+            through: 0,
+            caught_up: true,
+        };
+        let Some((kind, view_name)) = name.split_once(':') else {
+            return Err(format!("no handler for alarm {name}").into());
+        };
+        let view = match self.view(view_name).await {
+            Ok(view) => view,
+            // Its view is gone; the sweep removes what is left of it.
+            Err(error) if error.downcast_ref::<TableNotFound>().is_some() => return Ok(idle),
+            Err(error) => return Err(error),
+        };
+        if driver_key(&view) != key {
+            return Ok(idle);
+        }
+        match kind {
+            "schedule" => self.run_scheduled(&view, firing).await,
+            "pass" => self.drain_rows(&view, 1000).await,
+            "worker" => self.run_worker_alarm(&view, firing).await,
+            _ => Err(format!("no handler for alarm {name}").into()),
+        }
+    }
+
+    /// Wake a view's worker with its `alarm` handler.
+    async fn run_worker_alarm(
+        &self,
+        view: &ViewDefinition,
+        firing: &crate::alarms::Firing,
+    ) -> Result<Progress, Error> {
+        let Some(worker) = view.worker.as_deref().filter(|w| !w.trim().is_empty()) else {
+            return Err(format!("{} has no worker to wake", view.name).into());
+        };
+        let limits = view.limits();
+        let _heap = self
+            .cache
+            .resources
+            .reserve_memory(&format!("worker {}", view.name), limits.heap_bytes)
+            .map_err(|error| -> Error { Box::new(error) })?;
+        let expected = match &view.target {
+            Some(target) => self.definition(target).await.ok().map(|stream| {
+                Arc::new(stream.definition.user_schema(stream.config.schema.as_ref()))
+            }),
+            None => None,
+        };
+        let info = serde_json::json!({
+            "scheduledTime": firing.scheduled_ms,
+            "attempt": firing.attempt,
+            "retryCount": firing.attempt.saturating_sub(1),
+        })
+        .to_string();
+        let host = self.reach.clone();
+        let source = worker.to_owned();
+        let (produced, elsewhere, alarm) = tokio::task::spawn_blocking(move || {
+            let outcome =
+                walleye_v8::run_alarm(&source, &info, limits, host, walleye_v8::Turn::default())?;
+            worker_output(outcome, expected)
+        })
+        .await
+        .map_err(|error| -> Error { error.to_string().into() })??;
+        let mut written = self.land(view, elsewhere).await?;
+        let made: usize = produced.iter().map(RecordBatch::num_rows).sum();
+        if let Some(target) = &view.target
+            && made > 0
+        {
+            self.ensure_target(target, &produced).await?;
+            self.append(target, produced).await?;
+            written += made;
+        }
+        self.apply_worker_alarm(view, alarm).await?;
+        Ok(Progress {
+            rows: 0,
+            written,
+            delivered: 0,
+            through: firing.scheduled_ms.saturating_mul(1000),
+            caught_up: true,
+        })
+    }
+
+    /// Every pending alarm on the keys this process owns, as the inspection
+    /// route shows them.
+    pub fn pending_alarms(&self) -> serde_json::Value {
+        let alarms: Vec<serde_json::Value> = self
+            .owners
+            .held_alarms()
+            .into_iter()
+            .map(|(key, name, alarm)| {
+                serde_json::json!({
+                    "key": key,
+                    "alarm": name,
+                    "at_ms": alarm.at_ms,
+                    "scheduled_ms": alarm.scheduled_ms,
+                    "attempt": alarm.attempt,
+                    "repeat": alarm.repeat,
+                })
+            })
+            .collect();
+        serde_json::json!({ "node": self.owners.node(), "alarms": alarms })
+    }
+
+    /// A view's pending alarms, read from its key's record wherever it is
+    /// owned: its next scheduled run, its worker's alarm, a pass waiting to
+    /// be retried.
+    pub async fn view_alarms(&self, view: &ViewDefinition) -> Result<serde_json::Value, Error> {
+        let alarms = self.owners.read_alarms(&driver_key(view)).await?;
+        let mut shown = serde_json::Map::new();
+        for (name, alarm) in alarms {
+            let Some((kind, owner)) = name.split_once(':') else {
+                continue;
+            };
+            if owner != view.name {
+                continue;
+            }
+            let label = match kind {
+                "schedule" => "next_run",
+                "worker" => "worker_alarm",
+                "pass" => "retry",
+                _ => continue,
+            };
+            shown.insert(
+                label.into(),
+                serde_json::json!({
+                    "at_ms": alarm.at_ms,
+                    "scheduled_ms": alarm.scheduled_ms,
+                    "attempt": alarm.attempt,
+                }),
+            );
+        }
+        Ok(serde_json::Value::Object(shown))
+    }
+
+    /// Stop firing and wait out any firing in flight, so the keys can be
+    /// handed over between firings rather than during one.
+    async fn quiesce_alarms(&self) {
+        drop(self.firings.write().await);
     }
 }
 
@@ -3511,7 +4090,13 @@ fn highest_in(batches: &[RecordBatch]) -> Result<Option<u64>, Error> {
 
 /// What one worker turn produced: rows for the view's own target, and rows it
 /// wrote to streams it named itself.
-type WorkerOutput = (Vec<RecordBatch>, Vec<(String, Vec<RecordBatch>)>);
+/// What one worker turn produced: rows for the view's target, rows for
+/// streams it named itself, and what it asked of its alarm.
+type WorkerOutput = (
+    Vec<RecordBatch>,
+    Vec<(String, Vec<RecordBatch>)>,
+    Option<walleye_v8::AlarmChange>,
+);
 
 /// Hand a batch of rows to a worker and take back the rows it returns.
 ///
@@ -3528,13 +4113,23 @@ fn run_worker(
     limits: walleye_v8::Limits,
     expected: Option<Arc<Schema>>,
     host: Arc<dyn walleye_v8::Host>,
+    turn: walleye_v8::Turn,
 ) -> Result<WorkerOutput, Error> {
     let mut writer = arrow_json::ArrayWriter::new(Vec::new());
     writer.write_batches(&batches.iter().collect::<Vec<_>>())?;
     writer.finish()?;
     let rows = String::from_utf8(writer.into_inner())?;
 
-    let outcome = walleye_v8::run_with_host(worker, &rows, limits, host)?;
+    let outcome = walleye_v8::run_with_host(worker, &rows, limits, host, turn)?;
+    worker_output(outcome, expected)
+}
+
+/// Rows a worker returned and wrote, grouped for landing, and its alarm.
+fn worker_output(
+    outcome: walleye_v8::Outcome,
+    expected: Option<Arc<Schema>>,
+) -> Result<WorkerOutput, Error> {
+    let alarm = outcome.alarm;
 
     // Rows the worker sent elsewhere, grouped by stream and kept in the order
     // it wrote them.
@@ -3560,13 +4155,13 @@ fn run_worker(
     }
 
     if outcome.returned.is_empty() {
-        return Ok((Vec::new(), written));
+        return Ok((Vec::new(), written, alarm));
     }
     let values: Vec<serde_json::Value> = serde_json::from_str(&outcome.returned)?;
     if values.is_empty() {
-        return Ok((Vec::new(), written));
+        return Ok((Vec::new(), written, alarm));
     }
-    Ok((rows_to_batches(values, expected)?, written))
+    Ok((rows_to_batches(values, expected)?, written, alarm))
 }
 
 /// Turn JSON rows into Arrow batches, against a known schema when there is

@@ -35,7 +35,6 @@ fn sized(path: &std::path::Path, memory_bytes: usize) -> Config {
         bitr: false,
         members: vec![Node::new("n", "http://n", 1.0).unwrap()],
         kubernetes: None,
-        processor: None,
         lease: Default::default(),
         api: Some(ApiConfig {
             root_uri: format!("file://{}/store", path.display()),
@@ -353,9 +352,6 @@ async fn a_view_that_goes_nowhere_is_refused() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_pipeline_runs_itself() {
     let d = tempfile::tempdir().unwrap();
-    // A short idle tick so the test does not wait on the production cadence.
-    // SAFETY: set before the service that reads it starts.
-    unsafe { std::env::set_var("WALLEYE_VIEW_IDLE_SECONDS", "1") };
     let app = seeded(d.path(), &["a", "b", "c"], &[10.0, 95.0, 99.0]).await;
 
     defined(
@@ -406,7 +402,6 @@ async fn a_pipeline_runs_itself() {
         }
     }
     assert_eq!(hot, 2, "both hot sensors reached the last tier unaided");
-    unsafe { std::env::remove_var("WALLEYE_VIEW_IDLE_SECONDS") };
 }
 
 /// A worker's heap is part of the machine's memory, not extra to it. A view
@@ -645,8 +640,29 @@ async fn a_worker_fetches_its_own_rows_on_a_schedule() {
     )
     .await;
 
+    // An interval is due as soon as it is declared. Asking runs it, unless
+    // the node's own alarm got there first; either way it runs once.
     let first = refresh(&app, "poller").await;
-    assert_eq!(first["written"], 1, "the worker fetched and wrote: {first}");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let (status, rows) = post(
+            &app,
+            "/v1/query",
+            JSON,
+            json!({ "sql": "SELECT sensor FROM readings" })
+                .to_string()
+                .into_bytes(),
+        )
+        .await;
+        if status == StatusCode::OK && rows.as_array().is_some_and(|rows| !rows.is_empty()) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the worker fetched and wrote: {first}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
 
     // Too soon: the view runs on its own clock, not on demand.
     let soon = refresh(&app, "poller").await;

@@ -15,10 +15,12 @@
 //!   is the process, not the host: `<WALLEYE_NODE_ID>.<12 hex>`, fresh on
 //!   every start, so a replacement beside the original is a different node.
 //!   Only the process that owns a lease writes it.
-//! - `_walleye/own/<table>/<seq>.json` is a table's ownership record,
-//!   `{"node","epoch"}`, one object per version. The newest `seq` is the
-//!   record; writing the next `seq` with create-if-absent is the
-//!   compare-and-swap. An empty `node` is a released record.
+//! - `_walleye/own/<key>/<seq>.json` is an ownership record,
+//!   `{"node","epoch","alarms"}`, one object per version. The newest `seq` is
+//!   the record; writing the next `seq` with create-if-absent is the
+//!   compare-and-swap. An empty `node` is a released record. A key is a table
+//!   name or `view.<name>` for a view with no source table; `alarms` are the
+//!   key's pending alarms (see [`crate::alarms`]), which travel with it.
 //!
 //! Liveness is judged on the observer's monotonic clock and never on a wall
 //! clock. A lease is dead once the observer has seen the same version of it
@@ -27,6 +29,7 @@
 //! `skew`, and it is authoritative for `ttl` after the issue of the last
 //! renewal it counted. So by the time a peer may call it dead, it has already
 //! stopped answering as an owner.
+use crate::alarms::Alarm;
 use futures::TryStreamExt;
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, path::Path};
 use serde::{Deserialize, Serialize};
@@ -112,6 +115,21 @@ pub struct OwnerRecord {
     /// The Lance MemWAL writer epoch the owner's writer claims. There is one
     /// fencing epoch per table, and this is it.
     pub epoch: u64,
+    /// Pending alarms by name. Only the owner changes them, by writing a new
+    /// version of this record, and a new owner inherits them with it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub alarms: BTreeMap<String, Alarm>,
+}
+
+/// What an alarm change came to.
+#[derive(Debug, PartialEq, Eq)]
+pub enum AlarmUpdate<T> {
+    /// Written to the record.
+    Applied(T),
+    /// The change asked for nothing, so nothing was written.
+    Skipped,
+    /// This process does not own the key, or lost it to the write.
+    NotOwner,
 }
 
 /// A live process another node can forward to.
@@ -166,10 +184,11 @@ struct Session {
     retired: bool,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct Held {
     seq: u64,
     epoch: u64,
+    alarms: BTreeMap<String, Alarm>,
 }
 
 #[derive(Debug)]
@@ -203,6 +222,9 @@ pub struct Ownership {
     state: Mutex<State>,
     /// Wakes the renewer at once when a session stands down.
     renew_now: tokio::sync::Notify,
+    /// Wakes whatever fires alarms: a key was claimed, released or lost, or
+    /// an alarm changed.
+    pub(crate) alarms_changed: tokio::sync::Notify,
     /// One writer of a table's record at a time within this process, so two
     /// of its own requests never race each other for the same version.
     writing: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
@@ -269,6 +291,7 @@ impl Ownership {
                 started: Instant::now(),
             }),
             renew_now: tokio::sync::Notify::new(),
+            alarms_changed: tokio::sync::Notify::new(),
             writing: Mutex::new(HashMap::new()),
         }
     }
@@ -346,6 +369,7 @@ impl Ownership {
         state.session.renewal = 0;
         state.session.anchor = None;
         self.renew_now.notify_one();
+        self.alarms_changed.notify_waiters();
     }
 
     /// Tables this process stopped owning without releasing them, since the
@@ -832,9 +856,14 @@ impl Ownership {
             }
         }
         let epoch = record.as_ref().map_or(0, |record| record.epoch);
+        let alarms = record
+            .as_ref()
+            .map(|record| record.alarms.clone())
+            .unwrap_or_default();
         let claim = OwnerRecord {
             node: me.clone(),
             epoch,
+            alarms: alarms.clone(),
         };
         if !self.write_version(table, seq + 1, &claim).await? {
             return Ok(Err(Refusal::NotNow { retry_after: retry }));
@@ -845,16 +874,20 @@ impl Ownership {
             // session that is now dead, which peers will see for themselves.
             return Ok(Err(Refusal::NotNow { retry_after: retry }));
         }
+        let pending = alarms.len();
         state.held.insert(
             table.to_owned(),
             Held {
                 seq: seq + 1,
                 epoch,
+                alarms,
             },
         );
+        drop(state);
+        self.alarms_changed.notify_waiters();
         let prior = record.map(|record| record.node).unwrap_or_default();
         eprintln!(
-            "walleye.ownership claim table={table} node={me} epoch={epoch} prior={}",
+            "walleye.ownership claim table={table} node={me} epoch={epoch} alarms={pending} prior={}",
             if prior.is_empty() { "-" } else { &prior }
         );
         Ok(Ok(epoch))
@@ -870,7 +903,7 @@ impl Ownership {
                 return Ok(false);
             }
             match state.held.get(table) {
-                Some(held) => (*held, state.session.node.clone()),
+                Some(held) => (held.clone(), state.session.node.clone()),
                 None => return Ok(false),
             }
         };
@@ -880,6 +913,7 @@ impl Ownership {
         let record = OwnerRecord {
             node: me.clone(),
             epoch,
+            alarms: held.alarms.clone(),
         };
         let written = self.write_version(table, held.seq + 1, &record).await?;
         let mut state = self.state();
@@ -892,6 +926,7 @@ impl Ownership {
             Held {
                 seq: held.seq + 1,
                 epoch,
+                alarms: held.alarms,
             },
         );
         Ok(true)
@@ -903,9 +938,11 @@ impl Ownership {
         let _writing = self.writing(table).await;
         let held = self.state().held.remove(table);
         let Some(held) = held else { return Ok(()) };
+        self.alarms_changed.notify_waiters();
         let record = OwnerRecord {
             node: String::new(),
             epoch: held.epoch,
+            alarms: held.alarms,
         };
         if self.write_version(table, held.seq + 1, &record).await? {
             eprintln!(
@@ -914,6 +951,86 @@ impl Ownership {
             );
         }
         Ok(())
+    }
+
+    /// Change the alarms of a key this process owns, as one compare-and-swap
+    /// on its record. `change` returns `None` to leave the record alone. The
+    /// write is the proof of ownership: a process that lost the key cannot
+    /// make it, so no two processes both begin one firing.
+    pub async fn update_alarms<T>(
+        &self,
+        key: &str,
+        change: impl FnOnce(&mut BTreeMap<String, Alarm>) -> Option<T>,
+    ) -> Result<AlarmUpdate<T>, Error> {
+        let _writing = self.writing(key).await;
+        let (held, me) = {
+            let mut state = self.state();
+            if !self.authoritative_locked(&mut state) {
+                return Ok(AlarmUpdate::NotOwner);
+            }
+            match state.held.get(key) {
+                Some(held) => (held.clone(), state.session.node.clone()),
+                None => return Ok(AlarmUpdate::NotOwner),
+            }
+        };
+        let mut alarms = held.alarms.clone();
+        let Some(out) = change(&mut alarms) else {
+            return Ok(AlarmUpdate::Skipped);
+        };
+        let record = OwnerRecord {
+            node: me.clone(),
+            epoch: held.epoch,
+            alarms: alarms.clone(),
+        };
+        let written = self.write_version(key, held.seq + 1, &record).await?;
+        let mut state = self.state();
+        if !written || state.session.node != me {
+            state.held.remove(key);
+            state.lost.push(key.to_owned());
+            return Ok(AlarmUpdate::NotOwner);
+        }
+        state.held.insert(
+            key.to_owned(),
+            Held {
+                seq: held.seq + 1,
+                epoch: held.epoch,
+                alarms,
+            },
+        );
+        drop(state);
+        self.alarms_changed.notify_waiters();
+        Ok(AlarmUpdate::Applied(out))
+    }
+
+    /// Every alarm on the keys this process owns now, as (key, name, alarm).
+    pub fn held_alarms(&self) -> Vec<(String, String, Alarm)> {
+        let mut state = self.state();
+        if !self.authoritative_locked(&mut state) {
+            return Vec::new();
+        }
+        state
+            .held
+            .iter()
+            .flat_map(|(key, held)| {
+                held.alarms
+                    .iter()
+                    .map(|(name, alarm)| (key.clone(), name.clone(), alarm.clone()))
+            })
+            .collect()
+    }
+
+    /// The alarms of any key, read from the bucket: what whoever owns it has
+    /// pending.
+    pub async fn read_alarms(&self, key: &str) -> Result<BTreeMap<String, Alarm>, Error> {
+        if let Some(held) = self.state().held.get(key) {
+            return Ok(held.alarms.clone());
+        }
+        Ok(self
+            .read_latest(key)
+            .await?
+            .1
+            .map(|record| record.alarms)
+            .unwrap_or_default())
     }
 
     /// Stop claiming, and say so in the lease so peers stop sending this
@@ -1156,6 +1273,7 @@ mod tests {
         let ghost = OwnerRecord {
             node: "ghost".into(),
             epoch: 99,
+            alarms: BTreeMap::new(),
         };
         assert!(
             !a.write_version("t", 2, &ghost).await.unwrap(),
