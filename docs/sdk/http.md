@@ -11,15 +11,46 @@ no route for is a 404 with an empty body.
 ## Authentication
 
 Send the token as `x-api-key`, which is what the LanceDB clients do, or as
-`Authorization: Bearer`. Anything else, or a wrong token, is a 401. `/healthz`
-and `/readyz` are the probes; every other route needs the token.
+`Authorization: Bearer`. No token, a wrong one or an expired one is a 401; a
+token without the scope a route asks for is a 403. `/healthz` and `/readyz`
+are the probes and ask for nothing.
 
 `x-api-key` shadows `Authorization` rather than sitting beside it: if the header
 is present at all, it is the one checked, and a correct Bearer alongside a stale
 `x-api-key` is a 401. Send one.
 
-One token per deployment. It is the deployment's, not a user's — rotating it
-revokes every client at once.
+### Access tokens
+
+There are two kinds of token. The deployment token, `WALLEYE_TOKEN`, may call
+every route, including the ones a node's peers use. Access tokens are for
+clients: each carries some of three scopes, and every route asks for exactly
+one of them.
+
+| Scope | Routes |
+|---|---|
+| `data:read` | list and describe tables and views, `query/`, `count_rows/`, `index/list/`, `get_lsm_stats/`, `POST /v1/query` |
+| `data:write` | `insert/`, `POST /v1/streams/{name}/events`, and a worker's `/v1/worker/{name}/` |
+| `data:manage` | `create/`, `drop/`, `create_index/`, `compact_lsm/`, `flush_lsm/`, `POST /v1/streams`, and creating, dropping and refreshing views |
+
+No scope implies another: a token that creates tables and reads them holds
+`data:manage` and `data:read`. A route that names no scope is refused to every
+access token, so a route cannot be served to one by omission.
+
+A node reads its access tokens from `_walleye/access.json` under its root, and
+reads it again every few seconds, so a token added or removed there works or
+stops working without a restart. A token the node has not seen yet makes it
+read the file at once, at most once a second. The file holds each token's
+SHA-256, never the token:
+
+```json
+{"version": 1, "tokens": [
+  {"id": "tok_1", "sha256": "<hex SHA-256 of the token>", "scopes": ["data:read"], "expires_at": null}
+]}
+```
+
+`expires_at` is Unix seconds or null, and the node refuses a token past it
+whether or not the file has changed. On the managed service the file is
+written for you when you make or revoke a token.
 
 ## Tables
 

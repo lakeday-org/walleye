@@ -1,4 +1,5 @@
 //! Single-deployment stream API, Foyer peer service, and Bitr node composition.
+pub mod access;
 pub mod ask;
 pub mod cluster;
 pub mod cron;
@@ -14,9 +15,8 @@ use axum::{
     Json, Router,
     body::Bytes,
     extract::{DefaultBodyLimit, Path, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, Method, StatusCode},
     response::{IntoResponse, Response},
-    routing::{get, post},
 };
 pub use engine::{
     ApiConfig, Column, HIDDEN_PK, PK_METADATA_KEY, StreamDefinition, StreamRequest, TableExists,
@@ -58,9 +58,9 @@ impl Config {
     /// `WALLEYE_ROOT_URI` (a full `s3://` or `file://` URI).
     ///
     /// Optional: `WALLEYE_PORT` (8080), `WALLEYE_BIND` (`[::]`, dual-stack),
-    /// `WALLEYE_TOKEN` (generated and printed
-    /// when absent), `WALLEYE_DIR` (`./walleye-cache`), `WALLEYE_RAM_GB` (1),
-    /// `WALLEYE_NVME_GB` (8), `WALLEYE_BITR_URL` (enables Bitr cluster mode),
+    /// `WALLEYE_TOKEN` (the deployment's own credential, which may call every
+    /// route; generated and printed when absent), `WALLEYE_DIR`
+    /// (`./walleye-cache`), `WALLEYE_RAM_GB` (1), `WALLEYE_NVME_GB` (8), `WALLEYE_BITR_URL` (enables Bitr cluster mode),
     /// `WALLEYE_MEMBERS` (`id=http://host:8080,...`) with `WALLEYE_NODE_ID`
     /// naming this member.
     pub fn from_env() -> Result<Self, Box<dyn std::error::Error>> {
@@ -208,6 +208,8 @@ fn directory_bytes(dir: &str, skip: &std::path::Path) -> usize {
 pub struct Service {
     pub config: Config,
     pub cache: Arc<LanceFoyerCacheBackend>,
+    /// Who may call what: the deployment token and the published access tokens.
+    access: Arc<access::Access>,
     ring: Arc<Membership>,
     engine: Option<engine::Engine>,
     hits: AtomicU64,
@@ -308,6 +310,21 @@ impl Service {
             )
             .await?,
         );
+        // Customer access tokens are published into the deployment's own
+        // storage, so a node with storage reads them from there.
+        let access = Arc::new(match config.api.as_ref() {
+            Some(api) => {
+                let (store, root) = lance_io::object_store::ObjectStore::from_uri_and_params(
+                    Arc::new(lance_io::object_store::ObjectStoreRegistry::default()),
+                    &api.root_uri,
+                    &engine::storage_params(),
+                )
+                .await?;
+                access::Access::open(config.token.clone(), store.inner.clone(), &root).await?
+            }
+            None => access::Access::system_only(config.token.clone()),
+        });
+        access.clone().spawn_refresh(access::REFRESH_INTERVAL);
         let engine = if let Some(api) = config.api.clone() {
             let params = engine::storage_params();
             let peers =
@@ -347,6 +364,7 @@ impl Service {
         let service = Arc::new(Self {
             config,
             cache,
+            access,
             ring,
             engine,
             hits: AtomicU64::new(0),
@@ -734,48 +752,52 @@ pub fn use_tls() {
     });
 }
 
-pub fn router(service: Arc<Service>) -> Router {
-    Router::new()
-        .route("/healthz", get(healthz))
-        .route("/readyz", get(readyz))
-        .route("/internal/cache/{key}", get(read).put(write))
-        .route("/internal/cache/stats", get(stats))
-        .route("/internal/snapshot/{name}", get(snapshot))
-        .route("/internal/cache/flush", post(flush))
-        .route("/v1/streams", post(define))
-        .route("/v1/streams/{name}/events", post(ingest))
-        .route("/v1/ingest/{source}", post(ingest_any))
-        .route("/v1/query", post(query))
-        .layer(DefaultBodyLimit::max(8 * 1024 * 1024))
+/// Every route the node serves, each with what it asks of its caller.
+pub(crate) fn routes() -> access::Routes<Arc<Service>> {
+    use access::{Required::*, Scope::*};
+    access::Routes::default()
+        .route(Method::GET, "/healthz", Open, healthz)
+        .route(Method::GET, "/readyz", Open, readyz)
+        .route(Method::GET, "/internal/cache/{key}", System, read)
+        .route(Method::PUT, "/internal/cache/{key}", System, write)
+        .route(Method::GET, "/internal/cache/stats", System, stats)
+        .route(Method::GET, "/internal/snapshot/{name}", System, snapshot)
+        .route(Method::POST, "/internal/cache/flush", System, flush)
+        .route(Method::POST, "/v1/streams", Data(Manage), define)
+        .route(
+            Method::POST,
+            "/v1/streams/{name}/events",
+            Data(Write),
+            ingest,
+        )
+        // Records of any shape become rows in tables it decides, so it is a
+        // write like any other ingest.
+        .route(
+            Method::POST,
+            "/v1/ingest/{source}",
+            Data(Write),
+            ingest_any,
+        )
+        .route(Method::POST, "/v1/query", Data(Read), query)
+        .map(|router| router.layer(DefaultBodyLimit::max(8 * 1024 * 1024)))
         .merge(lancedb::routes())
+}
+pub fn router(service: Arc<Service>) -> Router {
+    let (router, table) = routes().into_parts();
+    let gate = access::Gate {
+        access: service.access.clone(),
+        table: Arc::new(table),
+    };
+    router
         .layer(axum::middleware::from_fn_with_state(
             service.clone(),
             cluster::route_to_owner,
         ))
+        // Outermost, so nothing - not even the forward to a stream's owner,
+        // which carries this node's own token - happens for a caller the
+        // route does not admit.
+        .layer(axum::middleware::from_fn_with_state(gate, access::gate))
         .with_state(service)
-}
-/// Accepts either `Authorization: Bearer <token>` or the LanceDB SDK's `x-api-key`.
-pub(crate) fn authorize(s: &Service, headers: &HeaderMap) -> Result<(), StatusCode> {
-    let presented = match headers.get("x-api-key").and_then(|v| v.to_str().ok()) {
-        Some(key) => key.to_string(),
-        None => headers
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "))
-            .ok_or(StatusCode::UNAUTHORIZED)?
-            .to_string(),
-    };
-    let expected = &s.config.token;
-    if presented.len() != expected.len()
-        || presented
-            .bytes()
-            .zip(expected.bytes())
-            .fold(0u8, |d, (a, b)| d | (a ^ b))
-            != 0
-    {
-        return Err(StatusCode::UNAUTHORIZED);
-    }
-    Ok(())
 }
 /// Liveness plus first-boot readiness. A node that has never been write-ready
 /// reports unavailable so a load balancer does not route to it before its
@@ -846,9 +868,7 @@ fn key(value: &str) -> Result<InternalCacheKey, StatusCode> {
 async fn read(
     State(s): State<Arc<Service>>,
     Path(k): Path<String>,
-    headers: HeaderMap,
 ) -> Result<Response, StatusCode> {
-    authorize(&s, &headers)?;
     if let Some(bytes) = s.cache.export_entry(&key(&k)?).await {
         s.hits.fetch_add(1, Ordering::Relaxed);
         Ok(bytes.into_response())
@@ -860,10 +880,8 @@ async fn read(
 async fn write(
     State(s): State<Arc<Service>>,
     Path(k): Path<String>,
-    headers: HeaderMap,
     body: Bytes,
 ) -> Result<StatusCode, StatusCode> {
-    authorize(&s, &headers)?;
     let key = key(&k)?;
     if s.ring.snapshot().owner(key.as_bytes()).id != s.config.node_id {
         return Err(StatusCode::CONFLICT);
@@ -880,9 +898,8 @@ async fn write(
 async fn snapshot(
     State(s): State<Arc<Service>>,
     Path(name): Path<String>,
-    headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    let engine = api(&s, &headers)?;
+    let engine = api(&s)?;
     let (schema, batches) = engine.snapshot_batches(&name).await.map_err(failure)?;
     let mut out = Vec::new();
     {
@@ -895,11 +912,7 @@ async fn snapshot(
     }
     Ok(([("content-type", "application/vnd.apache.arrow.file")], out).into_response())
 }
-async fn stats(
-    State(s): State<Arc<Service>>,
-    headers: HeaderMap,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    authorize(&s, &headers)?;
+async fn stats(State(s): State<Arc<Service>>) -> Json<serde_json::Value> {
     let budget = s.engine.as_ref().map(|e| {
         let r = e.resources();
         serde_json::json!({
@@ -910,17 +923,13 @@ async fn stats(
             "disk_used_elsewhere": r.disk_used_elsewhere(),
         })
     });
-    Ok(Json(
+    Json(
         serde_json::json!({"node":s.config.node_id,"members":s.ring.snapshot().members(),"membership_epoch":s.ring.snapshot().epoch(),"hits":s.hits.load(Ordering::Relaxed),"misses":s.misses.load(Ordering::Relaxed),"stores":s.stores.load(Ordering::Relaxed),"entries":s.cache.num_entries().await,"memory_usage":s.cache.memory_usage(),"memory_capacity":s.cache.memory_capacity(),"disk_capacity":s.cache.persistent_capacity(),"budget":budget}),
-    ))
+    )
 }
-async fn flush(
-    State(s): State<Arc<Service>>,
-    headers: HeaderMap,
-) -> Result<StatusCode, StatusCode> {
-    authorize(&s, &headers)?;
+async fn flush(State(s): State<Arc<Service>>) -> StatusCode {
     s.cache.flush().await;
-    Ok(StatusCode::NO_CONTENT)
+    StatusCode::NO_CONTENT
 }
 type ApiError = (StatusCode, Json<serde_json::Value>);
 fn failure(e: impl std::fmt::Display) -> ApiError {
@@ -977,8 +986,8 @@ type Error = Box<dyn std::error::Error + Send + Sync>;
 /// quorum is unreachable declines with 503 and a `Retry-After` instead of
 /// opening a writer that would fail recovery; the caller (or the forwarding
 /// peer) retries.
-pub(crate) fn writable<'a>(s: &'a Service, h: &HeaderMap) -> Result<&'a engine::Engine, ApiError> {
-    let engine = api(s, h)?;
+pub(crate) fn writable(s: &Service) -> Result<&engine::Engine, ApiError> {
+    let engine = api(s)?;
     if !s.write_ready.load(Ordering::Acquire) {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
@@ -987,8 +996,8 @@ pub(crate) fn writable<'a>(s: &'a Service, h: &HeaderMap) -> Result<&'a engine::
     }
     Ok(engine)
 }
-pub(crate) fn api<'a>(s: &'a Service, h: &HeaderMap) -> Result<&'a engine::Engine, ApiError> {
-    authorize(s, h).map_err(|code| (code, Json(serde_json::json!({"error":"unauthorized"}))))?;
+/// The engine, for a request the access gate has already admitted.
+pub(crate) fn api(s: &Service) -> Result<&engine::Engine, ApiError> {
     s.engine.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
         Json(serde_json::json!({"error":"use the configured stream ingress"})),
@@ -996,12 +1005,11 @@ pub(crate) fn api<'a>(s: &'a Service, h: &HeaderMap) -> Result<&'a engine::Engin
 }
 async fn define(
     State(s): State<Arc<Service>>,
-    h: HeaderMap,
     Json(def): Json<StreamRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let def: StreamDefinition = def.into();
     let name = def.name.clone();
-    let engine = writable(&s, &h)?;
+    let engine = writable(&s)?;
     let mut revision = s.revision.lock().await;
     *revision = format!("\"{}\"", uuid::Uuid::new_v4());
     engine.define(def).await.map_err(failure)?;
@@ -1060,7 +1068,7 @@ async fn ingest(
     h: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiError> {
-    let engine = writable(&s, &h)?;
+    let engine = writable(&s)?;
     // Parsing JSON into values costs several times the bytes it came from,
     // and the rows are copied again on the way into Arrow. Lease that before
     // paying it, as the Arrow path does, so a large insert is refused rather
@@ -1118,10 +1126,9 @@ struct Query {
 }
 async fn query(
     State(s): State<Arc<Service>>,
-    h: HeaderMap,
     Json(input): Json<Query>,
 ) -> Result<Response, ApiError> {
-    let engine = api(&s, &h)?;
+    let engine = api(&s)?;
     let revision = s.revision.lock().await;
     let headers = [
         ("content-type", "application/json"),
