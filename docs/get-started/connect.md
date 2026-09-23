@@ -29,6 +29,11 @@ database and anything else is a local directory. So the node's address goes in
 after `db://` is a label the client wants and the node ignores — one node is
 one database.
 
+On the managed service at [lakeday.ai](https://lakeday.ai) that name is how
+you pick the instance: every instance is reached at one address,
+`https://db.lakeday.ai`, as `db://<instance id>`, and the SDK sends the name
+with every request.
+
 **The token.** Self-hosted, it is `WALLEYE_TOKEN`, or the one the node
 generated and printed to standard error at startup, or an
 [access token](../sdk/http.md#access-tokens) you published for the node. On
