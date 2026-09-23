@@ -401,17 +401,30 @@ struct Stream {
 impl Stream {
     /// Bytes this stream's writer may hold in memory: the memtable size and
     /// unflushed bound the table is opened with, plus every vector index's
-    /// graph and storage at the memtable's row capacity.
+    /// graph at the memtable's row capacity. Not the vectors: those are in the
+    /// memtable already.
     fn memory_footprint(&self) -> usize {
         const MEMTABLE_BYTES: usize = 16 * 1024 * 1024 + 32 * 1024 * 1024;
         const MEMTABLE_ROWS: usize = 100_000;
+        /// A graph node's neighbour lists and the store's row lookup, per row
+        /// of capacity: 50 MiB measured over 100,000 rows, rounded up to cover
+        /// the widest full memtable measured.
+        const PER_VECTOR_SLOT: usize = 576;
         let vectors: usize = self
             .config
             .vector_indexes
             .iter()
             .filter_map(|spec| self.config.schema.field_with_name(&spec.column).ok())
+            // The graph preallocates a node per row of capacity, and the store
+            // a lookup entry per row; the vectors themselves are referenced in
+            // the memtable's own batches, which MEMTABLE_BYTES already counts.
+            // Measured, each in its own process, at 128, 768, 1536 and 3072
+            // dimensions: the graph is 50 MiB however wide the vectors, and a
+            // full memtable with it 82 to 102 MiB. Charging the vectors again
+            // per row of capacity, as this used to, put a 3072-wide column at
+            // 1184 MiB against 101 real, and a node could hold a handful.
             .map(|field| match field.data_type() {
-                DataType::FixedSizeList(_, dim) => MEMTABLE_ROWS * (*dim as usize * 4 + 128),
+                DataType::FixedSizeList(_, _) => MEMTABLE_ROWS * PER_VECTOR_SLOT,
                 _ => 0,
             })
             .sum();

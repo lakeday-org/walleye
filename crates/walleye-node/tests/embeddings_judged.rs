@@ -83,7 +83,9 @@ async fn node(dir: &std::path::Path) -> (Arc<Service>, Router) {
         node_id: "n".into(),
         listen: "127.0.0.1:0".into(),
         directory: dir.join("cache"),
-        memory_bytes: 512 * 1024 * 1024,
+        // Four tables open at once - two of them the ingest path's own bronze
+        // and quarantine - and a vector graph: more than 512 MiB allows.
+        memory_bytes: 1024 * 1024 * 1024,
         disk_bytes: 64 * 1024 * 1024,
         token: TOKEN.into(),
         bitr: false,

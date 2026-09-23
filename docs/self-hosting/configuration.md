@@ -90,7 +90,8 @@ still works: every judgement takes its safe default instead. See
 
 ## Embeddings
 
-Only relevant if you want ingested text to be searchable by meaning. This is
+Only relevant if you want ingested text to be searchable by meaning, or to use
+`embed()` in SQL. This is
 configured separately from the model that answers questions in SQL, because
 the two are chosen for different things and billed separately.
 

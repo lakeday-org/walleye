@@ -116,14 +116,35 @@ model is slow or down, the rows are written anyway with their vectors empty
 in. A rebuild keeps the vectors the table already has, so it doesn't re-embed
 every row.
 
-Search with any LanceDB client, naming the column:
+Search it in SQL with two functions:
 
-```python
-table.search(embed("box arrived damaged"), vector_column_name="review_embedding").limit(5)
+```sql
+SELECT review FROM reviews
+ORDER BY cosine_distance(review_embedding, embed('arrived damaged'))
+LIMIT 5
 ```
 
-The query text has to be embedded with the same model the table used. The
-table's rule records which model that is.
+- `embed(text)` turns text into a vector with the configured embedding model,
+  the same one ingest used, so the two can be compared.
+- `cosine_distance(a, b)` goes from 0 for the same meaning up to 2.
+
+A question asked in words through `/v1/query` uses them on its own. The
+text-to-SQL model is told which columns hold the meaning of which text, so
+"which review is about something damaged in delivery?" is answered by
+meaning:
+
+```sql
+SELECT "review" FROM "shop_reviews"
+ORDER BY cosine_distance("review_embedding", embed('something damaged in delivery'))
+LIMIT 1
+```
+
+That returns the review about a courier leaving the box in the rain, which
+shares no words with the question.
+
+LanceDB clients can also search the vector column directly by naming it
+(`vector_column_name="review_embedding"`). They then embed the query text
+themselves, with the same model.
 
 ## When records change shape
 
@@ -158,8 +179,9 @@ digit.
   rarely after, but it's proportional to what bronze holds.
 - On a cluster, ingest runs on the node that receives the request, and that
   node needs to own the typed table.
-- Embedding a query is the client's job for now. Walleye doesn't yet embed
-  search text for you.
+- A search from SQL compares against every row rather than using the vector
+  index. That's fine for tables up to millions of rows; past that, search
+  through the LanceDB API, which uses the index.
 - Switching embedding models doesn't re-embed an existing table. Its vectors
   stay with the model that made them, and new rows aren't embedded until the
   models match again.

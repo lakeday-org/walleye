@@ -83,7 +83,9 @@ async fn node(dir: &std::path::Path) -> (Arc<Service>, Router) {
         node_id: "n".into(),
         listen: "127.0.0.1:0".into(),
         directory: dir.join("cache"),
-        memory_bytes: 512 * 1024 * 1024,
+        // Four tables open at once - two of them the ingest path's own bronze
+        // and quarantine - and a vector graph: more than 512 MiB allows.
+        memory_bytes: 1024 * 1024 * 1024,
         disk_bytes: 64 * 1024 * 1024,
         token: TOKEN.into(),
         bitr: false,
@@ -248,8 +250,23 @@ async fn text_worth_searching_by_meaning_is_embedded_and_searchable() {
         "a text is nearest itself"
     );
 
+    // And in SQL, which is what a question asked in words is turned into:
+    // `embed` makes the query's vector with the same model, and
+    // `cosine_distance` ranks by it.
+    let ranked = sql(
+        &app,
+        &format!(
+            "SELECT review FROM reviews ORDER BY cosine_distance(review_embedding, embed('{}')) \
+             LIMIT 1",
+            REVIEWS[3].replace('\'', "''")
+        ),
+    )
+    .await;
+    assert_eq!(ranked[0]["review"], REVIEWS[3], "{ranked:?}");
+
     // --- the model goes down: ingestion does not wait for it ---------------
     model.down.store(true, Ordering::SeqCst);
+
     let during = ingest(&app, "reviews", records(5..8)).await;
     assert_eq!(during["accepted"], 3, "rows land anyway: {during}");
     assert_eq!(

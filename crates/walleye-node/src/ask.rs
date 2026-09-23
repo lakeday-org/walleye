@@ -71,6 +71,7 @@ impl Engine {
     /// Every table this node knows, as DDL the model reads.
     async fn catalog_ddl(&self) -> Result<String, Error> {
         let mut out = String::new();
+        let mut searchable = false;
         for (name, schema) in self.schemas().await? {
             let columns: Vec<String> = schema
                 .fields()
@@ -86,9 +87,38 @@ impl Engine {
                 quote(&name),
                 columns.join(",\n")
             ));
+            // Say which vectors hold the meaning of which text, and how to use
+            // them. Only where a query could: `embed` needs the same model
+            // that made the vectors.
+            if walleye_lance::embed::Embedder::from_env().is_some() {
+                for field in schema.fields() {
+                    let Some(text) = field.name().strip_suffix("_embedding") else {
+                        continue;
+                    };
+                    if !matches!(field.data_type(), DataType::FixedSizeList(_, _))
+                        || schema.field_with_name(text).is_err()
+                    {
+                        continue;
+                    }
+                    out.push_str(&format!(
+                        "-- {v} holds the meaning of {t}. To find rows whose {t} is about \
+                         something, whatever words it uses: ORDER BY cosine_distance({v}, \
+                         embed('what to look for')) LIMIT n. Smaller is closer.\n",
+                        v = quote(field.name()),
+                        t = quote(text),
+                    ));
+                    searchable = true;
+                }
+            }
         }
         if out.is_empty() {
             return Err("this node has no tables to ask about".into());
+        }
+        if searchable {
+            out.push_str(
+                "-- When a question asks for rows by what their text means or is about, \
+                 rather than for exact words, use the vector search above instead of LIKE.\n",
+            );
         }
         Ok(out)
     }
