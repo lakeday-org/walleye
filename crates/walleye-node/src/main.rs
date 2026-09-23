@@ -84,9 +84,26 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
             // this process accepts while it drains is made durable through it.
             let drain = async {
                 // Hand the tables over first, while this process still
-                // forwards requests for them to whoever claims them.
-                service.release().await;
-                service.quiesce();
+                // forwards requests for them to whoever claims them. The
+                // server is polled throughout: its accept loop lives in this
+                // future, and a connection left in the backlog while the
+                // release runs is reset when the listener closes, which a
+                // proxy in front reports as a 502.
+                let handover = async {
+                    service.release().await;
+                    service.quiesce();
+                    // A proxy routes to this process until it learns the
+                    // Machine is stopping. Go on accepting, and forwarding
+                    // to the new owners, for long enough that it has.
+                    tokio::time::sleep(DRAIN_GRACE).await;
+                };
+                tokio::select! {
+                    () = handover => {}
+                    r = &mut server => {
+                        service.close().await;
+                        return r.map_err(Into::into);
+                    }
+                }
                 // Keep serving state commits until the outstanding HTTP processors return.
                 let result = if service.config.processor.is_some() {
                     tokio::select! {r=&mut processor=>r, r=&mut server=>{service.close().await; return r.map_err(Into::into);}}
@@ -122,6 +139,12 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     let _ = stop_bitr.send(());
     result
 }
+
+/// How long a stopping process keeps accepting requests after it has handed
+/// its tables over. Fly Proxy was measured acting on a routing change in about
+/// 0.9 to 3.5 s; a request it sends in that window is forwarded to the table's
+/// new owner rather than refused.
+const DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
 
 async fn shutdown() {
     #[cfg(unix)]
