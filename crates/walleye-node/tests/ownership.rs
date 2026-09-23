@@ -141,8 +141,12 @@ async fn a_paused_owner_is_fenced_and_stands_down() {
     let pause = Duration::from_millis(lease.ttl_ms + lease.skew_ms + 4 * lease.sample_ms + 1_000);
     a.pause(pause);
     let paused = Instant::now();
+    // The claim takes the record at the old epoch; opening the writer then
+    // claims the next one, which is what fences the paused owner's writer.
     let b_epoch = loop {
-        if let Some(epoch) = held(&b.base).await.get("p").copied() {
+        if let Some(epoch) = held(&b.base).await.get("p").copied()
+            && epoch > a_epoch
+        {
             break epoch;
         }
         assert!(
@@ -154,10 +158,6 @@ async fn a_paused_owner_is_fenced_and_stands_down() {
     println!(
         "  a paused owner's table moved after {:.0} ms; writer epoch {a_epoch} -> {b_epoch}",
         paused.elapsed().as_secs_f64() * 1000.0
-    );
-    assert!(
-        b_epoch > a_epoch,
-        "the new owner's writer fences the old one's"
     );
     // The paused process's own writer is still open inside it. Its first act
     // on resuming is this write, sent straight to it.
