@@ -246,3 +246,14 @@
     A schedule that missed several occurrences running once for each of them,
     or dropping them without saying so. One run stands for the latest missed
     time and reports how many it covers.
+
+- name: a-hand-back-only-moves-a-key-to-where-it-belongs
+  where: mentions hand_back
+  each: method
+  min: 75
+  ensure: >
+    A process gives a key back only while it holds more than its fair share,
+    only a key whose placement is another live process, one key per sweep, and
+    only between alarm firings. Moving a key anywhere but to its placement, or
+    moving keys a process is placed to hold, is what turns rebalancing into
+    keys moving for ever.

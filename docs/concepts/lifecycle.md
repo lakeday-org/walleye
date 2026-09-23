@@ -64,7 +64,7 @@ In a cluster, roll one node at a time and watch `/readyz?require=all`. A quorum
 of two of three means the other two go on acknowledging writes while one is
 away, and the node being restarted hands its tables to them as it stops, so a
 client sees at most a retried request. The restarted node comes back owning
-nothing and takes tables only as other nodes leave. Waiting for every member
+nothing, and the others hand it its share, one table per sweep. Waiting for every member
 to be serving again before taking the next node out keeps two replicas
 answering throughout. [Losing a node](shapes.md#losing-a-node) is the same
 handover without the plan.
