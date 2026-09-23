@@ -885,10 +885,23 @@ impl Engine {
         &self.owners
     }
     /// Where requests for `name` go, claiming it here when nobody live owns
-    /// it. `fresh` reads the bucket rather than the last sample. Never
+    /// it and it belongs here. `fresh` reads the bucket rather than the last
+    /// sample. Never
     /// answers [`Route::Unowned`]: a table this process cannot take is a
     /// [`NoOwner`] error with the wait before trying again.
     pub async fn route(&self, name: &str, fresh: bool) -> Result<Route, Error> {
+        self.route_request(name, fresh, false).await
+    }
+    /// As [`Self::route`], for a request that arrived here. One another
+    /// process forwarded is taken here if nobody owns it, wherever it belongs:
+    /// that process sent it because it belongs here, and sending it on again
+    /// could go round in circles while two views of the leases disagree.
+    pub async fn route_request(
+        &self,
+        name: &str,
+        fresh: bool,
+        forwarded: bool,
+    ) -> Result<Route, Error> {
         match self.owners.resolve(name, fresh).await? {
             Route::Unowned => {}
             route => return Ok(route),
@@ -907,6 +920,19 @@ impl Engine {
                     retry_after: self.owners.config().sample(),
                 })),
             };
+        }
+        // A key nobody owns goes to the process it belongs to, which takes
+        // it on arrival; only a request already sent here is taken here.
+        let me = self.owners.node();
+        if !forwarded
+            && let Some(peer) = self.owners.preferred(name)
+            && peer.node != me
+            // The last sample can be a lease behind: one that retired or
+            // lapsed since is no place to send the key.
+            && let crate::ownership::Liveness::Live { verdict_in, .. } =
+                self.owners.liveness(&peer.node, true).await?
+        {
+            return Ok(Route::Remote { peer, verdict_in });
         }
         match self.owners.claim(name).await? {
             Ok(epoch) => {
@@ -1039,6 +1065,7 @@ impl Engine {
                 names.push(key);
             }
         }
+        self.owners.plan(&names);
         let mut claimed = Vec::new();
         for name in self.owners.orphaned(&names) {
             match self.owners.claim(&name).await {
@@ -1053,6 +1080,12 @@ impl Engine {
             self.warm_tables(claimed.clone()).await;
         }
         self.reconcile_views(&views).await;
+        // One key at a time, so a rebalance is a trickle a sweep apart rather
+        // than a stampede, and keys only ever move to where they belong, so it
+        // stops once nobody holds more than their share.
+        if let Some(key) = self.owners.surplus(&names) {
+            self.hand_back(&key).await;
+        }
         claimed
     }
     /// The registered definition, loading it from the catalog if needed.
@@ -1960,31 +1993,7 @@ impl Engine {
         let held = self.owners.held_tables();
         let count = held.len();
         futures::stream::iter(held)
-            .for_each_concurrent(8, |name| async move {
-                let stream = self.streams.lock().await.get(&name).cloned();
-                // Hold the writer slot across the release, so no write opens
-                // a new writer between the flush and the record naming nobody.
-                let guard = match &stream {
-                    Some(stream) => {
-                        let mut guard = stream.table.lock().await;
-                        if let Some(mut table) = guard.take() {
-                            if let Err(error) = table.checkpoint().await {
-                                eprintln!(
-                                    "walleye.ownership release table={name} stage=flush outcome=error error={error}"
-                                );
-                            }
-                            let _ = table.close().await;
-                        }
-                        *stream.lease.lock().await = None;
-                        Some(guard)
-                    }
-                    None => None,
-                };
-                if let Err(error) = self.owners.release(&name).await {
-                    eprintln!("walleye.ownership release table={name} outcome=error error={error}");
-                }
-                drop(guard);
-            })
+            .for_each_concurrent(8, |name| async move { self.release_key(&name).await })
             .await;
         self.owners.retire().await;
         eprintln!(
@@ -1992,6 +2001,54 @@ impl Engine {
             started.elapsed().as_millis()
         );
     }
+    /// Flush a key's writer and release its record at the same epoch, holding
+    /// the writer slot across both so no write opens a writer in between. A
+    /// write that was waiting finds the key released and is sent on to
+    /// whoever takes it.
+    async fn release_key(&self, name: &str) {
+        let stream = self.streams.lock().await.get(name).cloned();
+        let guard = match &stream {
+            Some(stream) => {
+                let mut guard = stream.table.lock().await;
+                if let Some(mut table) = guard.take() {
+                    if let Err(error) = table.checkpoint().await {
+                        eprintln!(
+                            "walleye.ownership release table={name} stage=flush outcome=error error={error}"
+                        );
+                    }
+                    let _ = table.close().await;
+                }
+                *stream.lease.lock().await = None;
+                Some(guard)
+            }
+            None => None,
+        };
+        if let Err(error) = self.owners.release(name).await {
+            eprintln!("walleye.ownership release table={name} outcome=error error={error}");
+        }
+        drop(guard);
+    }
+
+    /// Give one key back to the process it belongs to, because this one holds
+    /// more than its share. Waits out any alarm firing in flight and holds
+    /// new ones off until the key is released, as a stopping process does.
+    async fn hand_back(&self, key: &str) {
+        let started = Instant::now();
+        let _firings = self.firings.write().await;
+        if self.owners.holds(key).is_none() {
+            return;
+        }
+        self.release_key(key).await;
+        eprintln!(
+            "walleye.ownership hand_back key={key} to={} elapsed_ms={}",
+            self.owners
+                .preferred(key)
+                .map(|peer| peer.node)
+                .unwrap_or_default(),
+            started.elapsed().as_millis()
+        );
+    }
+
     pub async fn close(&self) {
         self.release_all().await;
         let mut closed = self.closed.write().await;
@@ -2515,6 +2572,8 @@ mod tests {
         let a: &'static Engine =
             Box::leak(Box::new(engine_with(dir, None, "a", lease.clone()).await));
         let b = engine_with(dir, None, "b", lease).await;
+        // A takes the table outright, wherever it would be placed.
+        assert!(a.owners.claim("t").await.unwrap().is_ok());
         a.define(definition("t")).await.unwrap();
         a.ingest("t", vec![json!({"id":1,"value":1})])
             .await

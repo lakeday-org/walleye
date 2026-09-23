@@ -210,6 +210,10 @@ struct State {
     lost: Vec<String>,
     /// Leases of stood-down sessions still to be deleted.
     abandoned: Vec<String>,
+    /// Where each known key belongs, as of the last sweep: see [`place`].
+    placement: HashMap<String, Peer>,
+    /// The most keys one live process should hold as of that sweep.
+    fair_share: usize,
     started: Instant,
 }
 
@@ -247,6 +251,35 @@ fn wall_ms() -> u64 {
 /// spread across the survivors instead of all landing on one.
 fn score(table: &str, node: &str) -> u64 {
     xxhash_rust::xxh3::xxh3_64(format!("{table}\0{node}").as_bytes())
+}
+
+/// Where each key belongs: rendezvous hashing with bounded load. Keys are
+/// taken in a fixed order and each goes to the highest-scoring process that
+/// has fewer than its fair share, `ceil(keys / processes)`. Every process that
+/// sees the same keys and the same live leases works out the same answer, no
+/// process is given more than its fair share, and a key keeps its place while
+/// the membership does.
+pub fn place(keys: &[String], nodes: &[String]) -> HashMap<String, String> {
+    let mut placed = HashMap::new();
+    if nodes.is_empty() {
+        return placed;
+    }
+    let mut keys: Vec<&String> = keys.iter().collect();
+    keys.sort_by_key(|key| (xxhash_rust::xxh3::xxh3_64(key.as_bytes()), (*key).clone()));
+    keys.dedup();
+    let cap = keys.len().div_ceil(nodes.len());
+    let mut load: HashMap<&str, usize> = nodes.iter().map(|n| (n.as_str(), 0)).collect();
+    for key in keys {
+        let mut ranked: Vec<&String> = nodes.iter().collect();
+        ranked.sort_by_key(|node| std::cmp::Reverse((score(key, node), (*node).clone())));
+        let chosen = ranked
+            .into_iter()
+            .find(|node| load[node.as_str()] < cap)
+            .expect("the shares add up to at least every key");
+        *load.get_mut(chosen.as_str()).expect("a counted node") += 1;
+        placed.insert(key.clone(), chosen.clone());
+    }
+    placed
 }
 
 fn version_of(meta: &object_store::ObjectMeta) -> String {
@@ -288,6 +321,8 @@ impl Ownership {
                 dead: HashSet::new(),
                 lost: Vec::new(),
                 abandoned: Vec::new(),
+                placement: HashMap::new(),
+                fair_share: usize::MAX,
                 started: Instant::now(),
             }),
             renew_now: tokio::sync::Notify::new(),
@@ -1064,21 +1099,30 @@ impl Ownership {
     /// The live process that should claim `table` if it is orphaned: the
     /// rendezvous winner among live, non-draining leases, this one included.
     pub fn preferred(&self, table: &str) -> Option<Peer> {
+        let live = self.live_peers();
+        let state = self.state();
+        if let Some(placed) = state.placement.get(table)
+            && live.contains(placed)
+        {
+            return Some(placed.clone());
+        }
+        drop(state);
+        // A key the last sweep did not know goes to its rendezvous winner.
+        live.into_iter().max_by_key(|peer| score(table, &peer.node))
+    }
+
+    /// The live, non-draining processes, this one included when it is an
+    /// owner, as this process sees them now.
+    pub fn live_peers(&self) -> Vec<Peer> {
         let mut state = self.state();
         let authoritative = self.authoritative_locked(&mut state);
         let me = state.session.node.clone();
-        let mut best: Option<(u64, Peer)> = None;
+        let mut live = Vec::new();
         let mut consider = |node: &str, addr: &str| {
-            let candidate = score(table, node);
-            if best.as_ref().is_none_or(|(s, _)| candidate > *s) {
-                best = Some((
-                    candidate,
-                    Peer {
-                        node: node.to_owned(),
-                        addr: addr.to_owned(),
-                    },
-                ));
-            }
+            live.push(Peer {
+                node: node.to_owned(),
+                addr: addr.to_owned(),
+            });
         };
         if authoritative && !state.session.draining {
             consider(&me, &self.addr);
@@ -1093,7 +1137,53 @@ impl Ownership {
             }
             consider(node, &lease.addr);
         }
-        best.map(|(_, peer)| peer)
+        live.sort_by(|a, b| a.node.cmp(&b.node));
+        live
+    }
+
+    /// Work out where every known key belongs among the live processes, for
+    /// claims and hand-backs until the next sweep.
+    pub fn plan(&self, keys: &[String]) {
+        let live = self.live_peers();
+        let nodes: Vec<String> = live.iter().map(|peer| peer.node.clone()).collect();
+        let placed = place(keys, &nodes);
+        let fair_share = keys.len().div_ceil(nodes.len().max(1));
+        let by_node: HashMap<&str, &Peer> = live.iter().map(|p| (p.node.as_str(), p)).collect();
+        let mut state = self.state();
+        state.placement = placed
+            .into_iter()
+            .filter_map(|(key, node)| by_node.get(node.as_str()).map(|p| (key, (*p).clone())))
+            .collect();
+        state.fair_share = if nodes.is_empty() {
+            usize::MAX
+        } else {
+            fair_share
+        };
+    }
+
+    /// A key this process should hand back: it holds more than its fair share
+    /// of the known keys, and the key belongs to another live process. One
+    /// at a time, the one this process has least claim to.
+    pub fn surplus(&self, known: &[String]) -> Option<String> {
+        let me = self.node();
+        let state = self.state();
+        let held: Vec<&String> = state
+            .held
+            .keys()
+            .filter(|key| known.contains(key))
+            .collect();
+        if held.len() <= state.fair_share {
+            return None;
+        }
+        held.into_iter()
+            .filter(|key| {
+                state
+                    .placement
+                    .get(key.as_str())
+                    .is_some_and(|peer| peer.node != me)
+            })
+            .min_by_key(|key| score(key, &me))
+            .cloned()
     }
 
     /// Of `tables`, those the last sample shows nobody live owns and this
@@ -1255,6 +1345,89 @@ mod tests {
             b.claim("t").await.unwrap(),
             Err(Refusal::Owned { .. })
         ));
+    }
+
+    /// Placement is balanced within one, the same wherever it is worked out,
+    /// and stable: a key keeps its process while the membership does.
+    #[test]
+    fn placement_is_balanced_and_deterministic() {
+        for (keys, nodes) in [(12, 3), (13, 3), (7, 4), (100, 5), (3, 5)] {
+            let keys: Vec<String> = (0..keys).map(|i| format!("t{i}")).collect();
+            let nodes: Vec<String> = (0..nodes).map(|i| format!("n{i}.x")).collect();
+            let placed = place(&keys, &nodes);
+            assert_eq!(placed.len(), keys.len());
+            let mut load: HashMap<&String, usize> = HashMap::new();
+            for node in placed.values() {
+                *load.entry(node).or_default() += 1;
+            }
+            let cap = keys.len().div_ceil(nodes.len());
+            assert!(load.values().all(|n| *n <= cap), "{load:?}");
+            let mut reversed = nodes.clone();
+            reversed.reverse();
+            assert_eq!(
+                place(&keys, &reversed),
+                placed,
+                "order of discovery is irrelevant"
+            );
+        }
+    }
+
+    /// The hand-back rule reaches a fixed point from any starting spread: a
+    /// process over its share gives one key to where it belongs, the process
+    /// it belongs to takes it, and nothing moves once no process is over.
+    /// Keys only ever move to their place, so the number of moves is bounded
+    /// by the number of keys.
+    #[test]
+    fn hand_backs_reach_a_fixed_point() {
+        let nodes: Vec<String> = (0..3).map(|i| format!("n{i}.x")).collect();
+        for seed in 0..200_u64 {
+            let keys: Vec<String> = (0..12).map(|i| format!("k{seed}-{i}")).collect();
+            let placed = place(&keys, &nodes);
+            let cap = keys.len().div_ceil(nodes.len());
+            // Any starting spread, skewed by the seed.
+            let mut owner: HashMap<String, String> = keys
+                .iter()
+                .enumerate()
+                .map(|(i, k)| {
+                    let n = ((seed as usize) * 7 + i * i) % 3;
+                    (
+                        k.clone(),
+                        nodes[if i % 4 == 0 { n } else { seed as usize % 3 }].clone(),
+                    )
+                })
+                .collect();
+            let mut moves = 0;
+            loop {
+                let mut moved = false;
+                for node in &nodes {
+                    let mine: Vec<&String> = keys.iter().filter(|k| owner[*k] == *node).collect();
+                    if mine.len() <= cap {
+                        continue;
+                    }
+                    if let Some(key) = mine
+                        .into_iter()
+                        .filter(|k| placed[*k] != *node)
+                        .min_by_key(|k| score(k, node))
+                    {
+                        owner.insert(key.clone(), placed[key].clone());
+                        moved = true;
+                        moves += 1;
+                    }
+                }
+                if !moved {
+                    break;
+                }
+                assert!(moves <= keys.len(), "seed {seed}: moves did not stop");
+            }
+            let mut load: HashMap<&String, usize> = HashMap::new();
+            for node in owner.values() {
+                *load.entry(node).or_default() += 1;
+            }
+            assert!(
+                nodes.iter().all(|n| load.get(n).copied().unwrap_or(0) == 4),
+                "seed {seed}: {load:?}"
+            );
+        }
     }
 
     /// A contender that read an old version and writes it after it was

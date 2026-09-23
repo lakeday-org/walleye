@@ -558,7 +558,7 @@ pub async fn route_to_owner(
     let mut fresh = forwarded;
     for attempt in 0..2 {
         let last = attempt == 1;
-        match engine.route(&table, fresh).await {
+        match engine.route_request(&table, fresh, forwarded).await {
             Ok(Route::Local { .. }) => {
                 let response = local(parts.clone(), bytes.clone()).await;
                 if !last && !forwarded && response.extensions().get::<Refused>().is_some() {
