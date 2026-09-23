@@ -145,6 +145,12 @@ The rules:
 - A stopping process marks its lease draining, flushes and releases each table
   at the same epoch, then deletes its lease.
 
+The bucket has to evaluate create-if-absent against its latest state and
+show a new object to the next LIST. S3 does, and so does Tigris for requests
+made in the region the bucket's data lives in; a Tigris bucket of the default
+Global type is only eventually consistent for requests from other regions, so
+every node of one deployment must reach it from the same region.
+
 `GET /internal/ownership` shows what a process believes: its session, whether
 it is an owner right now, the tables it holds at which epoch, and the leases it
 has seen.
