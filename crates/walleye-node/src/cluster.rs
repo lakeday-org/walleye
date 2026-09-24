@@ -182,6 +182,7 @@ impl Cluster {
     /// on a fresh one.
     fn client() -> Result<reqwest::Client, reqwest::Error> {
         reqwest::Client::builder()
+            .default_headers(crate::edge::peer_headers())
             .connect_timeout(std::time::Duration::from_secs(2))
             .timeout(std::time::Duration::from_secs(120))
             .pool_idle_timeout(std::time::Duration::from_secs(5))

@@ -165,6 +165,7 @@ async fn main() -> Result<(), Error> {
         Some(PeerConfig {
             token: peer_token.clone(),
             ring: Arc::new(Membership::new(nodes.clone())?),
+            headers: Default::default(),
         })
     } else {
         None
