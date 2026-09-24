@@ -101,21 +101,24 @@ async fn run_combined(
         env::var("LAKEDAY_REPLICA_STORAGE_PORT").unwrap_or_else(|_| "9090".to_owned());
     let storage_address = format_address(&storage_bind, &storage_port);
     let gateway_address = gateway_listen_address()?;
-    serve_combined(CombinedReplica {
-        root_key: root_key.to_owned(),
-        data_dir,
-        log_path,
-        control_path,
-        node_name: required_nonempty("LAKEDAY_REPLICA_NODE_NAME")?,
-        tier: required_nonempty("LAKEDAY_REPLICA_TIER")?,
-        members: direct_nodes()?,
-        internal_token: required_nonempty("LAKEDAY_REPLICA_INTERNAL_TOKEN")?,
-        admin_token: env::var("LAKEDAY_REPLICA_ADMIN_TOKEN").unwrap_or_default(),
-        quorum,
-        archive: Arc::new(build_archive()?),
-        storage_address,
-        gateway_address,
-    }, stop)
+    serve_combined(
+        CombinedReplica {
+            root_key: root_key.to_owned(),
+            data_dir,
+            log_path,
+            control_path,
+            node_name: required_nonempty("LAKEDAY_REPLICA_NODE_NAME")?,
+            tier: required_nonempty("LAKEDAY_REPLICA_TIER")?,
+            members: direct_nodes()?,
+            internal_token: required_nonempty("LAKEDAY_REPLICA_INTERNAL_TOKEN")?,
+            admin_token: env::var("LAKEDAY_REPLICA_ADMIN_TOKEN").unwrap_or_default(),
+            quorum,
+            archive: Arc::new(build_archive()?),
+            storage_address,
+            gateway_address,
+        },
+        stop,
+    )
     .await
 }
 
