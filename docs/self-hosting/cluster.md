@@ -104,14 +104,16 @@ them - and on which every copy agrees, and reading back from the archive any ran
 the peers have already trimmed. A write that needs it in the meantime, because
 a second node is gone, brings it up to date first rather than failing.
 
-Copying alone would leave it one record short while writes continue, since the
-newest record is never yet known committed, and it would refuse every live
-append after. So when it refuses an append the others already carried, the
-writer's coordinator - the one that knows that append had its quorum - brings
-it level and offers it that append again, and from then on it takes live
-appends itself; it logs `lakeday.replica catch_up outcome=rejoined`. The
-replica logs `lakeday.replica catch_up outcome=complete` when it holds
-everything.
+Copying from its peers alone never finishes while writes continue: the newest
+records are never yet known committed to anyone but their writer, and every
+pass takes long enough for the writer to move on, so the replica would stay
+behind and refuse every live append. So when it refuses an append the others
+already carried, the writer's coordinator - the only one that knows where the
+tail is, and that each record it acknowledged had its quorum - sends it every
+record it is missing in one go, and from then on it takes live appends itself.
+It logs `lakeday.replica rejoin outcome=level`. The replica logs
+`lakeday.replica catch_up outcome=complete` when its own pass finds nothing
+left to copy.
 
 If the node died mid-append, its replica can hold a record that only it ever
 received, from a writer the next owner replaced. That record was never
@@ -124,7 +126,10 @@ Committed segments are archived to `LAKEDAY_REPLICA_ARCHIVE_BUCKET` under
 trimmed behind them. A restarted replica whose volume survived does not seed
 from the archive - it already knows every stream - so a boot line of
 `seed_from_archive streams=0` is expected there; the archive is read by
-catch-up, for trimmed ranges, and by a replica with an empty volume.
+catch-up, for trimmed ranges, by a table's recovery when it changes owner,
+and by a replica with an empty volume. Those reads fetch many small segments
+at once, so on an object store they cost a few round trips however much
+history has built up since a table last flushed.
 
 Restoring a node that lost its disk is the seeding path above: it reads the
 archive, catches up from its peers, and rejoins owning nothing; the others
