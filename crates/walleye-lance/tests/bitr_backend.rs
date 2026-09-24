@@ -309,6 +309,69 @@ async fn lance_manifest_hint_is_a_lower_bound_for_compacted_recovery() {
     assert_eq!(next, 12);
 }
 
+/// Lance's cursor can run past the log: a position it saw is gone from the
+/// replicas, committed after their last archive pass on volumes a stop
+/// deleted. The log is the authority, so the next entry goes after the log's
+/// own tail rather than after the hint, where the log would refuse it for
+/// want of a predecessor and the table could never be opened again.
+#[tokio::test]
+async fn a_hint_past_the_log_follows_the_log() {
+    let gateway = Arc::new(MemoryReplica::healthy());
+    let writer = QuorumWriter::new(gateway.clone(), [7_u8; 32]);
+    let stream = "tenant-a/ns/table/do-1";
+    let payload = encode_fence_sentinel(6).expect("sentinel encoding succeeds");
+    for lsn in 1..=7 {
+        writer
+            .append(AppendRecord::new(
+                stream,
+                6,
+                lsn,
+                lsn.saturating_sub(1),
+                payload.as_ref(),
+            ))
+            .await
+            .expect("fixture tail persists");
+    }
+    // The manifest has seen 8 and flushed through 6.
+    let backend = backend(gateway, stream, 234);
+    WalBackend::checkpointed(&backend, backend.shard_id(), 6).await;
+    let next = WalBackend::next_position(&backend, backend.shard_id(), Some(8))
+        .await
+        .expect("the log's tail decides");
+    assert_eq!(next, 8);
+}
+
+/// A checkpoint past the log's tail proves the missing positions are not
+/// needed: the log is moved to it, and the next entry follows the checkpoint,
+/// never a position it covers.
+#[tokio::test]
+async fn a_checkpoint_past_the_log_moves_the_log() {
+    let gateway = Arc::new(MemoryReplica::healthy());
+    let writer = QuorumWriter::new(gateway.clone(), [7_u8; 32]);
+    let stream = "tenant-a/ns/table/do-1";
+    let payload = encode_fence_sentinel(6).expect("sentinel encoding succeeds");
+    for lsn in 1..=7 {
+        writer
+            .append(AppendRecord::new(
+                stream,
+                6,
+                lsn,
+                lsn.saturating_sub(1),
+                payload.as_ref(),
+            ))
+            .await
+            .expect("fixture tail persists");
+    }
+    let backend = backend(gateway.clone(), stream, 234);
+    WalBackend::checkpointed(&backend, backend.shard_id(), 9).await;
+    let next = WalBackend::next_position(&backend, backend.shard_id(), Some(9))
+        .await
+        .expect("the checkpoint decides");
+    assert_eq!(next, 10);
+    let extent = writer.extent(stream).await.expect("extent");
+    assert_eq!(extent.released_lsn, 9);
+}
+
 /// An old recovery snapshot can hide a committed record without changing writes.
 struct StaleProbeGateway {
     inner: Arc<MemoryReplica>,

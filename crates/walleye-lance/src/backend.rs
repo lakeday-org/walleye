@@ -705,21 +705,60 @@ impl BitrWalBackend {
     /// validated hot tail in memory.  A caller that needs authenticated
     /// recovery must use the public strict methods above instead.
     async fn next_position_for_lance(&self, after_lsn: u64) -> WalResult<u64> {
-        {
+        let after_lsn = {
             let state = self.state.lock().await;
             self.ensure_not_poisoned(&state)?;
             if let Some(position) = state.next_position {
                 return Ok(position);
             }
-        }
+            // The cursor can trail the checkpoint, which the log may already
+            // have released; nothing the checkpoint covers is looked for.
+            after_lsn.max(state.checkpointed_position)
+        };
         let entries = self.load_recovery_for_lance(after_lsn).await?;
+        // Lance's cursor is a hint, and it can run past the log: a position
+        // it saw can be gone from the replicas - committed after their last
+        // archive pass, on volumes a stop then deleted. The log is the
+        // authority for where the next entry goes. A position the table's
+        // durable checkpoint covers is not needed, so when the checkpoint is
+        // past the log's tail the log is first moved to it.
+        let tail = if entries.is_empty() && after_lsn > 0 {
+            let extent = self
+                .writer
+                .extent(self.stream.as_ref())
+                .await
+                .map_err(map_replica_error)?;
+            if extent.committed_lsn < after_lsn {
+                let checkpoint = self.state.lock().await.checkpointed_position;
+                let tail = if checkpoint > extent.committed_lsn {
+                    self.writer
+                        .release(self.stream.as_ref(), checkpoint)
+                        .await
+                        .map_err(map_replica_error)?;
+                    checkpoint
+                } else {
+                    extent.committed_lsn
+                };
+                eprintln!(
+                    "walleye.storage wal stream={} hint={after_lsn} log_tail={} checkpoint={checkpoint} next={} outcome=hint_past_log",
+                    self.stream,
+                    extent.committed_lsn,
+                    tail.saturating_add(1)
+                );
+                Some(tail)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let mut state = self.state.lock().await;
         self.ensure_not_poisoned(&state)?;
         if let Some(position) = state.next_position {
             return Ok(position);
         }
         if entries.is_empty() {
-            let next_position = after_lsn.saturating_add(1).max(1);
+            let next_position = tail.unwrap_or(after_lsn).saturating_add(1).max(1);
             state.recovered_tail_position = state
                 .recovered_tail_position
                 .max(next_position.saturating_sub(1));
