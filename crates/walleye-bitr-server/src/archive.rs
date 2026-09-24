@@ -15,6 +15,12 @@ use walleye_bitr::EncryptedRecord;
 
 const HEAD_UPDATE_ATTEMPTS: usize = 8;
 
+/// Segments read at once. A range of the archive is many small objects, and
+/// on an object store each read costs a round trip: read one at a time, a
+/// recovery or catch-up waits for as many round trips as the range has
+/// segments, which grows with the history since the last flush.
+const SEGMENT_READS_IN_FLIGHT: usize = 32;
+
 /// Failure to publish or verify an opaque archive stream.
 #[derive(Debug, Error)]
 pub enum ArchiveError {
@@ -264,19 +270,12 @@ impl OpaqueArchive {
         let mut expected_lsn = start_lsn;
         let mut range_complete = false;
         let mut previous_writer_epoch = None;
-        for reference in &head.segments {
-            if reference.last_lsn < start_lsn || reference.first_lsn > end_lsn {
-                continue;
-            }
-            let path = Path::from(reference.key.as_str());
-            let bytes = self.store.get(&path).await?.bytes().await?;
-            let digest = hex::encode(Sha256::digest(&bytes));
-            if digest != reference.digest {
-                return Err(ArchiveError::Checksum(reference.key.clone()));
-            }
-            let segment: Segment = serde_json::from_slice(&bytes)?;
-            self.verify_segment(&segment, reference, stream)?;
-
+        let wanted: Vec<&SegmentRef> = head
+            .segments
+            .iter()
+            .filter(|reference| reference.last_lsn >= start_lsn && reference.first_lsn <= end_lsn)
+            .collect();
+        for segment in self.load_segments(stream, &wanted).await? {
             for record in &segment.records {
                 if record.lsn() < start_lsn {
                     continue;
@@ -337,7 +336,6 @@ impl OpaqueArchive {
             return Ok(None);
         }
         let mut expected = 1_u64;
-        let mut verified_epoch = 0_u64;
         for reference in &head.segments {
             if reference.first_lsn != expected || reference.last_lsn < reference.first_lsn {
                 return Err(ArchiveError::Contiguity(format!(
@@ -345,30 +343,28 @@ impl OpaqueArchive {
                     reference.first_lsn
                 )));
             }
-            if reference.last_lsn > after_lsn {
-                let path = Path::from(reference.key.as_str());
-                let bytes = self.store.get(&path).await?.bytes().await?;
-                let digest = hex::encode(Sha256::digest(&bytes));
-                if digest != reference.digest {
-                    return Err(ArchiveError::Checksum(reference.key.clone()));
-                }
-                let segment: Segment = serde_json::from_slice(&bytes)?;
-                self.verify_segment(&segment, reference, stream)?;
-                if segment
-                    .records
-                    .first()
-                    .is_some_and(|record| record.writer_epoch() < verified_epoch)
-                {
-                    return Err(ArchiveError::Contiguity(
-                        "writer epoch moved backward between archive segments".to_owned(),
-                    ));
-                }
-                verified_epoch = segment
-                    .records
-                    .last()
-                    .map_or(verified_epoch, EncryptedRecord::writer_epoch);
-            }
             expected = reference.last_lsn.saturating_add(1);
+        }
+        let wanted: Vec<&SegmentRef> = head
+            .segments
+            .iter()
+            .filter(|reference| reference.last_lsn > after_lsn)
+            .collect();
+        let mut verified_epoch = 0_u64;
+        for segment in self.load_segments(stream, &wanted).await? {
+            if segment
+                .records
+                .first()
+                .is_some_and(|record| record.writer_epoch() < verified_epoch)
+            {
+                return Err(ArchiveError::Contiguity(
+                    "writer epoch moved backward between archive segments".to_owned(),
+                ));
+            }
+            verified_epoch = segment
+                .records
+                .last()
+                .map_or(verified_epoch, EncryptedRecord::writer_epoch);
         }
         if head.archived_lsn != expected.saturating_sub(1) || verified_epoch != head.writer_epoch {
             return Err(ArchiveError::Contiguity(
@@ -386,8 +382,6 @@ impl OpaqueArchive {
     ) -> Result<Vec<EncryptedRecord>, ArchiveError> {
         let head = self.load_head(stream).await?.head;
         let mut expected = 1_u64;
-        let mut tail_writer_epoch = 0_u64;
-        let mut recovered = Vec::new();
         for reference in &head.segments {
             if reference.first_lsn != expected || reference.last_lsn < reference.first_lsn {
                 return Err(ArchiveError::Contiguity(format!(
@@ -395,23 +389,20 @@ impl OpaqueArchive {
                     reference.first_lsn
                 )));
             }
-            // A segment wholly below the requested tail contributes no
-            // record. Its place in the chain is proven by the head's
-            // references; fetching and hashing it would make every open of
-            // a long-lived stream walk its entire history, one object at a
-            // time, for nothing.
-            if reference.last_lsn <= after_lsn {
-                expected = reference.last_lsn.saturating_add(1);
-                continue;
-            }
-            let path = Path::from(reference.key.as_str());
-            let bytes = self.store.get(&path).await?.bytes().await?;
-            let digest = hex::encode(Sha256::digest(&bytes));
-            if digest != reference.digest {
-                return Err(ArchiveError::Checksum(reference.key.clone()));
-            }
-            let segment: Segment = serde_json::from_slice(&bytes)?;
-            self.verify_segment(&segment, reference, stream)?;
+            expected = reference.last_lsn.saturating_add(1);
+        }
+        // A segment wholly below the requested tail contributes no record.
+        // Its place in the chain is proven by the head's references; fetching
+        // and hashing it would make every open of a long-lived stream walk
+        // its entire history for nothing.
+        let wanted: Vec<&SegmentRef> = head
+            .segments
+            .iter()
+            .filter(|reference| reference.last_lsn > after_lsn)
+            .collect();
+        let mut tail_writer_epoch = 0_u64;
+        let mut recovered = Vec::new();
+        for segment in self.load_segments(stream, &wanted).await? {
             if segment
                 .records
                 .first()
@@ -431,7 +422,6 @@ impl OpaqueArchive {
                     .into_iter()
                     .filter(|record| record.lsn() > after_lsn),
             );
-            expected = reference.last_lsn.saturating_add(1);
         }
         if head.archived_lsn != expected.saturating_sub(1) {
             return Err(ArchiveError::Contiguity(format!(
@@ -449,6 +439,31 @@ impl OpaqueArchive {
             ));
         }
         Ok(recovered)
+    }
+
+    /// Reads the segments `references` name, several at a time, each checked
+    /// against its digest and its head entry, and returns them in order.
+    async fn load_segments(
+        &self,
+        stream: &str,
+        references: &[&SegmentRef],
+    ) -> Result<Vec<Segment>, ArchiveError> {
+        let mut segments = Vec::with_capacity(references.len());
+        for chunk in references.chunks(SEGMENT_READS_IN_FLIGHT) {
+            let reads: Vec<_> = chunk
+                .iter()
+                .map(|reference| {
+                    tokio::spawn(read_segment(Arc::clone(&self.store), (*reference).clone()))
+                })
+                .collect();
+            for read in futures::future::join_all(reads).await {
+                segments.push(read.map_err(|source| object_store::Error::JoinError { source })??);
+            }
+        }
+        for (segment, reference) in segments.iter().zip(references) {
+            self.verify_segment(segment, reference, stream)?;
+        }
+        Ok(segments)
     }
 
     /// Writes one deterministic content-addressed segment, accepting exact retries.
@@ -643,6 +658,19 @@ impl OpaqueArchive {
             stream_digest(stream)
         ))
     }
+}
+
+/// Reads one segment and checks it against the digest its head entry names.
+async fn read_segment(
+    store: Arc<dyn ObjectStore>,
+    reference: SegmentRef,
+) -> Result<Segment, ArchiveError> {
+    let path = Path::from(reference.key.as_str());
+    let bytes = store.get(&path).await?.bytes().await?;
+    if hex::encode(Sha256::digest(&bytes)) != reference.digest {
+        return Err(ArchiveError::Checksum(reference.key));
+    }
+    Ok(serde_json::from_slice(&bytes)?)
 }
 
 fn stream_digest(stream: &str) -> String {

@@ -6085,6 +6085,13 @@ struct StreamWriterState {
     records: BTreeMap<u64, EncryptedRecord>,
 }
 
+/// Where catching a member up left it: how far it holds the committed log,
+/// and what was appended to get it there.
+struct CaughtUp {
+    held: u64,
+    appended: Option<std::ops::RangeInclusive<u64>>,
+}
+
 #[derive(Default)]
 struct GatewayWriterState {
     /// Set only after a quorum snapshot has reconstructed the committed tail.
@@ -6488,6 +6495,10 @@ pub struct GatewayStatus {
 /// Records appended to a catching-up member per request.
 const CATCH_UP_BATCH: usize = 256;
 
+/// How many times bringing a member level looks again after the member moved
+/// under it, before giving up until the next refusal.
+const LEVEL_ATTEMPTS: usize = 8;
+
 /// Client-facing replica gateway.
 ///
 /// [`Self::new_direct`] is the combined Fly constructor. It uses a durable
@@ -6528,18 +6539,13 @@ pub struct ReplicaGateway {
     lagging: Arc<Lagging>,
 }
 
-/// The newest batch each behind member refused, per stream, and a wake for
-/// whoever repairs them.
+/// Each member, per stream, that refused a batch for want of its
+/// predecessor after the batch had its quorum, and a wake for whoever brings
+/// them level.
 #[derive(Default)]
 struct Lagging {
-    refused: Mutex<BTreeMap<(String, String), LateRefusal>>,
+    refused: Mutex<BTreeMap<(String, String), ReplicaNode>>,
     wake: tokio::sync::Notify,
-}
-
-struct LateRefusal {
-    member: ReplicaNode,
-    records: Vec<EncryptedRecord>,
-    placement: Option<PlacementEpoch>,
 }
 
 impl ReplicaGateway {
@@ -12899,7 +12905,7 @@ impl ReplicaGateway {
                 Ok(()) => {
                     acknowledgements += 1;
                     if acknowledgements >= self.quorum {
-                        self.note_late_refusals(result_rx, records, placement);
+                        self.note_late_refusals(behind, result_rx, first.stream());
                         return Ok(acknowledgements);
                     }
                 }
@@ -12913,13 +12919,13 @@ impl ReplicaGateway {
         }
         // Short of a quorum, a member that refused for want of a predecessor
         // may simply be behind: one that was down while its peers wrote.
-        // Bring it up to date from the committed copies and offer it the
-        // batch again, rather than failing a write two members could carry.
+        // Bring it level with what this writer has acknowledged, which ends
+        // at the batch's predecessor, and offer it the batch again, rather
+        // than failing a write two members could carry.
         if !saw_fence {
             for node in behind {
-                match self.catch_up_member(first.stream(), &node).await {
-                    Ok(Some(_)) => {}
-                    _ => continue,
+                if self.bring_level(first.stream(), &node).await.is_err() {
+                    continue;
                 }
                 let client = NodeClient::new(node.clone(), &self.client, &self.internal_token);
                 if client
@@ -12943,76 +12949,231 @@ impl ReplicaGateway {
         Err(ReplicaError::QuorumUnavailable)
     }
 
-    /// Keeps listening, after a batch had its quorum, to the members that had
-    /// not answered, and notes each one that refused it for want of its
-    /// predecessor.
+    /// Notes each member that refused a batch for want of its predecessor,
+    /// once the batch had its quorum: those that already had, and, listening
+    /// on, those that had not answered yet.
     ///
     /// Such a member is behind, and catch-up alone cannot bring it level while
-    /// writes continue: catch-up copies only what is certainly committed, and
-    /// the newest record never is yet, so the member stays one short and
-    /// refuses every append after. Offering it this batch once it is caught up
-    /// to the batch's predecessor is what closes the gap, as the path short of
-    /// a quorum does inline. Here the write has already been answered, so the
-    /// repair is left to [`Self::repair_lagging`].
+    /// writes continue: catch-up copies only what is certainly committed, the
+    /// newest record never is yet, and every pass takes long enough for the
+    /// writer to move on, so the member stays behind and refuses every append
+    /// after. Only the writer knows where the tail is. The note is left to
+    /// [`Self::repair_lagging`], which brings the member level from what this
+    /// writer has acknowledged.
     fn note_late_refusals(
         &self,
+        already: Vec<ReplicaNode>,
         mut results: tokio::sync::mpsc::UnboundedReceiver<(ReplicaNode, Result<(), ReplicaError>)>,
-        records: &[EncryptedRecord],
-        placement: Option<PlacementEpoch>,
+        stream: &str,
     ) {
         let lagging = Arc::clone(&self.lagging);
-        let records = records.to_vec();
+        let stream = stream.to_owned();
+        // A member behind refuses at once, so it has usually answered before
+        // the quorum did.
+        if !already.is_empty() {
+            if let Ok(mut refused) = lagging.refused.lock() {
+                for member in already {
+                    refused.insert((member.id.clone(), stream.clone()), member);
+                }
+            }
+            lagging.wake.notify_one();
+        }
         tokio::spawn(async move {
             while let Some((member, result)) = results.recv().await {
                 if !matches!(result, Err(ReplicaError::LsnConflict)) {
                     continue;
                 }
-                let Some(stream) = records.first().map(|record| record.stream().to_owned()) else {
-                    return;
-                };
-                // Only the newest refusal matters: repairing it covers every
-                // one before it.
                 if let Ok(mut refused) = lagging.refused.lock() {
-                    refused.insert(
-                        (member.id.clone(), stream),
-                        LateRefusal {
-                            member,
-                            records: records.clone(),
-                            placement: placement.clone(),
-                        },
-                    );
+                    refused.insert((member.id.clone(), stream.clone()), member);
                 }
                 lagging.wake.notify_one();
             }
         });
     }
 
-    /// Brings each member noted by [`Self::note_late_refusals`] up to the
-    /// batch it refused, and offers it the batch again. The node's own LSN and
-    /// writer fences decide whether it takes it, exactly as for a first offer.
-    /// Returns how many members took theirs.
+    /// Brings each member noted by [`Self::note_late_refusals`] level with
+    /// what this writer has acknowledged. Returns how many are level.
     pub async fn repair_lagging(&self) -> usize {
         let refused = match self.lagging.refused.lock() {
             Ok(mut refused) => std::mem::take(&mut *refused),
             Err(_) => return 0,
         };
         let mut repaired = 0;
-        for ((_, stream), late) in refused {
-            // Already level with the batch's predecessor is as good as
-            // brought level: either way the batch is what it lacks.
-            if self.catch_up_member(&stream, &late.member).await.is_err() {
-                continue;
-            }
-            let client = NodeClient::new(late.member.clone(), &self.client, &self.internal_token);
-            if client
-                .append_and_commit_many_with_placement(&late.records, late.placement)
-                .await
-                .is_ok()
-            {
-                repaired += 1;
+        for ((_, stream), member) in refused {
+            match self.bring_level(&stream, &member).await {
+                Ok(_) => repaired += 1,
+                Err(error) => eprintln!(
+                    "lakeday.replica rejoin stream={stream} member={} outcome=error error={error}",
+                    member.id
+                ),
             }
         }
         repaired
+    }
+
+    /// Bring a member of a stream this coordinator writes level with every
+    /// record it has acknowledged, so the member takes the next append
+    /// itself. Returns the LSN range appended, none when it was level.
+    ///
+    /// The writer's acknowledged records are committed - each had a quorum -
+    /// and end at the live tail, so one append from them closes the gap
+    /// however fast writes arrive, where catch-up from the peers, which stops
+    /// short of the tail, would chase it. A member further behind than this
+    /// writer's records reach, or holding a record the committed log
+    /// replaced, is first caught up from its peers and the archive. A refusal
+    /// because the member moved meanwhile - a live append landed, or its own
+    /// archive pass trimmed past where this started - is a reason to look
+    /// again, not an error.
+    pub async fn bring_level(
+        &self,
+        stream: &str,
+        member: &ReplicaNode,
+    ) -> Result<Option<std::ops::RangeInclusive<u64>>, ReplicaError> {
+        let client = NodeClient::new(member.clone(), &self.client, &self.internal_token);
+        let mut placement: Option<Option<PlacementEpoch>> = None;
+        let mut sent: Option<std::ops::RangeInclusive<u64>> = None;
+        // How far the member's own records have been checked against its
+        // peers, where they lie below what this writer holds.
+        let mut vouched = 0_u64;
+        for _ in 0..LEVEL_ATTEMPTS {
+            let snapshot = client.snapshot(Some(stream)).await?;
+            let floor = snapshot
+                .trimmed
+                .iter()
+                .filter(|prefix| prefix.stream == stream)
+                .map(|prefix| prefix.archived_lsn)
+                .max()
+                .unwrap_or(0);
+            let own: BTreeMap<u64, EncryptedRecord> = snapshot
+                .records
+                .into_iter()
+                .filter(|record| record.stream() == stream && record.lsn() > floor)
+                .map(|record| (record.lsn(), record))
+                .collect();
+            let (committed, acknowledged) = {
+                let state = self.writer_state.lock().await;
+                match state.streams.get(stream) {
+                    Some(writer) => (
+                        writer.committed_lsn,
+                        writer
+                            .records
+                            .range(floor.saturating_add(1)..=writer.committed_lsn.max(floor))
+                            .map(|(lsn, record)| (*lsn, record.clone()))
+                            .collect::<BTreeMap<_, _>>(),
+                    ),
+                    None => (0, BTreeMap::new()),
+                }
+            };
+            // How far the member agrees with the acknowledged log.
+            let mut position = floor;
+            let mut disagrees = false;
+            for (lsn, record) in &own {
+                if *lsn != position.saturating_add(1) {
+                    break;
+                }
+                match acknowledged.get(lsn) {
+                    Some(acked) if acked == record => position = *lsn,
+                    Some(_) => {
+                        disagrees = true;
+                        break;
+                    }
+                    None if *lsn <= vouched => position = *lsn,
+                    None => break,
+                }
+            }
+            if position >= committed {
+                return Ok(sent);
+            }
+            if disagrees || !acknowledged.contains_key(&position.saturating_add(1)) {
+                // Beyond what this writer holds, or holding an orphan: the
+                // peers and the archive have what it needs.
+                match self.catch_up_to(stream, member).await {
+                    Ok(caught) if caught.held > vouched.max(position) => {
+                        vouched = caught.held;
+                        continue;
+                    }
+                    Ok(_) => return Err(ReplicaError::LsnConflict),
+                    Err(ReplicaError::LsnConflict) => continue,
+                    Err(error) => return Err(error),
+                }
+            }
+            let missing: Vec<EncryptedRecord> = acknowledged
+                .range(position.saturating_add(1)..)
+                .map(|(_, record)| record.clone())
+                .collect();
+            if placement.is_none() {
+                placement = Some(self.level_placement(stream, &client).await?);
+            }
+            let placement = placement.clone().flatten();
+            match self.append_in_batches(&client, &missing, placement).await {
+                Ok(()) => {
+                    let (first, last) = (
+                        missing.first().map_or(0, EncryptedRecord::lsn),
+                        missing.last().map_or(0, EncryptedRecord::lsn),
+                    );
+                    sent = Some(match sent {
+                        Some(range) => *range.start()..=last,
+                        None => first..=last,
+                    });
+                }
+                Err(ReplicaError::LsnConflict) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Err(ReplicaError::LsnConflict)
+    }
+
+    /// The placement a member being brought level is fenced to and appended
+    /// under: the stream's current route. The member was away while the route
+    /// moved on, so its fence may name a route that is gone; it is fenced to
+    /// the current one first, exactly as a route change fences every member,
+    /// and an older coordinator's late append is refused from then on.
+    async fn level_placement(
+        &self,
+        stream: &str,
+        client: &NodeClient<'_>,
+    ) -> Result<Option<PlacementEpoch>, ReplicaError> {
+        let Some(manifest) = self.read_manifest_quorum().await? else {
+            return Ok(None);
+        };
+        let route = manifest
+            .stream_segments
+            .get(stream)
+            .and_then(|segments| segments.last())
+            .cloned()
+            .ok_or(ReplicaError::QuorumUnavailable)?;
+        let placement = placement_for_route(stream, &route);
+        client.install_placement_fence(stream, &placement).await?;
+        Ok(Some(placement))
+    }
+
+    /// Appends committed records to one member in order, one writer epoch and
+    /// at most [`CATCH_UP_BATCH`] records per append.
+    async fn append_in_batches(
+        &self,
+        client: &NodeClient<'_>,
+        records: &[EncryptedRecord],
+        placement: Option<PlacementEpoch>,
+    ) -> Result<(), ReplicaError> {
+        let mut batch: Vec<EncryptedRecord> = Vec::new();
+        for record in records {
+            if batch.last().is_some_and(|previous: &EncryptedRecord| {
+                previous.writer_epoch() != record.writer_epoch()
+            }) || batch.len() >= CATCH_UP_BATCH
+            {
+                client
+                    .append_and_commit_many_with_placement(&batch, placement.clone())
+                    .await?;
+                batch.clear();
+            }
+            batch.push(record.clone());
+        }
+        if !batch.is_empty() {
+            client
+                .append_and_commit_many_with_placement(&batch, placement)
+                .await?;
+        }
+        Ok(())
     }
 
     /// Resolves once a member has been noted as behind since the last call
@@ -14140,9 +14301,22 @@ impl ReplicaGateway {
         stream: &str,
         member: &ReplicaNode,
     ) -> Result<Option<std::ops::RangeInclusive<u64>>, ReplicaError> {
+        Ok(self.catch_up_to(stream, member).await?.appended)
+    }
+
+    /// [`Self::catch_up_member`], saying also how far the member then holds
+    /// the committed log, every record of it checked against its peers.
+    async fn catch_up_to(
+        &self,
+        stream: &str,
+        member: &ReplicaNode,
+    ) -> Result<CaughtUp, ReplicaError> {
         let cohort = self.replicas_for_stream(stream).await?;
         if !cohort.iter().any(|node| node.id == member.id) {
-            return Ok(None);
+            return Ok(CaughtUp {
+                held: 0,
+                appended: None,
+            });
         }
         let snapshots = self.fetch_snapshots(&cohort, Some(stream)).await;
         let Some(own) = snapshots
@@ -14303,52 +14477,22 @@ impl ReplicaGateway {
             expected = expected.saturating_add(1);
         }
         let Some(first) = missing.first().map(EncryptedRecord::lsn) else {
-            return Ok(None);
+            return Ok(CaughtUp {
+                held: position,
+                appended: None,
+            });
         };
         let last = missing.last().map_or(first, EncryptedRecord::lsn);
-        // The member was away while the stream's route moved on, so its
-        // placement fence may name a route that is gone. Committed history is
-        // copied under the stream's current route: the member is fenced to it
-        // first, exactly as a route change fences every member, and an older
-        // coordinator's late append is refused from then on.
-        let placement = match self.read_manifest_quorum().await? {
-            Some(manifest) => {
-                let route = manifest
-                    .stream_segments
-                    .get(stream)
-                    .and_then(|segments| segments.last())
-                    .cloned()
-                    .ok_or(ReplicaError::QuorumUnavailable)?;
-                let placement = placement_for_route(stream, &route);
-                client.install_placement_fence(stream, &placement).await?;
-                Some(placement)
-            }
-            None => None,
-        };
-        // An append is one writer epoch.
-        let mut batch: Vec<EncryptedRecord> = Vec::new();
-        for record in missing {
-            if batch.last().is_some_and(|previous: &EncryptedRecord| {
-                previous.writer_epoch() != record.writer_epoch()
-            }) || batch.len() >= CATCH_UP_BATCH
-            {
-                client
-                    .append_and_commit_many_with_placement(&batch, placement.clone())
-                    .await?;
-                batch.clear();
-            }
-            batch.push(record);
-        }
-        if !batch.is_empty() {
-            client
-                .append_and_commit_many_with_placement(&batch, placement)
-                .await?;
-        }
+        let placement = self.level_placement(stream, &client).await?;
+        self.append_in_batches(&client, &missing, placement).await?;
         eprintln!(
             "lakeday.replica catch_up stream={stream} member={} from_lsn={first} to_lsn={last}",
             member.id
         );
-        Ok(Some(first..=last))
+        Ok(CaughtUp {
+            held: last,
+            appended: Some(first..=last),
+        })
     }
 
     /// Bring the local member up to date on every stream its cohort routes to

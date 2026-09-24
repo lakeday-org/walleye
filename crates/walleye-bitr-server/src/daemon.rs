@@ -216,6 +216,7 @@ pub async fn serve_combined(
         result = axum::serve(gateway_listener, gateway_app) => result.map_err(Into::into),
         result = archive_loop(Arc::clone(&gateway), Arc::clone(&node)) => result,
         result = catch_up_loop(Arc::clone(&gateway)) => result,
+        result = rejoin_loop(Arc::clone(&gateway)) => result,
         () = stop => Ok(()),
     };
     result
@@ -286,15 +287,13 @@ async fn archive_loop(
 /// write quorum for those positions until it holds them. The first pass runs
 /// as soon as the listeners are up and repeats at once while it finds work;
 /// after that it runs every few seconds, which also restores a member that
-/// fell behind without restarting.
+/// fell behind without restarting. It brings the replica as far as its peers
+/// can prove committed; the last stretch to the live tail comes from each
+/// stream's writer, in [`rejoin_loop`].
 async fn catch_up_loop(gateway: Arc<ReplicaGateway>) -> Result<(), Box<dyn std::error::Error>> {
     let started = std::time::Instant::now();
     let mut complete = false;
     loop {
-        let repaired = gateway.repair_lagging().await;
-        if repaired > 0 {
-            eprintln!("lakeday.replica catch_up outcome=rejoined members={repaired}");
-        }
         match gateway.catch_up_local().await {
             Ok(0) => {
                 if !complete {
@@ -304,12 +303,7 @@ async fn catch_up_loop(gateway: Arc<ReplicaGateway>) -> Result<(), Box<dyn std::
                         started.elapsed().as_millis()
                     );
                 }
-                // A member refusing live appends is behind now, not in five
-                // seconds.
-                tokio::select! {
-                    () = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
-                    () = gateway.lagging_noted() => {}
-                }
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             }
             Ok(appended) => {
                 eprintln!("lakeday.replica catch_up outcome=appended records={appended}");
@@ -318,6 +312,24 @@ async fn catch_up_loop(gateway: Arc<ReplicaGateway>) -> Result<(), Box<dyn std::
                 eprintln!("lakeday.replica catch_up outcome=error error={error}");
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             }
+        }
+    }
+}
+
+/// Brings level, as soon as it is noticed, every member that refused a live
+/// append this coordinator wrote for want of its predecessor. Only the
+/// writer knows where a stream's tail is, so this is what lets a member that
+/// is behind take live appends again while writes carry on.
+async fn rejoin_loop(gateway: Arc<ReplicaGateway>) -> Result<(), Box<dyn std::error::Error>> {
+    loop {
+        gateway.lagging_noted().await;
+        let started = std::time::Instant::now();
+        let repaired = gateway.repair_lagging().await;
+        if repaired > 0 {
+            eprintln!(
+                "lakeday.replica rejoin outcome=level members={repaired} elapsed_ms={}",
+                started.elapsed().as_millis()
+            );
         }
     }
 }
