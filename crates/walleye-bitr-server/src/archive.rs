@@ -76,6 +76,12 @@ pub struct OpaqueArchive {
 }
 
 impl OpaqueArchive {
+    /// Where the archive is: its store and prefix, the same on every node
+    /// archiving to it.
+    pub fn location(&self) -> String {
+        format!("{}/{}", self.store, self.prefix)
+    }
+
     /// Creates an archive under one non-empty object prefix and hard batch bound.
     pub fn new(
         store: Arc<dyn ObjectStore>,

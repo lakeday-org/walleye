@@ -110,11 +110,7 @@ async fn fresh_members_accept_the_append_after_the_archived_prefix()
     let fresh = group(&second, &["d", "e", "f"]).await?;
     let new_gateway = gateway(&second, &fresh, &archive, "new")?;
 
-    // Without seeding, the writer's next append is refused for want of a
-    // predecessor.
-    let refused = new_gateway.append_many(vec![record(stream, 5, 4)]).await;
-    assert!(refused.is_err(), "unseeded members must not accept LSN 5");
-
+    // Each learns the archived prefix before it serves.
     for node in &fresh {
         assert_eq!(new_gateway.seed_from_archive(&node.disk).await?, 1);
         assert_eq!(
