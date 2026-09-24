@@ -407,6 +407,8 @@ struct Stream {
     /// Who owns the table. A writer opens only while this process holds the
     /// table's ownership record, at the epoch that record names.
     owners: Arc<Ownership>,
+    /// The name of the log this writer appends to.
+    log: Arc<LogName>,
 }
 impl Stream {
     /// Bytes this stream's writer may hold in memory: the memtable size and
@@ -567,7 +569,8 @@ impl Stream {
             )?)),
             None => LanceDurability::ObjectStore,
         };
-        let table = Table::open(self.config.clone(), self.storage.clone(), durability).await?;
+        let config = self.config.clone().with_log(self.log.get().await?);
+        let table = Table::open(config, self.storage.clone(), durability).await?;
         // An open that overlapped another moved the manifest in between. The
         // writer holds the later epoch and has fenced whatever held the
         // earlier one, so the record follows it rather than the writer being
@@ -728,6 +731,7 @@ pub struct Engine {
     writer: Option<Arc<QuorumWriter>>,
     cluster: Cluster,
     owners: Arc<Ownership>,
+    log: Arc<LogName>,
     /// The lease renewer and the bucket sampler, stopped with the engine.
     background: Vec<tokio::task::AbortHandle>,
     /// The one crossing out of a worker's isolate.
@@ -813,6 +817,7 @@ impl Engine {
             owners.node(),
             cluster.endpoint
         );
+        let log = Arc::new(LogName::new(config.bitr_url.clone()));
         let engine = Self {
             config,
             cache,
@@ -830,6 +835,7 @@ impl Engine {
             firing_locks: Mutex::new(HashMap::new()),
             firings: RwLock::new(()),
             closed: RwLock::new(false),
+            log,
             writer,
             cluster,
             owners,
@@ -843,14 +849,7 @@ impl Engine {
         Ok(engine)
     }
     async fn register(&self, definition: StreamDefinition) -> Result<Arc<Stream>, Error> {
-        let mut config = definition.table_config(&self.config.root_uri)?;
-        // Name the log this writer appends to. Every process pointed at
-        // one Bitr gateway spells it the same way, and every process without
-        // one is writing the object store's own WAL, which they all share.
-        config = config.with_log(match &self.config.bitr_url {
-            Some(url) => format!("bitr:{}", url.trim_end_matches('/')),
-            None => "object-store".to_owned(),
-        });
+        let config = definition.table_config(&self.config.root_uri)?;
         let mut streams = self.streams.lock().await;
         // A drop in flight owns this name until it finishes. Reinstating it
         // here would resurrect the stream the drop is removing.
@@ -874,6 +873,7 @@ impl Engine {
                 claimed_at: Mutex::new(None),
                 contention: std::sync::atomic::AtomicU32::new(0),
                 owners: self.owners.clone(),
+                log: self.log.clone(),
             })
         });
         Ok(stream.clone())
@@ -3655,6 +3655,49 @@ impl Engine {
         )?;
         self.append(CURSORS, vec![batch]).await?;
         Ok(())
+    }
+}
+
+/// Which write-ahead log a writer appends to, as a name every writer on the
+/// same log spells the same way and no writer on another log does. The
+/// object store's own WAL is shared by everyone writing to the bucket. A Bitr
+/// log is named by where it archives, which the gateway reports: the address
+/// a process reaches its gateway at says nothing about which log is behind
+/// it, and the replicas holding the log can change without it becoming
+/// another log.
+pub(crate) struct LogName {
+    gateway: Option<String>,
+    name: tokio::sync::OnceCell<String>,
+}
+impl LogName {
+    fn new(gateway: Option<String>) -> Self {
+        Self {
+            gateway,
+            name: tokio::sync::OnceCell::new(),
+        }
+    }
+    async fn get(&self) -> Result<String, Error> {
+        let Some(gateway) = &self.gateway else {
+            return Ok("object-store".to_owned());
+        };
+        self.name
+            .get_or_try_init(|| async {
+                let ready: serde_json::Value = reqwest::Client::new()
+                    .get(format!("{}/readyz", gateway.trim_end_matches('/')))
+                    .timeout(std::time::Duration::from_secs(10))
+                    .send()
+                    .await?
+                    .json()
+                    .await?;
+                match ready["log"].as_str().filter(|log| !log.is_empty()) {
+                    Some(log) => Ok(format!("bitr:{log}")),
+                    None => Err(Error::from(
+                        "the replica gateway is not ready to say which log it serves",
+                    )),
+                }
+            })
+            .await
+            .cloned()
     }
 }
 
