@@ -314,3 +314,22 @@
     backwards; the archive head records the release before any segment or
     index page below it is deleted, and nothing the head still names is
     deleted.
+
+- name: the-log-decides-where-the-next-entry-goes
+  where: mentions next_position_for_lance
+  each: method
+  min: 75
+  ensure: >
+    The position of a table's next log entry comes from the replicated log's
+    own tail, or the table's durable checkpoint where that is further; never
+    from Lance's manifest cursor alone, which is a hint that can outrun what
+    the log still holds. Trusting the hint past the log's tail leaves a table
+    that refuses every open.
+
+- name: a-stopping-replica-archives-before-it-exits
+  where: "crates/walleye-bitr-server/src/daemon.rs"
+  ensure_absent: >
+    A replica process that stops without a final archive pass of everything
+    it holds committed, or a host that ends the process without waiting for
+    it. A stopped instance's volumes are deleted; what the archive does not
+    hold is gone.

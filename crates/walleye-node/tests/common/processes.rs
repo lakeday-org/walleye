@@ -117,13 +117,18 @@ impl Proc {
                 .enable_all()
                 .build()
                 .unwrap();
+            // The replica stops when told to, after the engine's handover, as
+            // the binary stops it; a kill ends it with everything else.
+            let (stop_replica, replica_stop) = tokio::sync::oneshot::channel::<()>();
             let replica = async move {
                 match replica {
                     Some(replica) => {
-                        if let Err(error) = serve_combined(replica, std::future::pending()).await {
+                        let stop = async {
+                            let _ = replica_stop.await;
+                        };
+                        if let Err(error) = serve_combined(replica, stop).await {
                             eprintln!("test replica stopped: {error}");
                         }
-                        std::future::pending::<()>().await
                     }
                     None => std::future::pending::<()>().await,
                 }
@@ -161,7 +166,7 @@ impl Proc {
                             }
                         }
                         // Gone without a word, as a crash leaves it.
-                        Command::Kill => return,
+                        Command::Kill => return false,
                         // As the binary stops on SIGTERM: hand the tables
                         // over while still answering, then stop serving.
                         Command::Stop => {
@@ -169,17 +174,23 @@ impl Proc {
                             let _ = quit.send(());
                             let _ = server.await;
                             service.close().await;
-                            return;
+                            return true;
                         }
                     }
                 }
+                false
             };
             // The replica runs beside the engine for as long as the engine
             // does, and stops with it.
             runtime.block_on(async move {
-                tokio::select! {
-                    () = engine => {}
-                    () = replica => {}
+                tokio::pin!(replica);
+                let graceful = tokio::select! {
+                    graceful = engine => graceful,
+                    () = &mut replica => false,
+                };
+                if graceful {
+                    let _ = stop_replica.send(());
+                    let _ = tokio::time::timeout(Duration::from_secs(20), &mut replica).await;
                 }
             });
             // Wait for the workers to stop, so a killed process's port is
@@ -725,6 +736,12 @@ impl Launch {
             storage_address: self.storage[index].clone(),
             gateway_address: self.gateways[index].clone(),
         }
+    }
+
+    /// Delete node `index`'s replica volume, as stopping an instance deletes
+    /// every Machine's: its next start seeds from the archive.
+    pub fn wipe(&self, index: usize) {
+        let _ = std::fs::remove_dir_all(self.data.join(format!("node-{index}")));
     }
 
     /// Start node `index`, engine and replica together.

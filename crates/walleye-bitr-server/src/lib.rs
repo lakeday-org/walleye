@@ -4694,6 +4694,7 @@ pub fn node_router(
         .route("/internal/v1/append-many", post(internal_append_many))
         .route("/internal/v1/commit", post(internal_commit))
         .route("/internal/v1/supersede", post(internal_supersede))
+        .route("/internal/v1/trim", post(internal_trim))
         .route("/internal/v1/control", get(internal_control_state))
         .route(
             "/internal/v1/control/metadata/freeze",
@@ -5035,6 +5036,36 @@ async fn internal_supersede(
         Ok(withdrawn) => Ok(Json(serde_json::json!({ "withdrawn": withdrawn }))),
         Err(ReplicaError::WriterFenced | ReplicaError::LsnConflict) => Err(StatusCode::CONFLICT),
         Err(_) => Err(StatusCode::SERVICE_UNAVAILABLE),
+    }
+}
+
+/// Trims the node's copy of a stream through a prefix the coordinator has
+/// released in the archive. Only ever moves forward; a node already past it
+/// is left as it is.
+async fn internal_trim(
+    State(state): State<NodeState>,
+    headers: HeaderMap,
+    Json(prefix): Json<TrimmedPrefix>,
+) -> StatusCode {
+    if !permits_internal(&headers, state.internal_token.as_deref()) {
+        return StatusCode::UNAUTHORIZED;
+    }
+    let past = state
+        .node
+        .snapshot()
+        .trimmed
+        .iter()
+        .any(|held| held.stream == prefix.stream && held.archived_lsn >= prefix.archived_lsn);
+    if past || prefix.archived_lsn == 0 {
+        return StatusCode::NO_CONTENT;
+    }
+    match state.node.compact_archived_batch(&[(
+        prefix.stream,
+        prefix.archived_lsn,
+        prefix.writer_epoch,
+    )]) {
+        Ok(_) => StatusCode::NO_CONTENT,
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE,
     }
 }
 
@@ -6737,14 +6768,47 @@ impl ReplicaGateway {
         })
     }
 
-    /// Lets go of the stream's archive through a checkpoint the table
-    /// published durably. See [`OpaqueArchive::release`].
+    /// Lets go of the stream's log through a checkpoint the table published
+    /// durably. See [`OpaqueArchive::release`]. When the release moved the
+    /// log's start past what this coordinator knew was committed, the writer
+    /// continues after it, and every member of the stream's cohort is trimmed
+    /// to it at once rather than at its next archive pass, so the next append
+    /// finds its predecessor on each of them.
     pub async fn release(&self, stream: &str, through_lsn: u64) -> Result<(), ReplicaError> {
-        self.archive
+        let (released, writer_epoch) = self
+            .archive
             .release(stream, through_lsn)
             .await
-            .map(|_| ())
-            .map_err(archive_error)
+            .map_err(archive_error)?;
+        let advanced = {
+            let mut state = self.writer_state.lock().await;
+            match state.streams.get_mut(stream) {
+                Some(writer) if writer.committed_lsn < released => {
+                    writer.committed_lsn = released;
+                    writer.records.clear();
+                    true
+                }
+                Some(_) => false,
+                None => true,
+            }
+        };
+        if advanced {
+            let members = self.replicas_for_stream(stream).await?;
+            let trims = members.into_iter().map(|member| {
+                let client = self.client.clone();
+                let token = self.internal_token.clone();
+                let stream = stream.to_owned();
+                async move {
+                    NodeClient::new(member, &client, &token)
+                        .trim(&stream, released, writer_epoch)
+                        .await
+                }
+            });
+            // A member that does not answer is trimmed by its own archive
+            // pass instead.
+            let _ = join_all(trims).await;
+        }
+        Ok(())
     }
 
     /// How many acknowledged records this coordinator holds, over every
@@ -16326,6 +16390,31 @@ impl<'a> NodeClient<'a> {
             StatusCode::CONFLICT => Err(ReplicaError::LsnConflict),
             StatusCode::UNAUTHORIZED => Err(ReplicaError::GatewayUnauthorized),
             _ => Err(ReplicaError::NodeUnavailable),
+        }
+    }
+
+    async fn trim(
+        &self,
+        stream: &str,
+        archived_lsn: u64,
+        writer_epoch: u64,
+    ) -> Result<(), ReplicaError> {
+        let response = self
+            .http
+            .post(format!("{}/internal/v1/trim", self.node.url))
+            .header(INTERNAL_AUTH_HEADER, self.internal_token)
+            .json(&TrimmedPrefix {
+                stream: stream.to_owned(),
+                archived_lsn,
+                writer_epoch,
+            })
+            .send()
+            .await
+            .map_err(|_| ReplicaError::NodeUnavailable)?;
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            Err(ReplicaError::NodeUnavailable)
         }
     }
 

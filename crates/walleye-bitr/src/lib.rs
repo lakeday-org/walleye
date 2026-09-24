@@ -698,7 +698,10 @@ pub trait ReplicaGateway: Send + Sync {
 
     /// Lets go of the stream's log through `through_lsn`: its writer has
     /// published a durable checkpoint covering it, so no recovery will ask
-    /// for it again. Never moves backwards, and never past what is committed.
+    /// for it again. Never moves backwards. A checkpoint past the log's
+    /// committed tail - positions the log lost, which the checkpoint made
+    /// unnecessary - moves the tail there too, and the log continues after
+    /// it.
     async fn release(&self, stream: &str, through_lsn: u64) -> Result<(), ReplicaError>;
 }
 
@@ -1225,13 +1228,8 @@ impl ReplicaGateway for MemoryReplica {
             .state
             .lock()
             .map_err(|_| ReplicaError::NodeUnavailable)?;
-        let committed = state
-            .records
-            .range((stream.to_owned(), 0)..=(stream.to_owned(), u64::MAX))
-            .next_back()
-            .map_or(0, |(_, record)| record.lsn);
         let released = state.released.entry(stream.to_owned()).or_default();
-        *released = (*released).max(through_lsn.min(committed));
+        *released = (*released).max(through_lsn);
         let released = *released;
         state
             .records
