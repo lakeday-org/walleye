@@ -27,9 +27,14 @@ pub const OWNER_HEADER: &str = "x-walleye-owner";
 /// - `no-owner` (503): nobody owns the table and this process cannot take it
 ///   yet. `Retry-After` says when to come back.
 /// - `owner-unreachable` (503): the owner's lease has not lapsed but it does
-///   not accept connections. Nothing was delivered.
+///   not accept connections. Nothing was delivered: every attempt failed to
+///   connect.
 /// - `owner-lost` (503): the owner stopped answering with the request in
 ///   flight and its lease then lapsed. The outcome is unknown.
+/// - `outcome-unknown` (502): the request may have reached the owner - a
+///   connection broke after it was sent, or the answer was cut off - and
+///   whether it was applied is not known. Not "nothing was done": a retry may
+///   apply it a second time unless it is safe to repeat.
 pub const ROUTE_ERROR_HEADER: &str = "x-walleye-route-error";
 /// How long a forward waits out an owner that is starting up before it
 /// answers 503. Nodes converge on the same quorum, so the skew between a
@@ -145,6 +150,18 @@ pub fn unavailable(
             ("retry-after", seconds.as_str()),
             (ROUTE_ERROR_HEADER, reason),
         ],
+        message.to_owned(),
+    )
+        .into_response()
+}
+
+/// The request may have reached the owner and whether it was applied is not
+/// known. Deliberately not a 503: a client that retries every 503 as "nothing
+/// was done" must not treat this one that way.
+fn outcome_unknown(message: &str) -> Response {
+    (
+        StatusCode::BAD_GATEWAY,
+        [(ROUTE_ERROR_HEADER, "outcome-unknown")],
         message.to_owned(),
     )
         .into_response()
@@ -310,6 +327,13 @@ impl Cluster {
     /// `Retry-After` set to `verdict_in`, when its lease may be judged
     /// lapsed and the table claimed.
     ///
+    /// Any other transport failure may have delivered the request: the
+    /// connection can break after the owner read it, and a dead pooled
+    /// connection looks the same from here. Such a request is not sent again
+    /// unless its method is safe to repeat, and its answer says the outcome
+    /// is unknown - never that nothing was done, whatever a later attempt
+    /// found.
+    ///
     /// The forward gives up when `owner_lost` resolves, which the caller ties
     /// to the owner's lease lapsing on this node's clock: an owner paused with
     /// the request in its socket buffer would otherwise hold it for the whole
@@ -339,6 +363,9 @@ impl Cluster {
             request
         };
         let deadline = std::time::Instant::now() + FORWARD_RETRY_WINDOW;
+        let repeatable = matches!(method, Method::GET | Method::HEAD | Method::OPTIONS);
+        // Whether any attempt so far may have reached the owner.
+        let maybe_delivered = std::sync::atomic::AtomicBool::new(false);
         let attempts = async {
             let mut delay = std::time::Duration::from_millis(100);
             let mut client = self.client.clone();
@@ -348,13 +375,15 @@ impl Cluster {
                 attempts += 1;
                 let outcome = build(&client).send().await;
                 let retryable = match &outcome {
-                    Err(error)
-                        if error.is_connect() || (error.is_request() && !error.is_timeout()) =>
-                    {
+                    Err(error) if error.is_connect() => {
                         failed += 1;
                         failed < 3
                     }
-                    Err(_) => false,
+                    Err(error) => {
+                        maybe_delivered.store(true, std::sync::atomic::Ordering::Relaxed);
+                        failed += 1;
+                        repeatable && !error.is_timeout() && failed < 3
+                    }
                     Ok(response) => {
                         response.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE
                             && response.headers().get(ROUTE_ERROR_HEADER).is_none()
@@ -425,29 +454,35 @@ impl Cluster {
                         }
                         reply
                     }
-                    Err(error) => (
-                        StatusCode::BAD_GATEWAY,
-                        format!("owner {}: {error}", owner.node),
-                    )
-                        .into_response(),
+                    Err(error) => outcome_unknown(&format!(
+                        "owner {} answered {status} and the answer was cut off: {error}; \
+                         whether the request was applied is unknown",
+                        owner.node
+                    )),
                 }
             }
-            // Nothing was delivered: the owner's lease has not lapsed yet, so
-            // nobody else may take the table, and the caller should come back.
-            Err(error) if error.is_connect() => unavailable(
-                "owner-unreachable",
-                verdict_in,
-                &format!(
-                    "owner {} does not accept connections and its lease has not lapsed yet: \
-                     {error}",
-                    owner.node
-                ),
-            ),
-            Err(error) => (
-                StatusCode::BAD_GATEWAY,
-                format!("owner {} unreachable: {error}", owner.node),
-            )
-                .into_response(),
+            // Nothing was delivered: every attempt failed to connect. The
+            // owner's lease has not lapsed yet, so nobody else may take the
+            // table, and the caller should come back.
+            Err(error)
+                if error.is_connect()
+                    && !maybe_delivered.load(std::sync::atomic::Ordering::Relaxed) =>
+            {
+                unavailable(
+                    "owner-unreachable",
+                    verdict_in,
+                    &format!(
+                        "owner {} does not accept connections and its lease has not lapsed \
+                         yet: {error}",
+                        owner.node
+                    ),
+                )
+            }
+            Err(error) => outcome_unknown(&format!(
+                "the connection to owner {} broke with the request sent or in flight: \
+                 {error}; whether it was applied is unknown",
+                owner.node
+            )),
         }
     }
 }
@@ -659,5 +694,84 @@ mod tests {
         assert_eq!(none.headers()["retry-after"], "2");
 
         assert!(route_error(&std::io::Error::other("anything else")).is_none());
+    }
+
+    /// An owner that reads a write and dies before it answers - the
+    /// connection breaks with the request delivered, and every attempt after
+    /// finds the port closed - is never reported as `owner-unreachable`,
+    /// whose contract is that nothing was done. The write is not sent again,
+    /// and the answer says its outcome is unknown.
+    #[tokio::test]
+    async fn a_forward_broken_after_the_request_went_out_is_outcome_unknown() {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let received = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let owner = {
+            let received = Arc::clone(&received);
+            tokio::spawn(async move {
+                // Takes one request, reads all of it, and dies without an
+                // answer; the port closes with it.
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut read = vec![0_u8; 64 * 1024];
+                let mut seen = Vec::new();
+                while !String::from_utf8_lossy(&seen).contains("\"id\":7") {
+                    let n = socket.read(&mut read).await.unwrap();
+                    assert!(n > 0, "the request arrived");
+                    seen.extend_from_slice(&read[..n]);
+                }
+                received.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                drop(socket);
+                drop(listener);
+            })
+        };
+        let cluster = Cluster::new("n".into(), "http://n".into(), "token".into()).unwrap();
+        let peer = Peer {
+            node: "owner".into(),
+            addr: format!("http://{address}"),
+        };
+        let response = cluster
+            .forward(
+                &peer,
+                Method::POST,
+                "/v1/streams/t/events",
+                Some("application/json"),
+                Bytes::from_static(b"{\"rows\":[{\"id\":7}]}"),
+                std::time::Duration::from_secs(1),
+                std::future::pending(),
+            )
+            .await;
+        owner.await.unwrap();
+        assert_eq!(received.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(response.headers()[ROUTE_ERROR_HEADER], "outcome-unknown");
+    }
+
+    /// An owner that never accepted a connection is `owner-unreachable`:
+    /// every attempt failed to connect, so nothing was delivered.
+    #[tokio::test]
+    async fn a_forward_that_never_connected_is_owner_unreachable() {
+        let address = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap()
+        };
+        let cluster = Cluster::new("n".into(), "http://n".into(), "token".into()).unwrap();
+        let peer = Peer {
+            node: "owner".into(),
+            addr: format!("http://{address}"),
+        };
+        let response = cluster
+            .forward(
+                &peer,
+                Method::POST,
+                "/v1/streams/t/events",
+                Some("application/json"),
+                Bytes::from_static(b"{}"),
+                std::time::Duration::from_secs(1),
+                std::future::pending(),
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[ROUTE_ERROR_HEADER], "owner-unreachable");
     }
 }
