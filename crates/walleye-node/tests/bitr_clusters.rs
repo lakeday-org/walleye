@@ -1,11 +1,14 @@
 //! Two Bitr clusters, two daemons, one stream, end to end.
 //!
 //! This is the case the object-store WAL cannot stand in for. Nodes writing
-//! that WAL share it, so each can always replay what the other left and a
-//! handover between them never has anything to refuse. Two Bitr clusters do
-//! not share anything except the object store the claim is arbitrated in, so
-//! the tail one of them is holding is genuinely unreadable by the other. That
-//! used to lose the rows silently.
+//! that WAL share it, so each can always replay what the other left. Two Bitr
+//! clusters share nothing but the bucket, so the tail one of them holds is
+//! genuinely unreadable by the other. That used to lose the rows silently.
+//!
+//! Ownership is what keeps it from happening now: the second daemon does not
+//! take a table whose owner is alive, it forwards to it, and the owner hands
+//! the table over by flushing before it releases, which puts the tail in the
+//! bucket where the second can read it.
 //!
 //! Each cluster here is what a real one is: three replica nodes behind a
 //! gateway, spoken to over HTTP. The daemons are configured exactly as
@@ -103,6 +106,7 @@ fn config(
         members,
         kubernetes: None,
         processor: None,
+        lease: Default::default(),
         api: Some(ApiConfig {
             root_uri: root.to_owned(),
             bitr_url: Some(bitr.to_owned()),
@@ -202,13 +206,12 @@ async fn ids_in_storage(root: &str) -> Vec<i64> {
 }
 
 /// A daemon on one Bitr cluster hands a stream to a daemon on another, with
-/// rows acknowledged and unflushed at the moment of the handover.
+/// rows acknowledged and unflushed until the moment of the handover.
 ///
-/// The second daemon cannot read the first one's log. Left alone it would
-/// claim the epoch, replay nothing, and serve a stream missing a row its
-/// client was told was stored. Instead it finds the note the first one left,
-/// asks that address to flush, and claims a stream whose tail is in the object
-/// store where anyone can reach it.
+/// The second daemon cannot read the first one's log. While the first owns
+/// the stream, the second sends it the writes; when the first stops, it
+/// flushes and releases, and the second claims a stream whose tail is in the
+/// bucket where anyone can reach it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_stream_moves_between_two_bitr_clusters_without_losing_a_row() {
     // SAFETY: the daemon reads its deployment keys from the environment, and
@@ -227,13 +230,10 @@ async fn a_stream_moves_between_two_bitr_clusters_without_losing_a_row() {
     let (second_bitr, second_tasks) = bitr_cluster(logs.path(), "west").await;
     assert_ne!(first_bitr, second_bitr, "two clusters, two gateways");
 
-    // The first daemon, serving for real so the second can reach it.
+    // The first daemon, serving for real so the second can reach it. Two
+    // deployments, not one cluster: the only thing they share is the bucket.
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let first_at = format!("http://{}", listener.local_addr().unwrap());
-    // Two deployments, not one cluster: each is a ring of itself, and the only
-    // thing they share is the bucket. That is the shape this is about - a ring
-    // spanning both would route every write to one owner and there would be no
-    // second claimant at all.
     let first = Service::open(config(
         cache.path(),
         "east",
@@ -261,7 +261,8 @@ async fn a_stream_moves_between_two_bitr_clusters_without_losing_a_row() {
         "the first daemon stores a row: {body}"
     );
 
-    // The second daemon, on the other cluster, takes the stream.
+    // The second daemon, on the other cluster. The first owns the stream, so
+    // the second's write goes there.
     let second = Service::open(config(
         cache.path(),
         "west",
@@ -274,12 +275,25 @@ async fn a_stream_moves_between_two_bitr_clusters_without_losing_a_row() {
     let second_app = router(second.clone());
     define(&second_app).await;
     let (status, body) = write_row(&second_app, 2).await;
+    assert_eq!(status, StatusCode::OK, "forwarded to the owner: {body}");
+
+    // The first stops, handing the stream over, and the second takes it -
+    // once its own quorum is writable, which a client waits out.
+    first.release().await;
+    let mut taken = write_row(&second_app, 3).await;
+    for _ in 0..60 {
+        if taken.0 != StatusCode::SERVICE_UNAVAILABLE {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        taken = write_row(&second_app, 3).await;
+    }
+    let (status, body) = taken;
     assert_eq!(
         status,
         StatusCode::OK,
         "the second daemon takes the stream: {body}"
     );
-
     first.close().await;
     second.close().await;
     serving.abort();
@@ -291,7 +305,7 @@ async fn a_stream_moves_between_two_bitr_clusters_without_losing_a_row() {
     // second one cannot read, and it is still here.
     assert_eq!(
         ids_in_storage(&root).await,
-        vec![1, 2],
+        vec![1, 2, 3],
         "no acknowledged row was lost moving between clusters"
     );
 }

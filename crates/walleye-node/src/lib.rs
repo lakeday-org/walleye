@@ -11,6 +11,7 @@ pub mod reach;
 pub mod values;
 pub use processor::ProcessorConfig;
 pub mod kubernetes;
+pub mod ownership;
 use axum::{
     Json, Router,
     body::Bytes,
@@ -23,6 +24,7 @@ pub use engine::{
     TableNotFound,
 };
 use lance_core::cache::{CacheBackend, InternalCacheKey};
+pub use ownership::LeaseConfig;
 use serde::Deserialize;
 use std::{
     path::PathBuf,
@@ -50,6 +52,9 @@ pub struct Config {
     pub kubernetes: Option<kubernetes::DiscoveryConfig>,
     #[serde(default)]
     pub processor: Option<ProcessorConfig>,
+    /// Lease timing for table ownership.
+    #[serde(default)]
+    pub lease: LeaseConfig,
 }
 impl Config {
     /// Build a single node, or a static cluster member, from environment variables.
@@ -62,7 +67,10 @@ impl Config {
     /// route; generated and printed when absent), `WALLEYE_DIR`
     /// (`./walleye-cache`), `WALLEYE_RAM_GB` (1), `WALLEYE_NVME_GB` (8), `WALLEYE_BITR_URL` (enables Bitr cluster mode),
     /// `WALLEYE_MEMBERS` (`id=http://host:8080,...`) with `WALLEYE_NODE_ID`
-    /// naming this member.
+    /// naming this member, `WALLEYE_ADVERTISE_URL` (where peers reach a node
+    /// started without `WALLEYE_MEMBERS`; `http://localhost:<port>`), and the
+    /// lease timings `WALLEYE_LEASE_TTL_MS` (10000), `WALLEYE_LEASE_SKEW_MS`
+    /// (2000) and `WALLEYE_OWNERSHIP_SAMPLE_MS` (2000).
     pub fn from_env() -> Result<Self, Box<dyn std::error::Error>> {
         Self::from_env_with(|name| std::env::var(name).ok())
     }
@@ -110,10 +118,28 @@ impl Config {
             }
             None => {
                 let node_id = get("WALLEYE_NODE_ID").unwrap_or_else(|| "single".into());
-                let node = Node::new(&node_id, format!("http://localhost:{port}"), 1.0)?;
+                // A replacement started beside this process forwards to it
+                // until it hands its tables over, so it needs an address the
+                // replacement can reach.
+                let advertise = get("WALLEYE_ADVERTISE_URL")
+                    .unwrap_or_else(|| format!("http://localhost:{port}"));
+                let node = Node::new(&node_id, advertise, 1.0)?;
                 (node_id, vec![node])
             }
         };
+        let ms = |name: &str, default: u64, get: &mut dyn FnMut(&str) -> Option<String>| {
+            get(name)
+                .map(|v| v.parse::<u64>())
+                .transpose()
+                .map(|v| v.unwrap_or(default))
+        };
+        let defaults = LeaseConfig::default();
+        let lease = LeaseConfig {
+            ttl_ms: ms("WALLEYE_LEASE_TTL_MS", defaults.ttl_ms, &mut get)?,
+            skew_ms: ms("WALLEYE_LEASE_SKEW_MS", defaults.skew_ms, &mut get)?,
+            sample_ms: ms("WALLEYE_OWNERSHIP_SAMPLE_MS", defaults.sample_ms, &mut get)?,
+        };
+        lease.validate()?;
         let bitr_url = get("WALLEYE_BITR_URL");
         Ok(Config {
             node_id,
@@ -134,6 +160,7 @@ impl Config {
             api: Some(ApiConfig { root_uri, bitr_url }),
             kubernetes: None,
             processor: None,
+            lease,
         })
     }
 }
@@ -339,22 +366,19 @@ impl Service {
                 peers,
             )
             .await?;
-            // A ring of one is still a ring. It routes nothing - the owner of
-            // every stream is this node, and `owner` answers None for that -
-            // but it is how a node knows the address its peers reach it on,
-            // and a single-node deployment holding an unflushed tail has to be
-            // able to say where that is. See `Stream::drained_by_holder`.
-            let cluster = (!config.members.is_empty() || config.kubernetes.is_some())
-                .then(|| {
-                    cluster::Cluster::new(
-                        config.node_id.clone(),
-                        ring.clone(),
-                        config.token.clone(),
-                    )
-                })
-                .transpose()?;
+            // The ring places cache entries and nothing else. Who owns a table
+            // is the ownership record in the bucket; this node's entry in the
+            // member list is only where it tells peers to reach it.
+            let endpoint = config
+                .members
+                .iter()
+                .find(|member| member.id == config.node_id)
+                .map(|member| member.endpoint.clone())
+                .ok_or("this node is not in its own member list")?;
+            let cluster =
+                cluster::Cluster::new(config.node_id.clone(), endpoint, config.token.clone())?;
             Some(
-                engine::Engine::open(api, cached, params, cluster)
+                engine::Engine::open(api, cached, params, cluster, config.lease.clone())
                     .await
                     .map_err(|e| e.to_string())?,
             )
@@ -392,7 +416,29 @@ impl Service {
         service.clone().spawn_view_driver();
         service.clone().spawn_socket_driver();
         service.clone().spawn_readiness();
+        service.clone().spawn_ownership();
         Ok(service)
+    }
+
+    /// Claim what dead or departed owners left, spread across the live
+    /// processes, and close writers for tables this process lost.
+    fn spawn_ownership(self: Arc<Self>) {
+        let Some(engine) = &self.engine else { return };
+        let every = engine.ownership().config().sample();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(every).await;
+                if self.quiescing.load(Ordering::Acquire) {
+                    return;
+                }
+                if let Some(engine) = &self.engine {
+                    let claimed = engine.sweep().await;
+                    if !claimed.is_empty() {
+                        eprintln!("walleye.ownership sweep claimed={}", claimed.join(","));
+                    }
+                }
+            }
+        });
     }
 
     /// Report the disk the Bitr log occupies beside the cache file, so the
@@ -728,6 +774,14 @@ impl Service {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
+    /// Hand every table this process owns to whoever claims it next, while
+    /// the API keeps answering: a request for a table already handed over is
+    /// forwarded to its new owner.
+    pub async fn release(&self) {
+        if let Some(engine) = &self.engine {
+            engine.release_all().await;
+        }
+    }
     /// Stops new processor delivery while the API remains open for in-flight commits.
     pub fn quiesce(&self) {
         self.quiescing.store(true, Ordering::Release);
@@ -763,6 +817,7 @@ pub(crate) fn routes() -> access::Routes<Arc<Service>> {
         .route(Method::GET, "/internal/cache/stats", System, stats)
         .route(Method::GET, "/internal/snapshot/{name}", System, snapshot)
         .route(Method::POST, "/internal/cache/flush", System, flush)
+        .route(Method::GET, "/internal/ownership", System, ownership)
         .route(Method::POST, "/v1/streams", Data(Manage), define)
         .route(
             Method::POST,
@@ -922,6 +977,13 @@ async fn stats(State(s): State<Arc<Service>>) -> Json<serde_json::Value> {
         serde_json::json!({"node":s.config.node_id,"members":s.ring.snapshot().members(),"membership_epoch":s.ring.snapshot().epoch(),"hits":s.hits.load(Ordering::Relaxed),"misses":s.misses.load(Ordering::Relaxed),"stores":s.stores.load(Ordering::Relaxed),"entries":s.cache.num_entries().await,"memory_usage":s.cache.memory_usage(),"memory_capacity":s.cache.memory_capacity(),"disk_capacity":s.cache.persistent_capacity(),"budget":budget}),
     )
 }
+/// What this process believes about table ownership: its session, whether it
+/// is authoritative, the tables it holds and at which epoch, and the leases
+/// it has seen.
+async fn ownership(State(s): State<Arc<Service>>) -> Result<Json<serde_json::Value>, StatusCode> {
+    let engine = s.engine.as_ref().ok_or(StatusCode::NOT_FOUND)?;
+    Ok(Json(engine.ownership().status()))
+}
 async fn flush(State(s): State<Arc<Service>>) -> StatusCode {
     s.cache.flush().await;
     StatusCode::NO_CONTENT
@@ -965,14 +1027,6 @@ fn write_failure(error: &Error) -> ApiError {
                 "outcome": "not written",
             })),
         ),
-        // A request that reached the wrong node is not a bad request: the
-        // caller did nothing wrong and the same call to the owner will work.
-        // The LanceDB surface already answers 409 for this; these routes
-        // used to answer 400, which no client retries.
-        _ if error.downcast_ref::<crate::cluster::NotOwner>().is_some() => (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({"error": error.to_string()})),
-        ),
         _ => failure(error),
     }
 }
@@ -1001,14 +1055,21 @@ pub(crate) fn api(s: &Service) -> Result<&engine::Engine, ApiError> {
 async fn define(
     State(s): State<Arc<Service>>,
     Json(def): Json<StreamRequest>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> Result<Response, ApiError> {
     let def: StreamDefinition = def.into();
     let name = def.name.clone();
     let engine = writable(&s)?;
     let mut revision = s.revision.lock().await;
     *revision = format!("\"{}\"", uuid::Uuid::new_v4());
-    engine.define(def).await.map_err(failure)?;
-    Ok(Json(serde_json::json!({"stream":name})))
+    if let Err(error) = engine.define(def).await {
+        // A table owned elsewhere, or owned here no longer, is a routing
+        // answer rather than a bad request.
+        return match cluster::route_error(&*error) {
+            Some(response) => Ok(response),
+            None => Err(failure(error)),
+        };
+    }
+    Ok(Json(serde_json::json!({"stream":name})).into_response())
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1096,10 +1157,15 @@ async fn ingest(
     }
     // Invalidate snapshots before attempting ingestion, including a partial failure.
     *revision = format!("\"{}\"", uuid::Uuid::new_v4());
-    let count = engine
-        .ingest(&name, input.rows)
-        .await
-        .map_err(|error| write_failure(&error))?;
+    let count = match engine.ingest(&name, input.rows).await {
+        Ok(count) => count,
+        Err(error) => {
+            return match cluster::route_error(&*error) {
+                Some(response) => Ok(response),
+                None => Err(write_failure(&error)),
+            };
+        }
+    };
     s.changed.notify_one();
     Ok((
         [("etag", revision.as_str())],
@@ -1201,6 +1267,37 @@ mod config_tests {
         let api = c.api.unwrap();
         assert_eq!(api.root_uri, "s3://walleye/prod");
         assert_eq!(api.bitr_url.as_deref(), Some("http://127.0.0.1:30080"));
+    }
+
+    #[test]
+    fn a_node_advertises_where_it_answers_and_takes_its_lease_timings() {
+        let c = Config::from_env_with(env(&[
+            ("WALLEYE_BUCKET", "walleye"),
+            ("WALLEYE_ADVERTISE_URL", "http://[fdaa::3]:8080"),
+            ("WALLEYE_LEASE_TTL_MS", "6000"),
+            ("WALLEYE_LEASE_SKEW_MS", "1000"),
+            ("WALLEYE_OWNERSHIP_SAMPLE_MS", "500"),
+        ]))
+        .unwrap();
+        assert_eq!(c.members[0].endpoint, "http://[fdaa::3]:8080");
+        assert_eq!(
+            c.lease,
+            crate::LeaseConfig {
+                ttl_ms: 6000,
+                skew_ms: 1000,
+                sample_ms: 500
+            }
+        );
+        // A skew that is not below a third of the ttl could let a late
+        // renewal count out of order, so it is refused.
+        assert!(
+            Config::from_env_with(env(&[
+                ("WALLEYE_BUCKET", "walleye"),
+                ("WALLEYE_LEASE_TTL_MS", "3000"),
+                ("WALLEYE_LEASE_SKEW_MS", "1000"),
+            ]))
+            .is_err()
+        );
     }
 
     #[test]

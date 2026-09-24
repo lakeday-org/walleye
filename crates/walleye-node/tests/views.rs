@@ -34,6 +34,7 @@ fn config(path: &std::path::Path) -> Config {
         members: vec![Node::new("n", "http://n", 1.0).unwrap()],
         kubernetes: None,
         processor: None,
+        lease: Default::default(),
         api: Some(ApiConfig {
             root_uri: format!("file://{}/store", path.display()),
             bitr_url: None,

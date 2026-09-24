@@ -13,8 +13,8 @@ use std::sync::{
     atomic::{AtomicU32, Ordering},
 };
 use tower::ServiceExt;
-use walleye_node::{ApiConfig, Config, Service, cluster::Cluster, router};
-use walleye_ring::{Membership, Node};
+use walleye_node::{ApiConfig, Config, Service, cluster::Cluster, ownership::Peer, router};
+use walleye_ring::Node;
 
 const TOKEN: &str = "deployment-secret-token";
 
@@ -30,6 +30,7 @@ fn config(path: &std::path::Path) -> Config {
         members: vec![Node::new("n", "http://n", 1.0).unwrap()],
         kubernetes: None,
         processor: None,
+        lease: Default::default(),
         api: Some(ApiConfig {
             root_uri: format!("file://{}/store", path.display()),
             bitr_url: None,
@@ -95,9 +96,11 @@ async fn a_forward_waits_out_an_owner_that_is_starting() {
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
     tokio::spawn(async move { axum::serve(listener, peer).await.unwrap() });
 
-    let owner = Node::new("owner", endpoint, 1.0).unwrap();
-    let ring = Arc::new(Membership::new(vec![owner.clone()]).unwrap());
-    let cluster = Cluster::new("me".into(), ring, TOKEN.into()).unwrap();
+    let owner = Peer {
+        node: "owner".into(),
+        addr: endpoint,
+    };
+    let cluster = Cluster::new("me".into(), "http://me".into(), TOKEN.into()).unwrap();
     let response = cluster
         .forward(
             &owner,
@@ -105,6 +108,8 @@ async fn a_forward_waits_out_an_owner_that_is_starting() {
             "/v1/table/t/insert/",
             Some("application/vnd.apache.arrow.stream"),
             Bytes::from_static(b"rows"),
+            std::time::Duration::from_secs(1),
+            std::future::pending(),
         )
         .await;
     assert_eq!(response.status(), StatusCode::OK);

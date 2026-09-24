@@ -19,18 +19,16 @@ is a different problem and the reason to run more than one.
 Each node runs a replica of the log on its own disk. A write is acknowledged
 once a quorum of replicas holds it, and committed segments are archived to
 object storage behind that. Two of three is the default quorum, so one node can
-be down without losing anything acknowledged. What it costs is service to the
-tables that node owns, which is the paragraph after next.
+be down without losing anything acknowledged. What it costs is a short pause
+for the tables that node owns, which is the paragraph after next.
 
 The trade is latency: a local quorum acknowledges faster than a bucket does.
 
-It is not a trade for availability, and this is the part worth reading twice. A
-node loss costs no acknowledged data — the two survivors are the quorum — but
-each table is owned by one node and ownership does not move while that node is
-away, so the tables it owns stop answering until it is back. Three nodes lose
-service to roughly a third of the tables where one node loses service to all of
-them. That is a smaller blast radius, not a failover.
-[Losing a node](shapes.md#losing-a-node) is the mechanism.
+A node loss costs no acknowledged data — the two survivors are the quorum —
+and each table is owned by one node, so the tables it owned stop answering
+until a survivor has seen its lease lapse and taken them over, about fifteen
+seconds by default. On one node there is no survivor, so nothing answers until
+it is back. [Losing a node](shapes.md#losing-a-node) is the mechanism.
 
 Both arrangements end in the same place. Object storage is the durable record
 either way; the cluster puts a replicated log in front of it.
@@ -77,8 +75,10 @@ write-ahead log lives there, and it is the log rather than old copies of it.
 [What you own](../self-hosting/operating.md) explains what happens if you do.
 
 Durability is also not availability, on either shape. A write in flight while
-its owner is replaced fails and should be retried; everything already
-acknowledged is safe. [Shapes](shapes.md) is that choice.
+its owner changes can be refused - 409 or 503 with an `x-walleye-route-error`
+header saying which - and should be retried; everything already acknowledged
+is safe, and a retried row with a primary key is not stored twice.
+[Shapes](shapes.md) is that choice.
 
 ## On the managed service
 

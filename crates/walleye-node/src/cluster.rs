@@ -1,43 +1,161 @@
-//! Per-stream ownership across cluster members. A stream's owner is the
-//! rendezvous-hash winner for its name on the membership ring, the same
-//! placement the cache uses. Only the owner opens the stream's MemWAL writer;
-//! every other member forwards the request to it. The MemWAL writer epoch
-//! (and, in Bitr mode, the Bitr writer epoch derived from it) fences a stale
-//! owner after a membership change; the membership fingerprint header catches
-//! a forward that raced such a change before it reaches the WAL.
+//! Reaching the process that owns a table. Who that is comes from
+//! [`crate::ownership`]: every table has one owner with a live lease, and a
+//! request that reaches any other process is forwarded to it. The fencing is
+//! the owner's Lance MemWAL writer epoch, which is the epoch in the table's
+//! ownership record; a forward that races an ownership change is answered
+//! with 409 and a route-error header, and the forwarder asks again.
 #![allow(clippy::result_large_err)]
+use crate::ownership::{Peer, Route};
 use axum::{
     body::Bytes,
     http::{HeaderMap, Method, StatusCode},
     response::{IntoResponse, Response},
 };
 use std::sync::Arc;
-use walleye_ring::{Membership, Node};
 
-/// Sent on every forwarded request: the forwarder's view of membership.
-pub const MEMBERS_HEADER: &str = "x-walleye-members";
 /// Marks a request as already forwarded once; a second hop is refused.
 pub const FORWARDED_HEADER: &str = "x-walleye-forwarded";
-/// Which member answered, for observability and tests.
+/// Which process answered, for observability and tests.
 pub const OWNER_HEADER: &str = "x-walleye-owner";
+/// Why a request could not be served where it landed:
+///
+/// - `stale-owner` (409): the process it reached does not own the table and
+///   did nothing with it. Send it to the owner.
+/// - `lost-ownership` (409): the process owned the table when the request
+///   started and not when it would have acknowledged it. The outcome is
+///   unknown; the new owner replays whatever reached the log.
+/// - `no-owner` (503): nobody owns the table and this process cannot take it
+///   yet. `Retry-After` says when to come back.
+/// - `owner-unreachable` (503): the owner's lease has not lapsed but it does
+///   not accept connections. Nothing was delivered.
+/// - `owner-lost` (503): the owner stopped answering with the request in
+///   flight and its lease then lapsed. The outcome is unknown.
+pub const ROUTE_ERROR_HEADER: &str = "x-walleye-route-error";
 /// How long a forward waits out an owner that is starting up before it
-/// answers 502. Nodes converge on the same quorum, so the skew between a
+/// answers 503. Nodes converge on the same quorum, so the skew between a
 /// ready forwarder and its owner is seconds.
 pub const FORWARD_RETRY_WINDOW: std::time::Duration = std::time::Duration::from_secs(15);
 
+/// This process does not own the table, and refused before doing anything:
+/// another live process owns it (named when known), or this one lost it
+/// before its writer opened.
 #[derive(Debug)]
-pub struct NotOwner(pub Node);
+pub struct NotOwner {
+    pub table: String,
+    pub owner: Option<Peer>,
+}
 impl std::fmt::Display for NotOwner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "stream is owned by {} at {}", self.0.id, self.0.endpoint)
+        match &self.owner {
+            Some(peer) => write!(
+                f,
+                "table {} is owned by {} at {}",
+                self.table, peer.node, peer.addr
+            ),
+            None => write!(f, "this process does not own table {}", self.table),
+        }
     }
 }
 impl std::error::Error for NotOwner {}
 
+/// This process stopped owning the table while the request was in flight,
+/// so it does not acknowledge it. The rows may or may not have reached the
+/// log; the new owner replays whatever did, and a retry of rows with a
+/// primary key collapses onto them.
+#[derive(Debug)]
+pub struct StaleOwner(pub String);
+impl std::fmt::Display for StaleOwner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "ownership of {} moved while the request was in flight; its outcome is unknown. \
+             Retry: the request reaches the new owner, and rows with a primary key are not \
+             stored twice",
+            self.0
+        )
+    }
+}
+impl std::error::Error for StaleOwner {}
+
+/// Nobody owns the table and this process cannot take it yet.
+#[derive(Debug)]
+pub struct NoOwner {
+    pub table: String,
+    pub retry_after: std::time::Duration,
+}
+impl std::fmt::Display for NoOwner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "no live process owns {} and this one cannot take it yet; retry",
+            self.table
+        )
+    }
+}
+impl std::error::Error for NoOwner {}
+
+/// Marks a response refused before anything was applied, so the routing
+/// layer may send the same request on to whoever owns the table now.
+#[derive(Clone, Copy, Debug)]
+pub struct Refused;
+
+/// The answer for an error that says where a table is not: 409 with
+/// `stale-owner`, or 503 with `Retry-After` and `no-owner`. `None` for any
+/// other error.
+pub fn route_error(error: &(dyn std::error::Error + 'static)) -> Option<Response> {
+    if let Some(not) = error.downcast_ref::<NotOwner>() {
+        let mut response = stale_owner(&not.to_string());
+        response.extensions_mut().insert(Refused);
+        return Some(response);
+    }
+    if let Some(stale) = error.downcast_ref::<StaleOwner>() {
+        return Some(
+            (
+                StatusCode::CONFLICT,
+                [(ROUTE_ERROR_HEADER, "lost-ownership")],
+                stale.to_string(),
+            )
+                .into_response(),
+        );
+    }
+    if let Some(none) = error.downcast_ref::<NoOwner>() {
+        return Some(unavailable("no-owner", none.retry_after, &none.to_string()));
+    }
+    None
+}
+
+pub fn stale_owner(message: &str) -> Response {
+    (
+        StatusCode::CONFLICT,
+        [(ROUTE_ERROR_HEADER, "stale-owner")],
+        message.to_owned(),
+    )
+        .into_response()
+}
+
+pub fn unavailable(
+    reason: &'static str,
+    retry_after: std::time::Duration,
+    message: &str,
+) -> Response {
+    let seconds = retry_after.as_millis().div_ceil(1000).max(1).to_string();
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [
+            ("retry-after", seconds.as_str()),
+            (ROUTE_ERROR_HEADER, reason),
+        ],
+        message.to_owned(),
+    )
+        .into_response()
+}
+
 #[derive(Clone)]
 pub struct Cluster {
+    /// This process's configured id; its session name is the ownership node.
     pub node_id: String,
-    pub ring: Arc<Membership>,
+    /// Where peers reach this process.
+    pub endpoint: String,
     pub token: String,
     client: reqwest::Client,
 }
@@ -45,18 +163,15 @@ impl std::fmt::Debug for Cluster {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Cluster")
             .field("node_id", &self.node_id)
+            .field("endpoint", &self.endpoint)
             .finish_non_exhaustive()
     }
 }
 impl Cluster {
-    pub fn new(
-        node_id: String,
-        ring: Arc<Membership>,
-        token: String,
-    ) -> Result<Self, reqwest::Error> {
+    pub fn new(node_id: String, endpoint: String, token: String) -> Result<Self, reqwest::Error> {
         Ok(Self {
             node_id,
-            ring,
+            endpoint,
             token,
             client: Self::client()?,
         })
@@ -72,50 +187,12 @@ impl Cluster {
             .pool_idle_timeout(std::time::Duration::from_secs(5))
             .build()
     }
-    /// Where this node answers, as its peers know it. This is what a writer
-    /// advertises while it holds an unflushed tail, so a claimant can ask it
-    /// to drain instead of only being refused.
-    pub fn self_endpoint(&self) -> Option<String> {
-        self.ring
-            .snapshot()
-            .members()
-            .iter()
-            .find(|member| member.id == self.node_id)
-            .map(|member| member.endpoint.clone())
-    }
-    /// The member that owns `stream`, or `None` when this node does.
-    pub fn owner(&self, stream: &str) -> Option<Node> {
-        let ring = self.ring.snapshot();
-        let owner = ring.owner(stream.as_bytes());
-        (owner.id != self.node_id).then(|| owner.clone())
-    }
-    /// A stable digest of the member ids this node currently sees.
-    pub fn fingerprint(&self) -> String {
-        let ring = self.ring.snapshot();
-        let mut ids: Vec<&str> = ring.members().iter().map(|n| n.id.as_str()).collect();
-        ids.sort_unstable();
-        let joined = ids.join("\n");
-        format!("{:016x}", xxhash_rust::xxh3::xxh3_64(joined.as_bytes()))
-    }
-    /// Reject a forwarded request whose sender saw a different membership.
-    pub fn check_fence(&self, headers: &HeaderMap) -> Result<(), Response> {
-        if let Some(seen) = headers.get(MEMBERS_HEADER).and_then(|v| v.to_str().ok())
-            && seen != self.fingerprint()
-        {
-            return Err((
-                StatusCode::CONFLICT,
-                "membership changed while the request was in flight; retry",
-            )
-                .into_response());
-        }
-        Ok(())
-    }
     /// Fetch every row of `stream` from the member that owns it, as an Arrow
     /// IPC file, for a query that spans owners.
-    pub async fn fetch_snapshot(&self, owner: &Node, stream: &str) -> Result<bytes::Bytes, String> {
+    pub async fn fetch_snapshot(&self, owner: &Peer, stream: &str) -> Result<bytes::Bytes, String> {
         let url = format!(
             "{}/internal/snapshot/{stream}",
-            owner.endpoint.trim_end_matches('/')
+            owner.addr.trim_end_matches('/')
         );
         let response = self
             .client
@@ -123,19 +200,19 @@ impl Cluster {
             .bearer_auth(&self.token)
             .send()
             .await
-            .map_err(|error| format!("owner {} is unreachable: {error}", owner.id))?;
+            .map_err(|error| format!("owner {} is unreachable: {error}", owner.node))?;
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
             return Err(format!(
                 "owner {} refused a snapshot of {stream} with {status}: {body}",
-                owner.id
+                owner.node
             ));
         }
         response
             .bytes()
             .await
-            .map_err(|error| format!("owner {} truncated {stream}: {error}", owner.id))
+            .map_err(|error| format!("owner {} truncated {stream}: {error}", owner.node))
     }
     /// Run one statement on the member that owns the table it reads, and take
     /// its rows.
@@ -144,83 +221,60 @@ impl Cluster {
     /// the table across the network so this node can filter it. For a
     /// statement naming a single table, asking its owner to run the statement
     /// moves the answer rather than the table.
-    /// Ask whoever holds a stream to flush it, so its unflushed tail lands in
-    /// shared storage and any writer may take the stream.
-    ///
-    /// This is the cooperative half of a handover. The claim itself is a
-    /// compare-and-swap nobody can refuse, but a writer that has been fenced
-    /// can no longer flush - its manifest commit is rejected by epoch - so the
-    /// drain has to happen while the holder still holds it. Hence a request,
-    /// before the claim, rather than anything the claimant can do alone.
-    pub async fn ask_to_flush(&self, endpoint: &str, stream: &str) -> Result<(), String> {
-        let url = format!(
-            "{}/v1/table/{stream}/flush_lsm/",
-            endpoint.trim_end_matches('/')
-        );
+    pub async fn run_sql(&self, owner: &Peer, sql: &str) -> Result<bytes::Bytes, String> {
+        let url = format!("{}/v1/query", owner.addr.trim_end_matches('/'));
         let response = self
             .client
             .post(url)
             .bearer_auth(&self.token)
-            // Deliberately no membership fingerprint. This is not a routed
-            // request and does not depend on the two sides agreeing about a
-            // ring: the whole point is to reach the writer holding a stream,
-            // which may be a node of another deployment entirely. Sending one
-            // would make every cross-deployment drain a 409.
-            .header(FORWARDED_HEADER, "1")
-            .json(&serde_json::json!({}))
-            .send()
-            .await
-            .map_err(|error| format!("the writer holding {stream} is unreachable: {error}"))?;
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(format!(
-                "the writer holding {stream} refused to flush with {status}: {body}"
-            ));
-        }
-        Ok(())
-    }
-    pub async fn run_sql(&self, owner: &Node, sql: &str) -> Result<bytes::Bytes, String> {
-        let url = format!("{}/v1/query", owner.endpoint.trim_end_matches('/'));
-        let response = self
-            .client
-            .post(url)
-            .bearer_auth(&self.token)
-            .header(MEMBERS_HEADER, self.fingerprint())
             .header(FORWARDED_HEADER, "1")
             .json(&serde_json::json!({"sql": sql}))
             .send()
             .await
-            .map_err(|error| format!("owner {} is unreachable: {error}", owner.id))?;
+            .map_err(|error| format!("owner {} is unreachable: {error}", owner.node))?;
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
             return Err(format!(
                 "owner {} refused the query with {status}: {body}",
-                owner.id
+                owner.node
             ));
         }
         response
             .bytes()
             .await
-            .map_err(|error| format!("owner {} truncated the answer: {error}", owner.id))
+            .map_err(|error| format!("owner {} truncated the answer: {error}", owner.node))
     }
 
     /// Relay one request to `owner` and return its response verbatim.
+    ///
+    /// A 503 from an owner still reaching its quorum is retried for a while,
+    /// and a connect failure twice, quickly: neither delivered anything. An
+    /// owner that still refuses connections is answered 503 with
+    /// `Retry-After` set to `verdict_in`, when its lease may be judged
+    /// lapsed and the table claimed.
+    ///
+    /// The forward gives up when `owner_lost` resolves, which the caller ties
+    /// to the owner's lease lapsing on this node's clock: an owner paused with
+    /// the request in its socket buffer would otherwise hold it for the whole
+    /// client timeout. By then the owner has stopped acting as one, so if it
+    /// resumes it refuses rather than applies what it was sent.
+    #[allow(clippy::too_many_arguments)]
     pub async fn forward(
         &self,
-        owner: &Node,
+        owner: &Peer,
         method: Method,
         path_and_query: &str,
         content_type: Option<&str>,
         body: Bytes,
+        verdict_in: std::time::Duration,
+        owner_lost: impl std::future::Future<Output = ()>,
     ) -> Response {
-        let url = format!("{}{}", owner.endpoint.trim_end_matches('/'), path_and_query);
+        let url = format!("{}{}", owner.addr.trim_end_matches('/'), path_and_query);
         let build = |client: &reqwest::Client| {
             let mut request = client
                 .request(method.clone(), &url)
                 .bearer_auth(&self.token)
-                .header(MEMBERS_HEADER, self.fingerprint())
                 .header(FORWARDED_HEADER, "1")
                 .body(body.clone());
             if let Some(content_type) = content_type {
@@ -228,86 +282,135 @@ impl Cluster {
             }
             request
         };
-        // A peer that is still starting refuses with 503, and one that just
-        // restarted fails to connect. Both are safe to retry: a connect error
-        // means the request never arrived, and a 503 is an explicit refusal
-        // with no side effect. Wait out a peer's startup window instead of
-        // turning it into a bare 502.
         let deadline = std::time::Instant::now() + FORWARD_RETRY_WINDOW;
-        let mut delay = std::time::Duration::from_millis(100);
-        let mut client = self.client.clone();
-        let mut attempts = 0_u32;
-        let outcome = loop {
-            attempts += 1;
-            let outcome = build(&client).send().await;
-            let retryable = match &outcome {
-                Err(error) => error.is_connect() || (error.is_request() && !error.is_timeout()),
-                Ok(response) => response.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE,
-            };
-            if !retryable || std::time::Instant::now() >= deadline {
-                if attempts > 1 {
-                    eprintln!(
-                        "walleye.forward owner={} attempts={attempts} settled",
-                        owner.id
-                    );
+        let attempts = async {
+            let mut delay = std::time::Duration::from_millis(100);
+            let mut client = self.client.clone();
+            let mut attempts = 0_u32;
+            let mut failed = 0_u32;
+            loop {
+                attempts += 1;
+                let outcome = build(&client).send().await;
+                let retryable = match &outcome {
+                    Err(error)
+                        if error.is_connect() || (error.is_request() && !error.is_timeout()) =>
+                    {
+                        failed += 1;
+                        failed < 3
+                    }
+                    Err(_) => false,
+                    Ok(response) => {
+                        response.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE
+                            && response.headers().get(ROUTE_ERROR_HEADER).is_none()
+                    }
+                };
+                if !retryable || std::time::Instant::now() >= deadline {
+                    if attempts > 1 {
+                        eprintln!(
+                            "walleye.forward owner={} attempts={attempts} settled",
+                            owner.node
+                        );
+                    }
+                    return outcome;
                 }
-                break outcome;
+                // A pooled connection may belong to the peer's previous
+                // incarnation; take a fresh one for the retry.
+                if let Ok(fresh) = Self::client() {
+                    client = fresh;
+                }
+                // A connection that failed is retried at once on a fresh
+                // one; only an owner that answered 503 is given time.
+                if outcome.is_ok() {
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(std::time::Duration::from_secs(1));
+                }
             }
-            // A pooled connection may belong to the peer's previous
-            // incarnation; take a fresh one for the retry.
-            if let Ok(fresh) = Self::client() {
-                client = fresh;
+        };
+        let outcome = tokio::select! {
+            outcome = attempts => outcome,
+            () = owner_lost => {
+                return unavailable(
+                    "owner-lost",
+                    std::time::Duration::from_secs(1),
+                    &format!(
+                        "owner {} stopped answering and its lease lapsed; the outcome of this \
+                         request is unknown, and a retry reaches whoever owns the table now",
+                        owner.node
+                    ),
+                );
             }
-            tokio::time::sleep(delay).await;
-            delay = (delay * 2).min(std::time::Duration::from_secs(1));
         };
         match outcome {
             Ok(response) => {
                 let status = StatusCode::from_u16(response.status().as_u16())
                     .unwrap_or(StatusCode::BAD_GATEWAY);
-                let content_type = response
-                    .headers()
-                    .get("content-type")
-                    .and_then(|v| v.to_str().ok())
-                    .map(str::to_string);
+                let mut headers = HeaderMap::new();
+                for name in [
+                    "content-type",
+                    "retry-after",
+                    ROUTE_ERROR_HEADER,
+                    OWNER_HEADER,
+                ] {
+                    if let Some(value) = response.headers().get(name)
+                        && let Ok(value) = value.to_str()
+                        && let Ok(value) = value.parse()
+                    {
+                        headers.insert(name, value);
+                    }
+                }
                 match response.bytes().await {
                     Ok(bytes) => {
                         let mut reply = (status, bytes).into_response();
-                        if let Some(ct) = content_type
-                            && let Ok(value) = ct.parse()
+                        reply.headers_mut().extend(headers);
+                        if !reply.headers().contains_key(OWNER_HEADER)
+                            && let Ok(value) = owner.node.parse()
                         {
-                            reply.headers_mut().insert("content-type", value);
-                        }
-                        if let Ok(value) = owner.id.parse() {
                             reply.headers_mut().insert(OWNER_HEADER, value);
                         }
                         reply
                     }
                     Err(error) => (
                         StatusCode::BAD_GATEWAY,
-                        format!("owner {}: {error}", owner.id),
+                        format!("owner {}: {error}", owner.node),
                     )
                         .into_response(),
                 }
             }
+            // Nothing was delivered: the owner's lease has not lapsed yet, so
+            // nobody else may take the table, and the caller should come back.
+            Err(error) if error.is_connect() => unavailable(
+                "owner-unreachable",
+                verdict_in,
+                &format!(
+                    "owner {} does not accept connections and its lease has not lapsed yet: \
+                     {error}",
+                    owner.node
+                ),
+            ),
             Err(error) => (
                 StatusCode::BAD_GATEWAY,
-                format!("owner {} unreachable: {error}", owner.id),
+                format!("owner {} unreachable: {error}", owner.node),
             )
                 .into_response(),
         }
     }
 }
 
-/// Axum middleware: send a request for a stream to the member that owns it.
-/// Local and single-node requests pass through untouched apart from the
-/// owner header on the response.
+/// The table a request is about, when it is about exactly one.
+enum Target {
+    Table(String),
+    /// A statement over several tables runs here and gathers the rest.
+    Local,
+}
+
+/// Axum middleware: send a request for a table to the process that owns it,
+/// claiming the table here if nobody does.
 pub async fn route_to_owner(
     axum::extract::State(s): axum::extract::State<Arc<crate::Service>>,
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
-    let Some(cluster) = s.engine.as_ref().and_then(|e| e.cluster()).cloned() else {
+    let Some(engine) = s.engine() else {
         return next.run(request).await;
     };
     let path = request.uri().path().to_string();
@@ -321,9 +424,6 @@ pub async fn route_to_owner(
     }
     // Forwarding carries this node's token; the access gate in front of this
     // has already admitted the caller for this route.
-    if let Err(response) = cluster.check_fence(request.headers()) {
-        return response;
-    }
     let forwarded = request.headers().contains_key(FORWARDED_HEADER);
     let method = request.method().clone();
     let path_and_query = request
@@ -341,77 +441,155 @@ pub async fn route_to_owner(
         Ok(bytes) => bytes,
         Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
     };
-    let stream = match segments.as_slice() {
-        ["v1", "table", name, ..] => Some((*name).to_string()),
-        ["v1", "streams", name, ..] => Some((*name).to_string()),
-        ["v1", "streams"] => serde_json::from_slice::<serde_json::Value>(&bytes)
+    let target = match segments.as_slice() {
+        ["v1", "table", name, ..] => Target::Table((*name).to_string()),
+        ["v1", "streams", name, ..] => Target::Table((*name).to_string()),
+        ["v1", "streams"] => match serde_json::from_slice::<serde_json::Value>(&bytes)
             .ok()
-            .and_then(|v| v.get("name").and_then(|n| n.as_str()).map(str::to_string)),
+            .and_then(|v| v.get("name").and_then(|n| n.as_str()).map(str::to_string))
+        {
+            Some(name) => Target::Table(name),
+            None => Target::Local,
+        },
         ["v1", "query"] => {
             let sql = serde_json::from_slice::<serde_json::Value>(&bytes)
                 .ok()
                 .and_then(|v| v.get("sql").and_then(|q| q.as_str()).map(str::to_string));
             match sql.map(|q| walleye_lance::sql_table_names(&q)) {
-                Some(Ok(tables)) => {
-                    let mut owners: Vec<Option<Node>> =
-                        tables.iter().map(|t| cluster.owner(t)).collect();
-                    owners
-                        .sort_by(|a, b| a.as_ref().map(|n| &n.id).cmp(&b.as_ref().map(|n| &n.id)));
-                    owners.dedup_by(|a, b| a.as_ref().map(|n| &n.id) == b.as_ref().map(|n| &n.id));
-                    match owners.as_slice() {
-                        // Every referenced table is owned here, or the query
-                        // names none: run it locally.
-                        [] | [None] => None,
-                        [Some(owner)] => Some(format!("\u{0}{}", owner.id)),
-                        // Tables spread across members: this node runs the
-                        // query and gathers the rows it does not own.
-                        _ => None,
-                    }
+                Some(Ok(tables)) if tables.len() == 1 => {
+                    Target::Table(tables.into_iter().next().expect("one table"))
                 }
+                Some(Ok(_)) | None => Target::Local,
                 Some(Err(error)) => {
                     return (StatusCode::BAD_REQUEST, error.to_string()).into_response();
                 }
-                None => None,
             }
         }
-        _ => None,
+        _ => Target::Local,
     };
-    let owner = match stream.as_deref() {
-        Some(id) if id.starts_with('\u{0}') => {
-            let id = &id[1..];
-            cluster
-                .ring
-                .snapshot()
-                .members()
-                .iter()
-                .find(|n| n.id == id)
-                .cloned()
+    let local = |parts: axum::http::request::Parts, bytes: Bytes| {
+        let next = next.clone();
+        async move {
+            let request = axum::extract::Request::from_parts(parts, axum::body::Body::from(bytes));
+            let mut response = next.run(request).await;
+            if let Ok(value) = engine.ownership().node().parse() {
+                response.headers_mut().insert(OWNER_HEADER, value);
+            }
+            response
         }
-        Some(name) => cluster.owner(name),
-        None => None,
     };
-    if let Some(owner) = owner {
-        if forwarded {
-            return (
-                StatusCode::CONFLICT,
-                format!("ownership moved to {} while forwarding; retry", owner.id),
-            )
-                .into_response();
+    // A name that cannot be a table is the handler's to refuse; it must not
+    // become an ownership record.
+    let table = match target {
+        Target::Table(table) if crate::engine::valid_name(&table) => table,
+        _ => return local(parts, bytes).await,
+    };
+    // A request that finds the table moved - a forward that reaches a former
+    // owner, or a local attempt refused before it applied anything - asks the
+    // bucket again and goes once more.
+    let mut fresh = forwarded;
+    for attempt in 0..2 {
+        let last = attempt == 1;
+        match engine.route(&table, fresh).await {
+            Ok(Route::Local { .. }) => {
+                let response = local(parts.clone(), bytes.clone()).await;
+                if !last && !forwarded && response.extensions().get::<Refused>().is_some() {
+                    fresh = true;
+                    continue;
+                }
+                return response;
+            }
+            Ok(Route::Unowned) => {
+                return unavailable(
+                    "no-owner",
+                    engine.ownership().config().sample(),
+                    &format!("no live process owns {table} and this one cannot take it yet"),
+                );
+            }
+            Ok(Route::Remote { peer, .. }) if forwarded => {
+                return stale_owner(&format!(
+                    "this process does not own {table}; {} does",
+                    peer.node
+                ));
+            }
+            Ok(Route::Remote { peer, verdict_in }) => {
+                let response = engine
+                    .cluster()
+                    .forward(
+                        &peer,
+                        method.clone(),
+                        &path_and_query,
+                        content_type.as_deref(),
+                        bytes.clone(),
+                        verdict_in,
+                        engine.lease_lapses(peer.node.clone()),
+                    )
+                    .await;
+                // Each says nothing was applied and the owner was not there:
+                // it no longer owns the table, it could not be reached, or it
+                // let the table go and knows nobody to send it to. Ask again;
+                // this process may take the table itself.
+                let moved = response.headers().get(ROUTE_ERROR_HEADER).is_some_and(|v| {
+                    v == "stale-owner" || v == "owner-unreachable" || v == "no-owner"
+                });
+                if !last && moved {
+                    fresh = true;
+                    continue;
+                }
+                return response;
+            }
+            Err(error) => {
+                return match route_error(&*error) {
+                    Some(response) => response,
+                    None => unavailable(
+                        "no-owner",
+                        std::time::Duration::from_secs(1),
+                        &format!("could not read who owns {table}: {error}"),
+                    ),
+                };
+            }
         }
-        return cluster
-            .forward(
-                &owner,
-                method,
-                &path_and_query,
-                content_type.as_deref(),
-                bytes,
-            )
-            .await;
     }
-    let request = axum::extract::Request::from_parts(parts, axum::body::Body::from(bytes));
-    let mut response = next.run(request).await;
-    if let Ok(value) = cluster.node_id.parse() {
-        response.headers_mut().insert(OWNER_HEADER, value);
+    unreachable!("the second attempt always returns")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The three ways a request finds its table is not here each answer with
+    /// a status a client can act on, and say which way in a header.
+    #[test]
+    fn route_errors_say_what_to_do_next() {
+        let refused = route_error(&NotOwner {
+            table: "t".into(),
+            owner: None,
+        })
+        .unwrap();
+        assert_eq!(refused.status(), StatusCode::CONFLICT);
+        assert_eq!(refused.headers()[ROUTE_ERROR_HEADER], "stale-owner");
+        assert!(
+            refused.extensions().get::<Refused>().is_some(),
+            "nothing was applied, so the request may go on to the owner"
+        );
+
+        let lost = route_error(&StaleOwner("t".into())).unwrap();
+        assert_eq!(lost.status(), StatusCode::CONFLICT);
+        assert_eq!(lost.headers()[ROUTE_ERROR_HEADER], "lost-ownership");
+        assert!(
+            lost.extensions().get::<Refused>().is_none(),
+            "its outcome is unknown, so it is not re-sent for the caller"
+        );
+
+        let none = route_error(&NoOwner {
+            table: "t".into(),
+            retry_after: std::time::Duration::from_millis(1_200),
+        })
+        .unwrap();
+        assert_eq!(none.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(none.headers()[ROUTE_ERROR_HEADER], "no-owner");
+        assert_eq!(none.headers()["retry-after"], "2");
+
+        assert!(route_error(&std::io::Error::other("anything else")).is_none());
     }
-    response
 }

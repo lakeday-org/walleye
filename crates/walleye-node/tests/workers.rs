@@ -36,6 +36,7 @@ fn sized(path: &std::path::Path, memory_bytes: usize) -> Config {
         members: vec![Node::new("n", "http://n", 1.0).unwrap()],
         kubernetes: None,
         processor: None,
+        lease: Default::default(),
         api: Some(ApiConfig {
             root_uri: format!("file://{}/store", path.display()),
             bitr_url: None,

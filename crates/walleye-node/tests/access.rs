@@ -28,6 +28,7 @@ fn config(path: &std::path::Path) -> Config {
         members: vec![Node::new("n", "http://n", 1.0).unwrap()],
         kubernetes: None,
         processor: None,
+        lease: Default::default(),
         api: Some(ApiConfig {
             root_uri: format!("file://{}/store", path.display()),
             bitr_url: None,
@@ -219,6 +220,14 @@ async fn each_token_reaches_only_what_its_scopes_name() {
     );
     assert_eq!(
         call(&app, Some(SYSTEM), "GET", "/internal/cache/stats", vec![]).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        call(&app, Some("manager"), "GET", "/internal/ownership", vec![]).await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        call(&app, Some(SYSTEM), "GET", "/internal/ownership", vec![]).await,
         StatusCode::OK
     );
     assert_eq!(

@@ -7,8 +7,8 @@ change with it.
 | | One node | Three nodes |
 |---|---|---|
 | A write is durable when | the log reaches object storage | a quorum of replicas holds it |
-| One node is lost | nothing answers until it is back | no acknowledged write is lost; the tables it owns stop answering until it is back |
-| Ownership | everything | each table belongs to one node |
+| One node is lost | nothing answers until it is back | no acknowledged write is lost; the tables it owned move to the survivors |
+| Ownership | everything | each table belongs to one live node |
 | Turned on by | nothing, it is the default | `WALLEYE_MEMBERS` and `WALLEYE_BITR_URL` |
 
 [A single node](../self-hosting/single-node.md) and
@@ -20,55 +20,42 @@ changes between them.
 Every member serves the whole API, so a client needs no knowledge of the
 topology and nothing pins it to a node.
 
-Each table is owned by exactly one member, picked by weighted rendezvous
-hashing over the member list. Only the owner holds the writer, so a request
-that arrives anywhere else is forwarded to the owner and answered from there.
-Reads are forwarded too, which is why a read always includes rows that are
-still in memory.
-
-Membership is static and identical on every node, so ownership is the same
-everywhere and survives a restart.
+Each table is owned by exactly one live node, recorded in the bucket. The
+first node to use a table claims it, and it keeps it until it stops or dies.
+Only the owner holds the writer, so a request that arrives anywhere else is
+forwarded to the owner and answered from there. Reads are forwarded too, which
+is why a read always includes rows that are still in memory.
 
 ## Losing a node
-
-Read this part before you size a cluster on it, because durability and
-availability come apart here.
 
 **Nothing committed is lost.** A write is acknowledged only once a quorum of
 two replicas holds it, so the two survivors hold everything that was
 acknowledged, and the archive receives it behind them.
 
-**The tables that node owns stop answering.** Ownership is a pure function of
-the table name over the static member list, with no liveness in it, so a node
-that is away stays the owner of its tables. Requests for them are forwarded to
-it, retried for fifteen seconds, and then answered 502. Tables owned by the
-other two carry on untouched.
+**Its tables move to the survivors.** Every node renews a lease in the bucket.
+When a node's lease has gone unrenewed for the lease time plus a skew
+allowance, the survivors claim its tables, spread between them, and replay the
+log before serving. With the defaults that is about fifteen seconds. Until
+then a request for one of those tables is answered 503 with `Retry-After`.
 
-So a three-node cluster survives a node loss without losing data and without
-losing service to roughly two thirds of its tables. It is not a failover
-cluster for the remaining third. Bring the node back rather than waiting for
-the cluster to route around it.
-
-Ownership does move when membership itself changes, which today means
-Kubernetes endpoint discovery rather than the static list. `WALLEYE_MEMBERS`
-does not turn that on. A membership change moves stream ownership at once; the
-warming window that follows one applies to cached reads, not to which node
-owns a table. [A cluster](../self-hosting/cluster.md) is where that lives.
+A node that stops cleanly hands its tables over instead, and a survivor takes
+each one at once. [A cluster](../self-hosting/cluster.md#ownership-in-the-bucket)
+has the details.
 
 ## Fencing
 
-Ownership does not move under a node loss, so fencing is not about failover. It
-is about the paths that do hand a table's writer from one process to another —
-a restart, a reopen, an ownership change under endpoint discovery — because two
-writers for one table would be a lost-update machine. A new owner claims the
-next writer epoch through a compare-and-swap on the manifest, and from that
-moment the previous owner's appends and commits fail. In a cluster the replicas
-are fenced from the same claim, so a process that was slow rather than dead
-cannot write behind the new owner's back.
+Two writers for one table would be a lost-update machine, so every handover is
+fenced by one epoch: the Lance writer epoch, which the owner writes into the
+table's ownership record before its writer claims it through a
+compare-and-swap on the manifest. From that moment the previous writer's
+appends and commits fail. In a cluster the replicas are fenced from the same
+claim, so a process that was slow rather than dead cannot write behind the new
+owner's back.
 
-Forwarded requests carry the sender's view of the membership and are refused if
-the receiver's differs, and a forward that lands on a non-owner is refused
-rather than forwarded onward.
+A process also stops acting as an owner the moment its own lease lapses on its
+own clock, which is before any peer may take its tables, and it acknowledges a
+write only if it still owns the table after the rows are durable. A forward
+that lands on a non-owner is refused with 409 rather than forwarded onward.
 
 ## SQL across owners
 

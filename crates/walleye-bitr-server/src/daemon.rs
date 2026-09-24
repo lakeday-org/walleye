@@ -20,6 +20,26 @@ pub async fn run_from_env() -> Result<(), Box<dyn std::error::Error>> {
 /// that owns its own command line passes an empty list; reading argv here
 /// would make it inherit flags meant for the host.
 pub async fn run_with_arguments(arguments: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
+    run_until(arguments, async {
+        // A failed handler install surfaces as an immediate stop, which is
+        // what the replica did before when the signal stream failed.
+        let _ = shutdown_signal().await;
+    })
+    .await
+}
+
+/// Runs one combined replica until `stop` resolves, instead of until this
+/// process is signalled.
+///
+/// A host that embeds the replica decides when it goes. `walleye-node` hands
+/// its tables over on SIGTERM, and the handover appends and flushes through
+/// this replica's gateway, so the replica has to outlive the signal: if it
+/// listened for SIGTERM itself it would stop at the moment the host starts
+/// needing it most.
+pub async fn run_until(
+    arguments: Vec<String>,
+    stop: impl std::future::Future<Output = ()>,
+) -> Result<(), Box<dyn std::error::Error>> {
     if arguments == ["--verify-control-head-cas"] {
         let archive = build_archive()?;
         let result = cas_probe::verify(archive.object_store(), archive.prefix())
@@ -32,13 +52,16 @@ pub async fn run_with_arguments(arguments: Vec<String>) -> Result<(), Box<dyn st
         return Err("unsupported replica arguments".into());
     }
     let root_key = required("LAKEDAY_DATAPLANE_ROOT_KEY")?;
-    run_combined(&root_key).await
+    run_combined(&root_key, stop).await
 }
 
 /// Runs the two listeners owned by every direct Fly Machine. Storage remains
 /// private on port 9090 while every combined process exposes the same
 /// stateless coordinator surface on port 30080.
-async fn run_combined(root_key: &str) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_combined(
+    root_key: &str,
+    stop: impl std::future::Future<Output = ()>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let data_dir = env::var("LAKEDAY_REPLICA_DATA_DIR").unwrap_or_else(|_| "/data".to_owned());
     let data_dir = std::path::PathBuf::from(data_dir);
     let log_path = env::var("LAKEDAY_REPLICA_LOG")
@@ -134,7 +157,7 @@ async fn run_combined(root_key: &str) -> Result<(), Box<dyn std::error::Error>> 
         result = axum::serve(storage_listener, storage_app) => result.map_err(Into::into),
         result = axum::serve(gateway_listener, gateway_app) => result.map_err(Into::into),
         result = archive_loop(Arc::clone(&gateway), Arc::clone(&node)) => result,
-        result = shutdown_signal() => result.map_err(Into::into),
+        () = stop => Ok(()),
     };
     result
 }

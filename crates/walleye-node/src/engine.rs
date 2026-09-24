@@ -1,6 +1,7 @@
 //! One deployment's stream registry. Definitions use object-store create-if-absent;
 //! one designated ingress owns a separately locked memshard for each stream.
-use crate::cluster::{Cluster, NotOwner};
+use crate::cluster::{Cluster, NoOwner, NotOwner, StaleOwner};
+use crate::ownership::{LeaseConfig, Ownership, Refusal, Route};
 use arrow_array::{Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use base64::Engine as _;
@@ -25,7 +26,6 @@ use walleye_lance::{
     LanceStorageOptions, LsmStats, SearchRequest, SnapshotSource, Table, TableConfig,
     TableSnapshot, TextIndexSpec, VectorIndexSpec,
 };
-use walleye_ring::Node;
 
 /// Merge flushed generations once this many exist.
 pub const COMPACT_MIN_SSTABLES: usize = 8;
@@ -209,7 +209,7 @@ pub(crate) fn storage_type(kind: &str) -> Option<DataType> {
         _ => return None,
     })
 }
-fn valid_name(name: &str) -> bool {
+pub(crate) fn valid_name(name: &str) -> bool {
     !name.is_empty()
         && name
             .bytes()
@@ -394,9 +394,9 @@ struct Stream {
     /// [`MIN_HOLD`]. Two writers racing drive this up and back each other off;
     /// one turn that lasts puts it back to nothing.
     contention: std::sync::atomic::AtomicU32,
-    /// How to reach peers, for asking the writer that holds a stream to flush
-    /// it. Absent on a node with no cluster, which then has nobody to ask.
-    cluster: Option<Cluster>,
+    /// Who owns the table. A writer opens only while this process holds the
+    /// table's ownership record, at the epoch that record names.
+    owners: Arc<Ownership>,
 }
 impl Stream {
     /// Bytes this stream's writer may hold in memory: the memtable size and
@@ -516,98 +516,66 @@ impl Stream {
     /// failing the request over one is a flake, not a fault.
     const CLAIM_ATTEMPTS: usize = 5;
 
-    /// A refused claim this process can do something about.
+    /// Build this writer's durability and claim the table's writer epoch.
     ///
-    /// The refusal means the stream's acknowledged tail is in a log this
-    /// writer cannot read - another Bitr cluster, or a quorum where this node
-    /// has only the object store. Flushing puts those rows in shared storage,
-    /// and only the writer still holding the stream can flush them, because a
-    /// fenced writer's commit is rejected by epoch. So this asks it to, and
-    /// says whether the asking worked.
-    ///
-    /// Returns false for every other error, and for a tail whose holder left
-    /// no address, which is the case an operator has to settle by hand.
-    async fn drained_by_holder(&self, error: &Error) -> bool {
-        let Some(fault) = error.downcast_ref::<walleye_lance::LanceError>() else {
-            return false;
-        };
-        if !walleye_lance::is_unreachable_tail(fault) {
-            return false;
-        }
-        let Some(cluster) = &self.cluster else {
-            return false;
-        };
-        let holder = walleye_lance::open_tail_holder(
-            &self.storage,
-            &self.config.uri,
-            self.config.shard_id,
-            &self.config.stream,
-        )
-        .await;
-        let Ok(Some(holder)) = holder else {
+    /// The ownership record names the epoch first and the writer claims it
+    /// second, so the record and the MemWAL manifest agree on one fencing
+    /// epoch. Only the record's holder moves it, which is what makes the
+    /// writer's claim - a compare-and-swap anybody could win - land on the
+    /// number the record already says.
+    async fn claim_table(&self) -> Result<Table, Error> {
+        if let Some(writer) = &self.bitr
+            && walleye_lance::prepare_bitr_takeover(
+                &self.storage,
+                &self.config.uri,
+                self.config.shard_id,
+                &self.config.stream,
+                writer,
+            )
+            .await?
+        {
             eprintln!(
-                "walleye.storage open_tail stream={} outcome=held_elsewhere holder=unknown",
+                "walleye.storage takeover stream={} outcome=reset_wal_positions",
                 self.definition.name
             );
-            return false;
-        };
-        match cluster.ask_to_flush(&holder, &self.definition.name).await {
-            Ok(()) => {
-                eprintln!(
-                    "walleye.storage open_tail stream={} outcome=drained_by_holder holder={holder}",
-                    self.definition.name
-                );
-                true
-            }
-            Err(why) => {
-                eprintln!(
-                    "walleye.storage open_tail stream={} outcome=holder_refused holder={holder} error={why}",
-                    self.definition.name
-                );
-                false
-            }
         }
-    }
-
-    /// Build this writer's durability and claim the table.
-    ///
-    /// Separate from [`Self::table`] because a refused claim can sometimes be
-    /// made to succeed - by getting the writer that holds the stream to flush -
-    /// and the retry has to redo all of this: the Bitr identity is minted
-    /// against an epoch, and that epoch moves while we are asking.
-    async fn claim_table(&self) -> Result<Table, Error> {
-        let durability = match &self.bitr {
-            Some(writer) => {
-                if walleye_lance::prepare_bitr_takeover(
-                    &self.storage,
-                    &self.config.uri,
-                    self.config.shard_id,
-                    &self.config.stream,
-                    writer,
-                )
-                .await?
-                {
-                    eprintln!(
-                        "walleye.storage takeover stream={} outcome=reset_wal_positions",
-                        self.definition.name
-                    );
-                }
-                let epoch = walleye_lance::next_writer_epoch(
-                    &self.storage,
-                    &self.config.uri,
-                    self.config.shard_id,
-                )
+        let epoch =
+            walleye_lance::next_writer_epoch(&self.storage, &self.config.uri, self.config.shard_id)
                 .await?;
-                LanceDurability::Bitr(Arc::new(BitrWalBackend::new(
-                    writer.clone(),
-                    &self.config.stream,
-                    self.config.shard_id,
-                    epoch,
-                )?))
-            }
+        if !self.owners.set_epoch(&self.definition.name, epoch).await? {
+            return Err(Box::new(NotOwner {
+                table: self.definition.name.clone(),
+                owner: None,
+            }));
+        }
+        let durability = match &self.bitr {
+            Some(writer) => LanceDurability::Bitr(Arc::new(BitrWalBackend::new(
+                writer.clone(),
+                &self.config.stream,
+                self.config.shard_id,
+                epoch,
+            )?)),
             None => LanceDurability::ObjectStore,
         };
-        Ok(Table::open(self.config.clone(), self.storage.clone(), durability).await?)
+        let table = Table::open(self.config.clone(), self.storage.clone(), durability).await?;
+        // An open that overlapped another moved the manifest in between. The
+        // writer holds the later epoch and has fenced whatever held the
+        // earlier one, so the record follows it rather than the writer being
+        // thrown away after its claim.
+        let claimed = table.writer_epoch();
+        if claimed != epoch
+            && !self
+                .owners
+                .set_epoch(&self.definition.name, claimed)
+                .await?
+        {
+            let _ = table.close().await;
+            return Err(Box::new(NotOwner {
+                table: self.definition.name.clone(),
+                owner: None,
+            }));
+        }
+        Ok(table)
     }
 
     async fn table(&self) -> Result<MappedMutexGuard<'_, Table>, Error> {
@@ -628,12 +596,6 @@ impl Stream {
                     Ok(table) => {
                         opened = Some(table);
                         break;
-                    }
-                    Err(error) if self.drained_by_holder(&error).await => {
-                        // The holder flushed, so the tail is in shared storage
-                        // and this writer can read it. Claim again from
-                        // scratch: the epoch has moved while we were asking.
-                        continue;
                     }
                     // Two opens overlapping, one of which committed the epoch
                     // first. Nothing is wrong and nothing was fenced; the
@@ -656,6 +618,7 @@ impl Stream {
                 }
             }
             let Some(opened) = opened else {
+                *self.lease.lock().await = None;
                 return Err(Box::new(walleye_lance::LanceError::io(format!(
                     "could not claim the writer for {} after {} attempts; another opener keeps \
                      winning the race",
@@ -745,7 +708,10 @@ pub struct Engine {
     // Requests share this read lock; shutdown waits for all active requests.
     closed: RwLock<bool>,
     writer: Option<Arc<QuorumWriter>>,
-    cluster: Option<Cluster>,
+    cluster: Cluster,
+    owners: Arc<Ownership>,
+    /// The lease renewer and the bucket sampler, stopped with the engine.
+    background: Vec<tokio::task::AbortHandle>,
     /// The one crossing out of a worker's isolate.
     reach: Arc<dyn walleye_v8::Host>,
 }
@@ -760,8 +726,10 @@ impl Engine {
         config: ApiConfig,
         cache: CachedStorage,
         params: ObjectStoreParams,
-        cluster: Option<Cluster>,
+        cluster: Cluster,
+        lease: LeaseConfig,
     ) -> Result<Self, Error> {
+        lease.validate()?;
         let (catalog, prefix) = ObjectStore::from_uri_and_params(
             Arc::new(ObjectStoreRegistry::default()),
             &config.root_uri,
@@ -792,6 +760,41 @@ impl Engine {
         } else {
             None
         };
+        let owners = Arc::new(Ownership::new(
+            catalog.inner.clone(),
+            prefix.clone(),
+            &cluster.node_id,
+            cluster.endpoint.clone(),
+            lease,
+        ));
+        // A lease before anything else: nothing may be claimed without one.
+        let mut published = false;
+        for _ in 0..5 {
+            if owners.renew().await {
+                published = true;
+                break;
+            }
+        }
+        if !published {
+            return Err("could not publish this process's lease in the bucket".into());
+        }
+        let background = vec![
+            tokio::spawn({
+                let owners = owners.clone();
+                async move { owners.renew_forever().await }
+            })
+            .abort_handle(),
+            tokio::spawn({
+                let owners = owners.clone();
+                async move { owners.sample_forever().await }
+            })
+            .abort_handle(),
+        ];
+        eprintln!(
+            "walleye.ownership start node={} addr={}",
+            owners.node(),
+            cluster.endpoint
+        );
         let engine = Self {
             config,
             cache,
@@ -808,6 +811,8 @@ impl Engine {
             closed: RwLock::new(false),
             writer,
             cluster,
+            owners,
+            background,
             reach: crate::reach::Reach::new(
                 crate::reach::Allowed::from_env(),
                 tokio::runtime::Handle::current(),
@@ -818,12 +823,7 @@ impl Engine {
     }
     async fn register(&self, definition: StreamDefinition) -> Result<Arc<Stream>, Error> {
         let mut config = definition.table_config(&self.config.root_uri)?;
-        // Say where this writer answers, so a process that finds the stream
-        // held here can ask it to drain rather than only being told no.
-        if let Some(endpoint) = self.cluster.as_ref().and_then(Cluster::self_endpoint) {
-            config = config.with_holder(endpoint);
-        }
-        // And name the log this writer appends to. Every process pointed at
+        // Name the log this writer appends to. Every process pointed at
         // one Bitr gateway spells it the same way, and every process without
         // one is writing the object store's own WAL, which they all share.
         config = config.with_log(match &self.config.bitr_url {
@@ -852,38 +852,171 @@ impl Engine {
                 seq: Mutex::new(None),
                 claimed_at: Mutex::new(None),
                 contention: std::sync::atomic::AtomicU32::new(0),
-                cluster: self.cluster.clone(),
+                owners: self.owners.clone(),
             })
         });
         Ok(stream.clone())
     }
-    /// The member that owns `name`, or `None` when this node does. Single
-    /// node deployments own everything.
-    pub fn owner(&self, name: &str) -> Option<Node> {
-        self.cluster.as_ref().and_then(|c| c.owner(name))
+    pub fn cluster(&self) -> &Cluster {
+        &self.cluster
     }
-    pub fn cluster(&self) -> Option<&Cluster> {
-        self.cluster.as_ref()
+    pub fn ownership(&self) -> &Ownership {
+        &self.owners
     }
+    /// Where requests for `name` go, claiming it here when nobody live owns
+    /// it. `fresh` reads the bucket rather than the last sample. Never
+    /// answers [`Route::Unowned`]: a table this process cannot take is a
+    /// [`NoOwner`] error with the wait before trying again.
+    pub async fn route(&self, name: &str, fresh: bool) -> Result<Route, Error> {
+        match self.owners.resolve(name, fresh).await? {
+            Route::Unowned => {}
+            route => return Ok(route),
+        }
+        if self.owners.draining() {
+            // A process on its way out takes nothing. Send the request to the
+            // live process that should, which claims it on arrival.
+            let me = self.owners.node();
+            return match self.owners.preferred(name) {
+                Some(peer) if peer.node != me => Ok(Route::Remote {
+                    peer,
+                    verdict_in: self.owners.config().sample(),
+                }),
+                _ => Err(Box::new(NoOwner {
+                    table: name.to_owned(),
+                    retry_after: self.owners.config().sample(),
+                })),
+            };
+        }
+        match self.owners.claim(name).await? {
+            Ok(epoch) => {
+                self.open_claimed(name).await;
+                Ok(Route::Local { epoch })
+            }
+            Err(Refusal::Owned { peer, verdict_in }) => Ok(Route::Remote { peer, verdict_in }),
+            Err(Refusal::NotNow { retry_after }) => Err(Box::new(NoOwner {
+                table: name.to_owned(),
+                retry_after,
+            })),
+        }
+    }
+    /// Open a table just claimed, replaying whatever its previous owner left
+    /// in the log, and learn where its arrival numbers stand - before the
+    /// request that claimed it takes the process's write lock, so tables
+    /// taken over together are not opened one after another under it. A
+    /// table not in the catalog yet is being created, and opens then.
+    async fn open_claimed(&self, name: &str) {
+        let Ok(stream) = self.definition(name).await else {
+            return;
+        };
+        let started = Instant::now();
+        if let Err(error) = stream.table().await.map(drop) {
+            eprintln!("walleye.ownership open table={name} outcome=error error={error}");
+            return;
+        }
+        let mut seq = stream.seq.lock().await;
+        if seq.is_none()
+            && let Ok(high) = self.highest_seq(name).await
+        {
+            *seq = Some(high.max(now_micros()));
+        }
+        eprintln!(
+            "walleye.ownership open table={name} elapsed_ms={}",
+            started.elapsed().as_millis()
+        );
+    }
+    /// Resolves once `node` has gone a whole lease verdict without renewing,
+    /// on this process's clock. A lease that disappears counts from when it
+    /// did: a holder that retires it is still answering what it was already
+    /// sent, and one whose lease was collected lapsed long ago.
+    pub async fn lease_lapses(&self, node: String) {
+        let mut gone_since: Option<Instant> = None;
+        loop {
+            tokio::time::sleep(self.owners.config().sample()).await;
+            match self.owners.liveness(&node, true).await {
+                Ok(crate::ownership::Liveness::Lapsed) => return,
+                Ok(crate::ownership::Liveness::Gone) => {
+                    let since = *gone_since.get_or_insert_with(Instant::now);
+                    if since.elapsed() >= self.owners.config().verdict() {
+                        return;
+                    }
+                }
+                Ok(crate::ownership::Liveness::Live { .. }) | Err(_) => gone_since = None,
+            }
+        }
+    }
+
     /// The one memory and disk budget every allocation in this process
     /// borrows from.
     pub fn resources(&self) -> &Arc<walleye_cache::QueryResources> {
         &self.cache.resources
     }
-    /// A stream this node may write: its definition, after confirming
-    /// ownership. A stream that moved to another member has its local writer
-    /// closed so the new owner's epoch claim is the only live writer.
+    /// A stream this process owns, claiming it if nobody live does. One that
+    /// another process owns has any local writer closed, so the owner's is
+    /// the only live one.
     async fn stream(&self, name: &str) -> Result<Arc<Stream>, Error> {
         let stream = self.definition(name).await?;
-        if let Some(owner) = self.owner(name) {
-            if let Some(mut table) = stream.table.lock().await.take() {
-                let _ = table.checkpoint().await;
-                let _ = table.close().await;
-            }
-            *stream.lease.lock().await = None;
-            return Err(Box::new(NotOwner(owner)));
+        if self.owners.holds(name).is_some() {
+            return Ok(stream);
         }
-        Ok(stream)
+        match self.route(name, false).await {
+            Ok(Route::Local { .. }) => Ok(stream),
+            Ok(Route::Remote { peer, .. }) => {
+                close_writer(&stream).await;
+                Err(Box::new(NotOwner {
+                    table: name.to_owned(),
+                    owner: Some(peer),
+                }))
+            }
+            Ok(Route::Unowned) => Err(Box::new(NoOwner {
+                table: name.to_owned(),
+                retry_after: self.owners.config().sample(),
+            })),
+            Err(error) => {
+                close_writer(&stream).await;
+                Err(error)
+            }
+        }
+    }
+    /// Close the writers of tables this process stopped owning without
+    /// releasing them. They are not flushed: another process may have their
+    /// epoch by now, and a fenced writer cannot flush anyway.
+    pub async fn close_lost(&self) {
+        for name in self.owners.take_lost() {
+            let stream = self.streams.lock().await.get(&name).cloned();
+            if let Some(stream) = stream {
+                close_writer(&stream).await;
+                eprintln!("walleye.ownership lost table={name} writer=closed");
+            }
+        }
+    }
+    /// Claim what nobody live owns and this process should, by rendezvous
+    /// over the live leases, and open what it claims so a dead owner's log
+    /// is replayed now rather than on the first request. Returns the tables
+    /// claimed.
+    pub async fn sweep(&self) -> Vec<String> {
+        self.close_lost().await;
+        if !self.owners.settled() || self.owners.draining() {
+            return Vec::new();
+        }
+        if let Err(error) = self.refresh_catalog().await {
+            eprintln!("walleye.ownership sweep stage=catalog outcome=error error={error}");
+            return Vec::new();
+        }
+        let names: Vec<String> = self.streams.lock().await.keys().cloned().collect();
+        let mut claimed = Vec::new();
+        for name in self.owners.orphaned(&names) {
+            match self.owners.claim(&name).await {
+                Ok(Ok(_)) => claimed.push(name),
+                Ok(Err(_)) => {}
+                Err(error) => {
+                    eprintln!("walleye.ownership sweep table={name} outcome=error error={error}")
+                }
+            }
+        }
+        if !claimed.is_empty() {
+            self.warm_tables(claimed.clone()).await;
+        }
+        claimed
     }
     /// The registered definition, loading it from the catalog if needed.
     /// Does not open a writer and does not check ownership.
@@ -1065,7 +1198,8 @@ impl Engine {
                     return Err(Box::new(TableExists(definition.name.clone())));
                 }
                 // The stored definition carries any index changes made since creation.
-                let stream = self.register(existing).await?;
+                self.register(existing).await?;
+                let stream = self.stream(&definition.name).await?;
                 drop(stream.table().await?);
                 return Ok(());
             }
@@ -1074,7 +1208,9 @@ impl Engine {
                 return Err(error.into());
             }
         }
-        let stream = self.register(definition).await?;
+        let name = definition.name.clone();
+        self.register(definition).await?;
+        let stream = self.stream(&name).await?;
         drop(stream.table().await?);
         Ok(())
     }
@@ -1239,7 +1375,17 @@ impl Engine {
         // caller sees a slower write rather than a refused one.
         for attempt in 0..Self::RECLAIM_ATTEMPTS {
             let outcome = async {
-                stream.table().await?.append(batches.clone()).await?;
+                let mut table = stream.table().await?;
+                let epoch = table.writer_epoch();
+                table.append(batches.clone()).await?;
+                // Acknowledge only as the owner, at the epoch this writer
+                // holds, checked after the rows are durable rather than only
+                // before they were sent.
+                if !self.owners.confirm(&stream.definition.name, epoch) {
+                    drop(table);
+                    close_writer(stream).await;
+                    return Err(Box::new(StaleOwner(stream.definition.name.clone())) as Error);
+                }
                 Ok::<(), Error>(())
             }
             .await;
@@ -1253,15 +1399,17 @@ impl Engine {
             };
             // A fence means somebody else claimed this stream's writer.
             // Reopening claims it straight back, because claiming is the only
-            // way an epoch ever moves, so a node that reopens a stream it no
-            // longer owns takes the writer from the node that does. Both then
-            // answer 200 for writes to the same stream while stealing it from
-            // each other, and neither client is told anything is wrong.
+            // way an epoch ever moves, so a process that reopens a table it no
+            // longer owns takes the writer from the one that does.
             //
-            // Only a node that still owns the stream may reopen. One that does
-            // not says so, and the owner is named so the caller can go there.
-            if let Some(owner) = self.owner(&stream.definition.name) {
-                return Err(Box::new(NotOwner(owner)));
+            // Only the owner may reopen. The rows of the fenced attempt did
+            // not reach the log, since the fence refused them.
+            if self.owners.holds(&stream.definition.name).is_none() {
+                close_writer(stream).await;
+                return Err(Box::new(NotOwner {
+                    table: stream.definition.name.clone(),
+                    owner: None,
+                }));
             }
             if !stream.discard_fenced_writer(reason).await {
                 return Err(error);
@@ -1361,14 +1509,15 @@ impl Engine {
     /// first request after startup does not pay the writer open, WAL replay,
     /// and index loads. Errors are logged per stream and never fatal.
     pub async fn warm(&self) {
-        let names = match self.table_names().await {
-            Ok(names) => names,
-            Err(error) => {
-                eprintln!("walleye.storage warm stage=catalog outcome=error error={error}");
-                return;
-            }
-        };
-        let owned = names.into_iter().filter(|n| self.owner(n).is_none());
+        if let Err(error) = self.load_catalog().await {
+            eprintln!("walleye.storage warm stage=catalog outcome=error error={error}");
+            return;
+        }
+        self.warm_tables(self.owners.held_tables()).await;
+    }
+    /// Open the named tables this process owns, within half the budget.
+    async fn warm_tables(&self, names: Vec<String>) {
+        let owned = names.into_iter().filter(|n| self.owners.holds(n).is_some());
         // Warming is an optimization: it opens streams before their first
         // request. It must leave room for the streams a client opens next, so
         // it plans against what each stream will hold and takes at most half
@@ -1496,6 +1645,10 @@ impl Engine {
             streams.remove(name);
         }
         let dropped = self.drop_objects(name).await;
+        // The name is free for anyone to create again.
+        if let Err(error) = self.owners.release(name).await {
+            eprintln!("walleye.ownership release table={name} outcome=error error={error}");
+        }
         self.dropping.lock().await.remove(name);
         dropped
     }
@@ -1625,19 +1778,17 @@ impl Engine {
         &self,
         sql: &str,
     ) -> Result<(Vec<GatheredTable>, Vec<walleye_cache::MemoryLease>), Error> {
-        let Some(cluster) = &self.cluster else {
-            return Ok((Vec::new(), Vec::new()));
-        };
         let mut gathered = Vec::new();
         let mut leases = Vec::new();
         for name in walleye_lance::sql_table_names(sql)? {
-            let Some(owner) = cluster.owner(&name) else {
-                continue;
-            };
             if !self.streams.lock().await.contains_key(&name) {
                 continue;
             }
-            let bytes = cluster.fetch_snapshot(&owner, &name).await?;
+            let owner = match self.route(&name, false).await? {
+                Route::Remote { peer, .. } => peer,
+                Route::Local { .. } | Route::Unowned => continue,
+            };
+            let bytes = self.cluster.fetch_snapshot(&owner, &name).await?;
             leases.push(self.cache.resources.reserve_memory(
                 &format!("gathered table {name}"),
                 bytes.len().saturating_mul(2),
@@ -1744,18 +1895,85 @@ impl Engine {
             Err(error) => Err(error),
         }
     }
+    /// Hand every table back and leave: stop claiming, flush and close each
+    /// owned table's writer, release its record at the same epoch so a peer
+    /// or a replacement claims it at once, then remove the lease. A request
+    /// for a released table is forwarded to the process that should claim it.
+    pub async fn release_all(&self) {
+        if self.owners.draining() {
+            return;
+        }
+        let started = Instant::now();
+        self.owners.drain().await;
+        let held = self.owners.held_tables();
+        let count = held.len();
+        futures::stream::iter(held)
+            .for_each_concurrent(8, |name| async move {
+                let stream = self.streams.lock().await.get(&name).cloned();
+                // Hold the writer slot across the release, so no write opens
+                // a new writer between the flush and the record naming nobody.
+                let guard = match &stream {
+                    Some(stream) => {
+                        let mut guard = stream.table.lock().await;
+                        if let Some(mut table) = guard.take() {
+                            if let Err(error) = table.checkpoint().await {
+                                eprintln!(
+                                    "walleye.ownership release table={name} stage=flush outcome=error error={error}"
+                                );
+                            }
+                            let _ = table.close().await;
+                        }
+                        *stream.lease.lock().await = None;
+                        Some(guard)
+                    }
+                    None => None,
+                };
+                if let Err(error) = self.owners.release(&name).await {
+                    eprintln!("walleye.ownership release table={name} outcome=error error={error}");
+                }
+                drop(guard);
+            })
+            .await;
+        self.owners.retire().await;
+        eprintln!(
+            "walleye.ownership released tables={count} elapsed_ms={}",
+            started.elapsed().as_millis()
+        );
+    }
     pub async fn close(&self) {
+        self.release_all().await;
         let mut closed = self.closed.write().await;
         *closed = true;
         let streams = std::mem::take(&mut *self.streams.lock().await);
         futures::future::join_all(streams.into_values().map(|stream| async move {
-            if let Some(mut table) = stream.table.lock().await.take() {
-                let _ = table.checkpoint().await;
-                let _ = table.close().await;
-            }
+            close_writer(&stream).await;
         }))
         .await;
+        for task in &self.background {
+            task.abort();
+        }
     }
+}
+impl Drop for Engine {
+    fn drop(&mut self) {
+        for task in &self.background {
+            task.abort();
+        }
+    }
+}
+/// Close a table's writer without flushing it, and return its memory.
+async fn close_writer(stream: &Stream) {
+    let taken = stream.table.lock().await.take();
+    if let Some(table) = taken {
+        let closing = tokio::time::timeout(std::time::Duration::from_secs(10), table.close());
+        if closing.await.is_err() {
+            eprintln!(
+                "walleye.storage writer_close stream={} outcome=timeout",
+                stream.definition.name
+            );
+        }
+    }
+    *stream.lease.lock().await = None;
 }
 /// Merge generations without holding the table lock, then delete the replaced
 /// directories once every snapshot taken before the swap has timed out.
@@ -2010,6 +2228,14 @@ mod tests {
         writer: Option<Arc<QuorumWriter>>,
         cache_id: &str,
     ) -> Engine {
+        engine_with(dir, writer, cache_id, LeaseConfig::default()).await
+    }
+    async fn engine_with(
+        dir: &std::path::Path,
+        writer: Option<Arc<QuorumWriter>>,
+        cache_id: &str,
+        lease: LeaseConfig,
+    ) -> Engine {
         let cache = CachedStorage::open(
             dir.join(cache_id),
             "test",
@@ -2027,7 +2253,8 @@ mod tests {
             },
             cache,
             ObjectStoreParams::default(),
-            None,
+            Cluster::new(cache_id.into(), "http://127.0.0.1:1".into(), "token".into()).unwrap(),
+            lease,
         )
         .await
         .unwrap();
@@ -2217,6 +2444,102 @@ mod tests {
         reopened.close().await;
         reopened.cache.backend.close().await.unwrap();
     }
+    /// Two engines over one root, the first holding table `t` with one row
+    /// and a second write waiting inside it - past its ownership check, at the
+    /// writer - when it stops renewing its lease and the second takes `t`.
+    /// The first is leaked, so the write in flight can outlive this function.
+    async fn a_write_in_flight_across_a_takeover(
+        dir: &std::path::Path,
+    ) -> (
+        &'static Engine,
+        Engine,
+        impl std::future::Future<Output = Result<usize, Error>>,
+    ) {
+        let lease = LeaseConfig {
+            ttl_ms: 600,
+            skew_ms: 100,
+            sample_ms: 100,
+        };
+        let a: &'static Engine =
+            Box::leak(Box::new(engine_with(dir, None, "a", lease.clone()).await));
+        let b = engine_with(dir, None, "b", lease).await;
+        a.define(definition("t")).await.unwrap();
+        a.ingest("t", vec![json!({"id":1,"value":1})])
+            .await
+            .unwrap();
+        let stream = a.stream("t").await.unwrap();
+        let guard = stream.table().await.unwrap();
+        let mut pending = Box::pin(a.ingest("t", vec![json!({"id":2,"value":2})]));
+        assert!(futures::poll!(&mut pending).is_pending());
+        // A stops renewing, as a paused or partitioned process does.
+        for task in &a.background {
+            task.abort();
+        }
+        let started = Instant::now();
+        loop {
+            if let Ok(Ok(_)) = b.owners.claim("t").await {
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "b never took t"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(a.owners.holds("t"), None, "a stopped acting as owner first");
+        drop(guard);
+        (a, b, pending)
+    }
+
+    /// The write reached the log before the new owner opened its writer, but
+    /// the old owner no longer owned the table when it would have answered, so
+    /// it does not acknowledge it. The new owner replays the row: the outcome
+    /// the client was told is unknown turns out to be stored, once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_write_is_acknowledged_only_while_its_writer_still_owns_the_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_a, b, pending) = a_write_in_flight_across_a_takeover(dir.path()).await;
+        let refused = pending.await.unwrap_err();
+        assert!(
+            refused.downcast_ref::<StaleOwner>().is_some(),
+            "refused at acknowledgement: {refused}"
+        );
+        let rows: serde_json::Value = serde_json::from_slice(
+            &b.query("SELECT count(*) AS n, count(DISTINCT id) AS d FROM t")
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(rows, json!([{"n":2,"d":2}]));
+    }
+
+    /// The new owner opened its writer first, which fences the old one: the
+    /// write is refused by the log itself, not written, and the old owner does
+    /// not take the writer back.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_write_behind_the_new_owners_writer_is_fenced_and_not_retaken() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b, pending) = a_write_in_flight_across_a_takeover(dir.path()).await;
+        b.ingest("t", vec![json!({"id":3,"value":3})])
+            .await
+            .unwrap();
+        let refused = pending.await.unwrap_err();
+        assert!(
+            refused.downcast_ref::<NotOwner>().is_some()
+                || refused.downcast_ref::<StaleOwner>().is_some(),
+            "refused rather than retaken: {refused}"
+        );
+        assert_eq!(a.owners.holds("t"), None);
+        let rows: serde_json::Value =
+            serde_json::from_slice(&b.query("SELECT id FROM t ORDER BY id").await.unwrap())
+                .unwrap();
+        assert_eq!(
+            rows,
+            json!([{"id":1},{"id":3}]),
+            "the fenced write is not stored"
+        );
+    }
+
     #[tokio::test]
     async fn object_store_streams_progress_independently_and_reopen() {
         check_independent_streams(false).await;
@@ -2793,6 +3116,8 @@ impl Engine {
         if self.definition(source).await.is_err() {
             return Ok(idle);
         }
+        // Reading the source opens its writer, which only its owner may do.
+        self.stream(source).await?;
         let pick = format!(
             "SELECT * FROM \"{source}\" WHERE {HIDDEN_SEQ} > {cursor} \
              ORDER BY {HIDDEN_SEQ} LIMIT {}",
@@ -3088,9 +3413,11 @@ impl Engine {
                 let Ok(view) = self.view(name).await else {
                     continue;
                 };
-                if let Some(source) = &view.source
-                    && self.owner(source).is_some()
-                {
+                // The owner of a view's source drives it, and the owner of the
+                // cursors table drives the views with no source, so exactly
+                // one process runs each.
+                let driver = view.source.as_deref().unwrap_or(CURSORS);
+                if !matches!(self.route(driver, false).await, Ok(Route::Local { .. })) {
                     continue;
                 }
                 let outcome = self.refresh_view(name).await;
@@ -3120,6 +3447,7 @@ impl Engine {
         if self.definition(CURSORS).await.is_err() {
             return Ok(0);
         }
+        self.stream(CURSORS).await?;
         let sql = format!(
             "SELECT position FROM \"{CURSORS}\" WHERE consumer = '{}'",
             consumer.replace('\'', "''")
