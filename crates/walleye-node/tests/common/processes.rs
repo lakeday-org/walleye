@@ -15,7 +15,11 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::net::TcpListener;
-use walleye_bitr_server::{DiskReplica, OpaqueArchive, ReplicaNode, gateway_router, node_router};
+use walleye_bitr_server::{
+    DiskReplica, INTERNAL_AUTH_HEADER, OpaqueArchive, ReplicaNode,
+    daemon::{CombinedReplica, serve_combined},
+    gateway_router, node_router,
+};
 use walleye_node::{ApiConfig, Config, LeaseConfig, Service, cluster, router};
 use walleye_ring::Node;
 
@@ -61,6 +65,31 @@ impl Proc {
         bitr: Option<&str>,
         lease: LeaseConfig,
     ) -> Self {
+        Self::start_inner(node_id, root, cache, bitr, lease, None).await
+    }
+
+    /// Start a launch node: the engine and, in the same process, its own
+    /// replica and coordinator, as one Machine runs them. Killing it kills
+    /// both.
+    pub async fn start_launch(
+        node_id: &str,
+        root: &str,
+        cache: &std::path::Path,
+        lease: LeaseConfig,
+        replica: CombinedReplica,
+    ) -> Self {
+        let gateway = format!("http://{}", replica.gateway_address);
+        Self::start_inner(node_id, root, cache, Some(&gateway), lease, Some(replica)).await
+    }
+
+    async fn start_inner(
+        node_id: &str,
+        root: &str,
+        cache: &std::path::Path,
+        bitr: Option<&str>,
+        lease: LeaseConfig,
+        replica: Option<CombinedReplica>,
+    ) -> Self {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
@@ -88,7 +117,18 @@ impl Proc {
                 .enable_all()
                 .build()
                 .unwrap();
-            runtime.block_on(async move {
+            let replica = async move {
+                match replica {
+                    Some(replica) => {
+                        if let Err(error) = serve_combined(replica, std::future::pending()).await {
+                            eprintln!("test replica stopped: {error}");
+                        }
+                        std::future::pending::<()>().await
+                    }
+                    None => std::future::pending::<()>().await,
+                }
+            };
+            let engine = async move {
                 let service = Service::open(config).await.unwrap();
                 let app = router(service.clone());
                 use axum::serve::ListenerExt;
@@ -132,6 +172,14 @@ impl Proc {
                             return;
                         }
                     }
+                }
+            };
+            // The replica runs beside the engine for as long as the engine
+            // does, and stops with it.
+            runtime.block_on(async move {
+                tokio::select! {
+                    () = engine => {}
+                    () = replica => {}
                 }
             });
             // Wait for the workers to stop, so a killed process's port is
@@ -309,15 +357,7 @@ pub async fn exactly_once(base: &str, table: &str, acknowledged: &[i64]) {
 /// every process in a test appends to, as the three members of a launch
 /// instance do.
 pub async fn bitr(dir: &std::path::Path) -> (String, Vec<tokio::task::JoinHandle<()>>) {
-    static KEYS: std::sync::Once = std::sync::Once::new();
-    KEYS.call_once(|| {
-        // SAFETY: set once, before any process in this binary reads them, and
-        // to the same values every test would set.
-        unsafe {
-            std::env::set_var("LAKEDAY_DATAPLANE_ROOT_KEY", STANDARD.encode(ROOT_KEY));
-            std::env::set_var("WALLEYE_DATA_KEY", STANDARD.encode([9_u8; 32]));
-        }
-    });
+    keys();
     let encoded = STANDARD.encode(ROOT_KEY);
     let mut tasks = Vec::new();
     let mut members = Vec::new();
@@ -505,5 +545,125 @@ pub fn each_occurrence_once(runs: &[(u64, u64)]) {
             (missed + 1) * 1000,
             "occurrences between {previous} and {at} are unaccounted for: {runs:?}"
         );
+    }
+}
+
+/// The deployment keys every engine and replica in this binary reads.
+fn keys() {
+    static KEYS: std::sync::Once = std::sync::Once::new();
+    KEYS.call_once(|| {
+        // SAFETY: set once, before any process in this binary reads them, and
+        // to the same values every test would set.
+        unsafe {
+            std::env::set_var("LAKEDAY_DATAPLANE_ROOT_KEY", STANDARD.encode(ROOT_KEY));
+            std::env::set_var("WALLEYE_DATA_KEY", STANDARD.encode([9_u8; 32]));
+        }
+    });
+}
+
+/// Three launch nodes' fixed identities: each one's replica name, data
+/// directory and addresses, which a restart reuses, and the archive they
+/// share.
+pub struct Launch {
+    pub root: String,
+    pub archive: Arc<OpaqueArchive>,
+    pub members: Vec<ReplicaNode>,
+    gateways: Vec<String>,
+    data: std::path::PathBuf,
+}
+
+fn free_address() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.local_addr().unwrap().to_string()
+}
+
+impl Launch {
+    pub fn new(dir: &std::path::Path) -> Self {
+        keys();
+        let store: Arc<dyn object_store_bitr::ObjectStore> =
+            Arc::new(object_store_bitr::memory::InMemory::new());
+        let archive = Arc::new(OpaqueArchive::new(store, "bitr", 16).expect("archive"));
+        let members = (0..3)
+            .map(|i| ReplicaNode::new(format!("node-{i}"), format!("http://{}", free_address())))
+            .collect();
+        Self {
+            root: format!("file://{}/store", dir.display()),
+            archive,
+            members,
+            gateways: (0..3).map(|_| free_address()).collect(),
+            data: dir.join("replicas"),
+        }
+    }
+
+    /// The replica half of node `index`, on the same volume every time.
+    pub fn replica(&self, index: usize) -> CombinedReplica {
+        let name = format!("node-{index}");
+        let data_dir = self.data.join(&name);
+        std::fs::create_dir_all(&data_dir).unwrap();
+        CombinedReplica {
+            root_key: STANDARD.encode(ROOT_KEY),
+            log_path: data_dir.join("replica.log"),
+            control_path: data_dir.join("control.json"),
+            data_dir,
+            node_name: name,
+            tier: "nvme".into(),
+            members: self.members.clone(),
+            internal_token: INTERNAL.into(),
+            admin_token: String::new(),
+            quorum: 2,
+            archive: Arc::clone(&self.archive),
+            storage_address: self.members[index]
+                .url
+                .trim_start_matches("http://")
+                .to_owned(),
+            gateway_address: self.gateways[index].clone(),
+        }
+    }
+
+    /// Start node `index`, engine and replica together.
+    pub async fn start(&self, index: usize, cache: &std::path::Path, lease: LeaseConfig) -> Proc {
+        Proc::start_launch(
+            &format!("node-{index}"),
+            &self.root,
+            cache,
+            lease,
+            self.replica(index),
+        )
+        .await
+    }
+
+    /// How far node `index`'s replica holds each stream: the highest LSN in
+    /// its log or in the archived prefix it has trimmed. `None` while the
+    /// node is not answering.
+    pub async fn positions(&self, index: usize) -> Option<BTreeMap<String, u64>> {
+        let snapshot: Value = client()
+            .get(format!("{}/internal/v1/records", self.members[index].url))
+            .header(INTERNAL_AUTH_HEADER, INTERNAL)
+            .query(&[("stream", "*")])
+            .send()
+            .await
+            .ok()?
+            .json()
+            .await
+            .ok()?;
+        let mut positions = BTreeMap::new();
+        for record in snapshot["records"].as_array()? {
+            let (Some(stream), Some(lsn)) = (record["stream"].as_str(), record["lsn"].as_u64())
+            else {
+                continue;
+            };
+            let entry = positions.entry(stream.to_owned()).or_insert(0);
+            *entry = (*entry).max(lsn);
+        }
+        for prefix in snapshot["trimmed"].as_array()? {
+            let (Some(stream), Some(lsn)) =
+                (prefix["stream"].as_str(), prefix["archived_lsn"].as_u64())
+            else {
+                continue;
+            };
+            let entry = positions.entry(stream.to_owned()).or_insert(0);
+            *entry = (*entry).max(lsn);
+        }
+        Some(positions)
     }
 }

@@ -48,7 +48,10 @@ cache alone will squeeze one of them.
 
 Losing that disk is still not losing data — a quorum of two held every
 acknowledged write, and the replica re-seeds from the archive and catches up
-from its peers when it comes back. It is slower than losing a pure cache.
+from its peers when it comes back. So does a node that restarts with its disk
+intact but missed writes while it was down. A replica counts towards a quorum
+only for positions it holds, so one that is behind never stands in for a
+complete copy. It is slower than losing a pure cache.
 
 That is why a stop, a restart and a resize are all safe, and why a cold node is
 slow rather than wrong.

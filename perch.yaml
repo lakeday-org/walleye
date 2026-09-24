@@ -257,3 +257,17 @@
     only between alarm firings. Moving a key anywhere but to its placement, or
     moving keys a process is placed to hold, is what turns rebalancing into
     keys moving for ever.
+
+- name: a-replica-counts-only-for-positions-it-holds
+  where: mentions catch_up_member
+  each: method
+  min: 75
+  ensure: >
+    A replica counts towards a write quorum only for positions it actually
+    holds: an append is acknowledged by a member only when the member holds
+    the predecessor, and a member behind is caught up before it is counted,
+    never counted while it is still catching up. Catch-up copies only records
+    that are committed and agree across their copies, in LSN order, and
+    withdraws a member's own record only when a newer writer's committed
+    record replaced it. Counting a member for a position it lacks, or copying
+    an uncommitted record, lets a second failure lose an acknowledged write.

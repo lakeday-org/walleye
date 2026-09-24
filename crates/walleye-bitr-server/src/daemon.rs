@@ -55,6 +55,27 @@ pub async fn run_until(
     run_combined(&root_key, stop).await
 }
 
+/// Everything one combined replica process needs, however it was configured.
+#[derive(Clone)]
+pub struct CombinedReplica {
+    pub root_key: String,
+    pub data_dir: std::path::PathBuf,
+    pub log_path: std::path::PathBuf,
+    pub control_path: std::path::PathBuf,
+    pub node_name: String,
+    pub tier: String,
+    pub members: Vec<crate::ReplicaNode>,
+    pub internal_token: String,
+    pub admin_token: String,
+    pub quorum: usize,
+    pub archive: Arc<OpaqueArchive>,
+    /// Where the private storage listener binds, which peers reach at this
+    /// member's address. Bound only once the member is seeded.
+    pub storage_address: String,
+    /// Where the coordinator binds, which the local engine reaches.
+    pub gateway_address: String,
+}
+
 /// Runs the two listeners owned by every direct Fly Machine. Storage remains
 /// private on port 9090 while every combined process exposes the same
 /// stateless coordinator surface on port 30080.
@@ -67,12 +88,62 @@ async fn run_combined(
     let log_path = env::var("LAKEDAY_REPLICA_LOG")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| data_dir.join("replica.log"));
-    let node_name = required_nonempty("LAKEDAY_REPLICA_NODE_NAME")?;
-    let tier = required_nonempty("LAKEDAY_REPLICA_TIER")?;
-    let initial_nodes = direct_nodes()?;
     let control_path = env::var("LAKEDAY_REPLICA_CONTROL_PATH")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| crate::control_state_path(&data_dir));
+    let quorum = env::var("LAKEDAY_REPLICA_QUORUM")
+        .unwrap_or_else(|_| "2".to_owned())
+        .parse::<usize>()
+        .map_err(|_| "LAKEDAY_REPLICA_QUORUM must be an integer")?;
+    let storage_bind =
+        env::var("LAKEDAY_REPLICA_STORAGE_BIND").unwrap_or_else(|_| "0.0.0.0".to_owned());
+    let storage_port =
+        env::var("LAKEDAY_REPLICA_STORAGE_PORT").unwrap_or_else(|_| "9090".to_owned());
+    let storage_address = format_address(&storage_bind, &storage_port);
+    let gateway_address = gateway_listen_address()?;
+    serve_combined(
+        CombinedReplica {
+            root_key: root_key.to_owned(),
+            data_dir,
+            log_path,
+            control_path,
+            node_name: required_nonempty("LAKEDAY_REPLICA_NODE_NAME")?,
+            tier: required_nonempty("LAKEDAY_REPLICA_TIER")?,
+            members: direct_nodes()?,
+            internal_token: required_nonempty("LAKEDAY_REPLICA_INTERNAL_TOKEN")?,
+            admin_token: env::var("LAKEDAY_REPLICA_ADMIN_TOKEN").unwrap_or_default(),
+            quorum,
+            archive: Arc::new(build_archive()?),
+            storage_address,
+            gateway_address,
+        },
+        stop,
+    )
+    .await
+}
+
+/// Runs one combined replica: its storage node, its coordinator, the archive
+/// pass and the catch-up pass, until `stop` resolves.
+pub async fn serve_combined(
+    replica: CombinedReplica,
+    stop: impl std::future::Future<Output = ()>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let CombinedReplica {
+        root_key,
+        data_dir,
+        log_path,
+        control_path,
+        node_name,
+        tier,
+        members: initial_nodes,
+        internal_token,
+        admin_token,
+        quorum,
+        archive,
+        storage_address,
+        gateway_address,
+    } = replica;
+    let root_key = root_key.as_str();
     let node = Arc::new(DiskReplica::open_with_control(
         &log_path,
         node_name.clone(),
@@ -81,13 +152,6 @@ async fn run_combined(
         &control_path,
         &initial_nodes,
     )?);
-    let internal_token = required_nonempty("LAKEDAY_REPLICA_INTERNAL_TOKEN")?;
-    let quorum = env::var("LAKEDAY_REPLICA_QUORUM")
-        .unwrap_or_else(|_| "2".to_owned())
-        .parse::<usize>()
-        .map_err(|_| "LAKEDAY_REPLICA_QUORUM must be an integer")?;
-    let admin_token = env::var("LAKEDAY_REPLICA_ADMIN_TOKEN").unwrap_or_default();
-    let archive = Arc::new(build_archive()?);
     let gateway = Arc::new(
         ReplicaGateway::new_direct_with_control(
             initial_nodes,
@@ -143,12 +207,6 @@ async fn run_combined(
             }
         }
     });
-    let storage_bind =
-        env::var("LAKEDAY_REPLICA_STORAGE_BIND").unwrap_or_else(|_| "0.0.0.0".to_owned());
-    let storage_port =
-        env::var("LAKEDAY_REPLICA_STORAGE_PORT").unwrap_or_else(|_| "9090".to_owned());
-    let storage_address = format_address(&storage_bind, &storage_port);
-    let gateway_address = gateway_listen_address()?;
     let storage_listener = TcpListener::bind(&storage_address).await?;
     let gateway_listener = TcpListener::bind(&gateway_address).await?;
     let storage_app = node_router(Arc::clone(&node), root_key, Some(&internal_token))?;
@@ -157,6 +215,7 @@ async fn run_combined(
         result = axum::serve(storage_listener, storage_app) => result.map_err(Into::into),
         result = axum::serve(gateway_listener, gateway_app) => result.map_err(Into::into),
         result = archive_loop(Arc::clone(&gateway), Arc::clone(&node)) => result,
+        result = catch_up_loop(Arc::clone(&gateway)) => result,
         () = stop => Ok(()),
     };
     result
@@ -217,6 +276,48 @@ async fn archive_loop(
         interval.tick().await;
         if let Err(error) = gateway.archive_local_commits(&node).await {
             eprintln!("replica archive pass failed: {error}");
+        }
+    }
+}
+
+/// Keeps the local replica holding every committed record of the streams
+/// routed to it. A Machine that restarts rejoins with its volume as it left
+/// it, missing what its peers wrote meanwhile; it cannot count towards a
+/// write quorum for those positions until it holds them. The first pass runs
+/// as soon as the listeners are up and repeats at once while it finds work;
+/// after that it runs every few seconds, which also restores a member that
+/// fell behind without restarting.
+async fn catch_up_loop(gateway: Arc<ReplicaGateway>) -> Result<(), Box<dyn std::error::Error>> {
+    let started = std::time::Instant::now();
+    let mut complete = false;
+    loop {
+        let repaired = gateway.repair_lagging().await;
+        if repaired > 0 {
+            eprintln!("lakeday.replica catch_up outcome=rejoined members={repaired}");
+        }
+        match gateway.catch_up_local().await {
+            Ok(0) => {
+                if !complete {
+                    complete = true;
+                    eprintln!(
+                        "lakeday.replica catch_up outcome=complete elapsed_ms={}",
+                        started.elapsed().as_millis()
+                    );
+                }
+                // A member refusing live appends is behind now, not in five
+                // seconds.
+                tokio::select! {
+                    () = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
+                    () = gateway.lagging_noted() => {}
+                }
+            }
+            Ok(appended) => {
+                eprintln!("lakeday.replica catch_up outcome=appended records={appended}");
+            }
+            Err(error) => {
+                eprintln!("lakeday.replica catch_up outcome=error error={error}");
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
         }
     }
 }

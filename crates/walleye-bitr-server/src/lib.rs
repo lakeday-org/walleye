@@ -3026,6 +3026,44 @@ struct NodeCommitEntry {
     record: EncryptedRecord,
 }
 
+/// Records of a stream from `from_lsn` on, written by writers older than
+/// `writer_epoch`, withdrawn from this member because the committed log holds
+/// different records there. See [`DiskReplica::supersede`].
+#[derive(Deserialize, Serialize)]
+struct NodeSupersedeEntry {
+    kind: String,
+    stream: String,
+    from_lsn: u64,
+    writer_epoch: u64,
+}
+
+/// Remove a stream's records at and after `from_lsn`, and their commit
+/// markers, and recompute the highest writer epoch the member has seen for it.
+fn withdraw_suffix(
+    stream: &str,
+    from_lsn: u64,
+    highest_epoch: &mut BTreeMap<String, u64>,
+    records: &mut BTreeMap<(String, u64), EncryptedRecord>,
+    committed: &mut BTreeMap<(String, u64), EncryptedRecord>,
+    trimmed: &BTreeMap<String, TrimmedPrefix>,
+) {
+    records.retain(|(s, lsn), _| s != stream || *lsn < from_lsn);
+    committed.retain(|(s, lsn), _| s != stream || *lsn < from_lsn);
+    let highest = records
+        .range((stream.to_owned(), 0)..=(stream.to_owned(), u64::MAX))
+        .map(|(_, record)| record.writer_epoch())
+        .chain(trimmed.get(stream).map(|prefix| prefix.writer_epoch))
+        .max();
+    match highest {
+        Some(epoch) => {
+            highest_epoch.insert(stream.to_owned(), epoch);
+        }
+        None => {
+            highest_epoch.remove(stream);
+        }
+    }
+}
+
 #[derive(Deserialize, Serialize)]
 struct NodeTrimEntry {
     kind: String,
@@ -3239,6 +3277,22 @@ impl DiskReplica {
                     if records.get(&key) == Some(&entry.record) {
                         committed.insert(key, entry.record);
                     }
+                }
+                "supersede" => {
+                    let entry: NodeSupersedeEntry =
+                        serde_json::from_slice(line).map_err(|error| {
+                            ReplicaError::NodeStorage(format!(
+                                "invalid node supersede entry: {error}"
+                            ))
+                        })?;
+                    withdraw_suffix(
+                        &entry.stream,
+                        entry.from_lsn,
+                        &mut highest_epoch,
+                        &mut records,
+                        &mut committed,
+                        &trimmed,
+                    );
                 }
                 "trim" => {
                     let entry: NodeTrimEntry = serde_json::from_slice(line).map_err(|error| {
@@ -3598,6 +3652,74 @@ impl DiskReplica {
             .map_err(|error| ReplicaError::NodeStorage(error.to_string()))?;
         state.committed.insert(key, record);
         Ok(())
+    }
+
+    /// Withdraw this member's records of `stream` from `from_lsn` on, which
+    /// writers older than `writer_epoch` left behind and the committed log
+    /// replaced.
+    ///
+    /// A member that was cut off can hold the last record its own writer sent
+    /// it before dying: acknowledged by nobody, because it never reached a
+    /// quorum, and superseded by the next writer, which recovered the log
+    /// without it and wrote a different record at that position. The member
+    /// then refuses every append to the stream - it has a record there - and
+    /// never counts towards a quorum for it again. Withdrawing the orphan is
+    /// safe exactly when every record withdrawn is older than the writer that
+    /// replaced it; a record from that writer or a later one is refused, as is
+    /// a position the member has already trimmed into the archive.
+    pub fn supersede(
+        &self,
+        stream: &str,
+        from_lsn: u64,
+        writer_epoch: u64,
+    ) -> Result<usize, ReplicaError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| ReplicaError::NodeStorage("node lock is poisoned".to_owned()))?;
+        if stream.is_empty() || from_lsn == 0 {
+            return Err(ReplicaError::LsnConflict);
+        }
+        if state
+            .trimmed
+            .get(stream)
+            .is_some_and(|prefix| from_lsn <= prefix.archived_lsn)
+        {
+            return Err(ReplicaError::LsnConflict);
+        }
+        let doomed = state
+            .records
+            .range((stream.to_owned(), from_lsn)..=(stream.to_owned(), u64::MAX))
+            .map(|(_, record)| record.writer_epoch())
+            .collect::<Vec<_>>();
+        if doomed.is_empty() {
+            return Ok(0);
+        }
+        if doomed.iter().any(|epoch| *epoch >= writer_epoch) {
+            return Err(ReplicaError::WriterFenced);
+        }
+        write_json_line(
+            &mut state.file,
+            &NodeSupersedeEntry {
+                kind: "supersede".to_owned(),
+                stream: stream.to_owned(),
+                from_lsn,
+                writer_epoch,
+            },
+        )?;
+        state
+            .file
+            .sync_data()
+            .map_err(|error| ReplicaError::NodeStorage(error.to_string()))?;
+        let DiskState {
+            highest_epoch,
+            records,
+            committed,
+            trimmed,
+            ..
+        } = &mut *state;
+        withdraw_suffix(stream, from_lsn, highest_epoch, records, committed, trimmed);
+        Ok(doomed.len())
     }
 
     /// Atomically replaces one archived hot prefix with a durable trim fence.
@@ -4571,6 +4693,7 @@ pub fn node_router(
         .route("/internal/v1/append", post(internal_append))
         .route("/internal/v1/append-many", post(internal_append_many))
         .route("/internal/v1/commit", post(internal_commit))
+        .route("/internal/v1/supersede", post(internal_supersede))
         .route("/internal/v1/control", get(internal_control_state))
         .route(
             "/internal/v1/control/metadata/freeze",
@@ -4887,6 +5010,32 @@ async fn internal_commit(
     }
     let record = encrypted_record_body(&headers, &body)?;
     Ok(append_status(state.node.commit(record).await))
+}
+
+#[derive(Deserialize, Serialize)]
+struct SupersedeRequest {
+    stream: String,
+    from_lsn: u64,
+    writer_epoch: u64,
+}
+
+/// Withdraws a member's orphaned suffix; see [`DiskReplica::supersede`].
+async fn internal_supersede(
+    State(state): State<NodeState>,
+    headers: HeaderMap,
+    Json(request): Json<SupersedeRequest>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    if !permits_internal(&headers, state.internal_token.as_deref()) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    match state
+        .node
+        .supersede(&request.stream, request.from_lsn, request.writer_epoch)
+    {
+        Ok(withdrawn) => Ok(Json(serde_json::json!({ "withdrawn": withdrawn }))),
+        Err(ReplicaError::WriterFenced | ReplicaError::LsnConflict) => Err(StatusCode::CONFLICT),
+        Err(_) => Err(StatusCode::SERVICE_UNAVAILABLE),
+    }
 }
 
 async fn internal_maintenance_append(
@@ -6336,6 +6485,9 @@ pub struct GatewayStatus {
     pub membership_epoch: u64,
 }
 
+/// Records appended to a catching-up member per request.
+const CATCH_UP_BATCH: usize = 256;
+
 /// Client-facing replica gateway.
 ///
 /// [`Self::new_direct`] is the combined Fly constructor. It uses a durable
@@ -6371,6 +6523,23 @@ pub struct ReplicaGateway {
     /// handed off to a freshly prepared cohort. Legacy/static gateways leave
     /// this unset.
     control_head: Option<ControlHeadStore>,
+    /// Members that refused a batch for want of its predecessor after the
+    /// batch already had its quorum. See [`Self::repair_lagging`].
+    lagging: Arc<Lagging>,
+}
+
+/// The newest batch each behind member refused, per stream, and a wake for
+/// whoever repairs them.
+#[derive(Default)]
+struct Lagging {
+    refused: Mutex<BTreeMap<(String, String), LateRefusal>>,
+    wake: tokio::sync::Notify,
+}
+
+struct LateRefusal {
+    member: ReplicaNode,
+    records: Vec<EncryptedRecord>,
+    placement: Option<PlacementEpoch>,
 }
 
 impl ReplicaGateway {
@@ -6619,6 +6788,7 @@ impl ReplicaGateway {
             writer_state: tokio::sync::Mutex::new(GatewayWriterState::default()),
             stream_writers: Mutex::new(BTreeMap::new()),
             route_repair_cache: Mutex::new(RouteRepairCache::default()),
+            lagging: Arc::new(Lagging::default()),
             client: reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(1))
                 .timeout(Duration::from_secs(5))
@@ -12723,17 +12893,45 @@ impl ReplicaGateway {
         let mut acknowledgements = 0;
         let mut saw_fence = false;
         let mut saw_conflict = false;
-        while let Some((_, result)) = result_rx.recv().await {
+        let mut behind = Vec::new();
+        while let Some((node, result)) = result_rx.recv().await {
             match result {
                 Ok(()) => {
+                    acknowledgements += 1;
+                    if acknowledgements >= self.quorum {
+                        self.note_late_refusals(result_rx, records, placement);
+                        return Ok(acknowledgements);
+                    }
+                }
+                Err(ReplicaError::WriterFenced) => saw_fence = true,
+                Err(ReplicaError::LsnConflict) => {
+                    saw_conflict = true;
+                    behind.push(node);
+                }
+                Err(_) => {}
+            }
+        }
+        // Short of a quorum, a member that refused for want of a predecessor
+        // may simply be behind: one that was down while its peers wrote.
+        // Bring it up to date from the committed copies and offer it the
+        // batch again, rather than failing a write two members could carry.
+        if !saw_fence {
+            for node in behind {
+                match self.catch_up_member(first.stream(), &node).await {
+                    Ok(Some(_)) => {}
+                    _ => continue,
+                }
+                let client = NodeClient::new(node.clone(), &self.client, &self.internal_token);
+                if client
+                    .append_and_commit_many_with_placement(records, placement.clone())
+                    .await
+                    .is_ok()
+                {
                     acknowledgements += 1;
                     if acknowledgements >= self.quorum {
                         return Ok(acknowledgements);
                     }
                 }
-                Err(ReplicaError::WriterFenced) => saw_fence = true,
-                Err(ReplicaError::LsnConflict) => saw_conflict = true,
-                Err(_) => {}
             }
         }
         if saw_fence {
@@ -12743,6 +12941,84 @@ impl ReplicaGateway {
             return Err(ReplicaError::LsnConflict);
         }
         Err(ReplicaError::QuorumUnavailable)
+    }
+
+    /// Keeps listening, after a batch had its quorum, to the members that had
+    /// not answered, and notes each one that refused it for want of its
+    /// predecessor.
+    ///
+    /// Such a member is behind, and catch-up alone cannot bring it level while
+    /// writes continue: catch-up copies only what is certainly committed, and
+    /// the newest record never is yet, so the member stays one short and
+    /// refuses every append after. Offering it this batch once it is caught up
+    /// to the batch's predecessor is what closes the gap, as the path short of
+    /// a quorum does inline. Here the write has already been answered, so the
+    /// repair is left to [`Self::repair_lagging`].
+    fn note_late_refusals(
+        &self,
+        mut results: tokio::sync::mpsc::UnboundedReceiver<(ReplicaNode, Result<(), ReplicaError>)>,
+        records: &[EncryptedRecord],
+        placement: Option<PlacementEpoch>,
+    ) {
+        let lagging = Arc::clone(&self.lagging);
+        let records = records.to_vec();
+        tokio::spawn(async move {
+            while let Some((member, result)) = results.recv().await {
+                if !matches!(result, Err(ReplicaError::LsnConflict)) {
+                    continue;
+                }
+                let Some(stream) = records.first().map(|record| record.stream().to_owned()) else {
+                    return;
+                };
+                // Only the newest refusal matters: repairing it covers every
+                // one before it.
+                if let Ok(mut refused) = lagging.refused.lock() {
+                    refused.insert(
+                        (member.id.clone(), stream),
+                        LateRefusal {
+                            member,
+                            records: records.clone(),
+                            placement: placement.clone(),
+                        },
+                    );
+                }
+                lagging.wake.notify_one();
+            }
+        });
+    }
+
+    /// Brings each member noted by [`Self::note_late_refusals`] up to the
+    /// batch it refused, and offers it the batch again. The node's own LSN and
+    /// writer fences decide whether it takes it, exactly as for a first offer.
+    /// Returns how many members took theirs.
+    pub async fn repair_lagging(&self) -> usize {
+        let refused = match self.lagging.refused.lock() {
+            Ok(mut refused) => std::mem::take(&mut *refused),
+            Err(_) => return 0,
+        };
+        let mut repaired = 0;
+        for ((_, stream), late) in refused {
+            // Already level with the batch's predecessor is as good as
+            // brought level: either way the batch is what it lacks.
+            if self.catch_up_member(&stream, &late.member).await.is_err() {
+                continue;
+            }
+            let client = NodeClient::new(late.member.clone(), &self.client, &self.internal_token);
+            if client
+                .append_and_commit_many_with_placement(&late.records, late.placement)
+                .await
+                .is_ok()
+            {
+                repaired += 1;
+            }
+        }
+        repaired
+    }
+
+    /// Resolves once a member has been noted as behind since the last call
+    /// to [`Self::repair_lagging`].
+    pub async fn lagging_noted(&self) {
+        self.lagging.wake.notified().await;
     }
 
     /// Sends the route repair to the members of a route that did not answer
@@ -13842,6 +14118,276 @@ impl ReplicaGateway {
         }
     }
 
+    /// Bring one member of a stream's cohort up to date: append, in LSN order,
+    /// every record it is missing that is known to be committed.
+    ///
+    /// A member that was down or cut off while its peers kept writing holds a
+    /// prefix of the log. It refuses the next append for want of a
+    /// predecessor, correctly - a member counts towards a quorum only for
+    /// positions it actually holds - so until it catches up the cohort runs on
+    /// two copies, and losing either stops writes. This closes the gap.
+    ///
+    /// A record is copied only if it is committed: a later record carries a
+    /// commit watermark at or above it, or this coordinator acknowledged it.
+    /// Copies of one LSN must agree byte for byte, the chain must be
+    /// contiguous with each record naming its predecessor as committed, and
+    /// writer epochs must not go backwards; the member's own predecessor and
+    /// epoch checks apply to every append as well. A range the peers have
+    /// already trimmed is read back from the archive. Returns the LSN range
+    /// appended, none when the member was already complete.
+    pub async fn catch_up_member(
+        &self,
+        stream: &str,
+        member: &ReplicaNode,
+    ) -> Result<Option<std::ops::RangeInclusive<u64>>, ReplicaError> {
+        let cohort = self.replicas_for_stream(stream).await?;
+        if !cohort.iter().any(|node| node.id == member.id) {
+            return Ok(None);
+        }
+        let snapshots = self.fetch_snapshots(&cohort, Some(stream)).await;
+        let Some(own) = snapshots
+            .iter()
+            .find(|(node, _)| node.id == member.id)
+            .and_then(|(_, snapshot)| snapshot.as_ref())
+        else {
+            return Err(ReplicaError::NodeUnavailable);
+        };
+        let floor = own
+            .trimmed
+            .iter()
+            .filter(|prefix| prefix.stream == stream)
+            .map(|prefix| prefix.archived_lsn)
+            .max()
+            .unwrap_or(0);
+        let own_records: BTreeMap<u64, &EncryptedRecord> = own
+            .records
+            .iter()
+            .filter(|record| record.stream() == stream && record.lsn() > floor)
+            .map(|record| (record.lsn(), record))
+            .collect();
+
+        // Every copy the peers hold above the member's floor, with the
+        // highest commit watermark any of them proves.
+        let mut copies: BTreeMap<u64, EncryptedRecord> = BTreeMap::new();
+        let mut certified = 0_u64;
+        let mut peers_trimmed = 0_u64;
+        let mut disagreement: Option<u64> = None;
+        for (node, snapshot) in &snapshots {
+            if node.id == member.id {
+                continue;
+            }
+            let Some(snapshot) = snapshot else { continue };
+            peers_trimmed = peers_trimmed.max(
+                snapshot
+                    .trimmed
+                    .iter()
+                    .filter(|prefix| prefix.stream == stream)
+                    .map(|prefix| prefix.archived_lsn)
+                    .max()
+                    .unwrap_or(0),
+            );
+            for record in snapshot
+                .records
+                .iter()
+                .filter(|record| record.stream() == stream && record.lsn() > floor)
+            {
+                certified = certified.max(record.committed_lsn());
+                match copies.get(&record.lsn()) {
+                    // Two peers disagree: nothing from here on is certain
+                    // enough to copy.
+                    Some(existing) if existing != record => {
+                        disagreement =
+                            Some(disagreement.map_or(record.lsn(), |at: u64| at.min(record.lsn())));
+                    }
+                    Some(_) => {}
+                    None => {
+                        copies.insert(record.lsn(), record.clone());
+                    }
+                }
+            }
+        }
+        if let Some(at) = disagreement {
+            copies.split_off(&at);
+        }
+        {
+            let state = self.writer_state.lock().await;
+            if let Some(acknowledged) = state.streams.get(stream) {
+                certified = certified.max(acknowledged.committed_lsn);
+                for (lsn, record) in acknowledged.records.range(floor.saturating_add(1)..) {
+                    if *lsn > acknowledged.committed_lsn {
+                        break;
+                    }
+                    if copies.get(lsn).is_some_and(|existing| existing != record) {
+                        return Err(ReplicaError::LsnConflict);
+                    }
+                    copies.entry(*lsn).or_insert_with(|| record.clone());
+                }
+            }
+        }
+        // What the peers have already archived and trimmed comes back from
+        // the archive, which holds exactly the committed prefix.
+        if peers_trimmed > floor {
+            for record in self
+                .archive
+                .recover(stream, floor)
+                .await
+                .map_err(|error| ReplicaError::NodeStorage(error.to_string()))?
+            {
+                if record.lsn() > peers_trimmed {
+                    break;
+                }
+                certified = certified.max(record.lsn());
+                if copies
+                    .get(&record.lsn())
+                    .is_some_and(|existing| existing != &record)
+                {
+                    return Err(ReplicaError::LsnConflict);
+                }
+                copies.insert(record.lsn(), record);
+            }
+        }
+
+        // How far the member agrees with the committed log. Where it holds a
+        // record the committed log replaced, left by an older writer that
+        // never reached a quorum, that suffix is withdrawn first.
+        let mut position = floor;
+        let mut own_epoch = own
+            .trimmed
+            .iter()
+            .filter(|prefix| prefix.stream == stream)
+            .map(|prefix| prefix.writer_epoch)
+            .max()
+            .unwrap_or(0);
+        let client = NodeClient::new(member.clone(), &self.client, &self.internal_token);
+        for (lsn, record) in &own_records {
+            if *lsn != position.saturating_add(1) {
+                break;
+            }
+            match copies.get(lsn) {
+                Some(copy) if copy == *record => {
+                    position = *lsn;
+                    own_epoch = own_epoch.max(record.writer_epoch());
+                }
+                Some(copy)
+                    if *lsn <= certified
+                        && own_records
+                            .range(lsn..)
+                            .all(|(_, orphan)| orphan.writer_epoch() < copy.writer_epoch()) =>
+                {
+                    client.supersede(stream, *lsn, copy.writer_epoch()).await?;
+                    eprintln!(
+                        "lakeday.replica catch_up stream={stream} member={} superseded_from_lsn={lsn}",
+                        member.id
+                    );
+                    break;
+                }
+                // Holding a record nobody else can vouch for, or one the
+                // committed log differs on for a writer at least as new:
+                // nothing to do here that is certainly right.
+                _ => break,
+            }
+        }
+
+        let mut missing = Vec::new();
+        let mut expected = position.saturating_add(1);
+        for (lsn, record) in copies.range(expected..) {
+            if *lsn != expected
+                || *lsn > certified
+                || record.committed_lsn() != lsn.saturating_sub(1)
+                || record.writer_epoch() < own_epoch
+            {
+                break;
+            }
+            own_epoch = record.writer_epoch();
+            missing.push(record.clone());
+            expected = expected.saturating_add(1);
+        }
+        let Some(first) = missing.first().map(EncryptedRecord::lsn) else {
+            return Ok(None);
+        };
+        let last = missing.last().map_or(first, EncryptedRecord::lsn);
+        // The member was away while the stream's route moved on, so its
+        // placement fence may name a route that is gone. Committed history is
+        // copied under the stream's current route: the member is fenced to it
+        // first, exactly as a route change fences every member, and an older
+        // coordinator's late append is refused from then on.
+        let placement = match self.read_manifest_quorum().await? {
+            Some(manifest) => {
+                let route = manifest
+                    .stream_segments
+                    .get(stream)
+                    .and_then(|segments| segments.last())
+                    .cloned()
+                    .ok_or(ReplicaError::QuorumUnavailable)?;
+                let placement = placement_for_route(stream, &route);
+                client.install_placement_fence(stream, &placement).await?;
+                Some(placement)
+            }
+            None => None,
+        };
+        // An append is one writer epoch.
+        let mut batch: Vec<EncryptedRecord> = Vec::new();
+        for record in missing {
+            if batch.last().is_some_and(|previous: &EncryptedRecord| {
+                previous.writer_epoch() != record.writer_epoch()
+            }) || batch.len() >= CATCH_UP_BATCH
+            {
+                client
+                    .append_and_commit_many_with_placement(&batch, placement.clone())
+                    .await?;
+                batch.clear();
+            }
+            batch.push(record);
+        }
+        if !batch.is_empty() {
+            client
+                .append_and_commit_many_with_placement(&batch, placement)
+                .await?;
+        }
+        eprintln!(
+            "lakeday.replica catch_up stream={stream} member={} from_lsn={first} to_lsn={last}",
+            member.id
+        );
+        Ok(Some(first..=last))
+    }
+
+    /// Bring the local member up to date on every stream its cohort routes to
+    /// it, as a restarted replica does before it can count towards a quorum
+    /// again. Returns how many records it appended.
+    pub async fn catch_up_local(&self) -> Result<u64, ReplicaError> {
+        let Some(control) = self.control() else {
+            return Ok(0);
+        };
+        let me = self
+            .nodes_snapshot()
+            .await?
+            .into_iter()
+            .find(|member| member.id == self.local_member_id)
+            .ok_or(ReplicaError::NodeUnavailable)?;
+        let streams = control.with_state(|state| {
+            state
+                .stream_segments
+                .iter()
+                .filter(|(_, segments)| {
+                    segments.last().is_some_and(|segment| {
+                        segment
+                            .member_ids
+                            .iter()
+                            .any(|id| id == &self.local_member_id)
+                    })
+                })
+                .map(|(stream, _)| stream.clone())
+                .collect::<Vec<_>>()
+        })?;
+        let mut appended = 0_u64;
+        for stream in streams {
+            if let Some(range) = self.catch_up_member(&stream, &me).await? {
+                appended = appended.saturating_add(range.count() as u64);
+            }
+        }
+        Ok(appended)
+    }
+
     /// Fetches every member's snapshot. The phase ends once a quorum answered
     /// and the stragglers had their grace; a member that stays silent is
     /// reported unavailable, exactly as one whose request timed out, so the
@@ -14336,6 +14882,11 @@ async fn gateway_ready(
     }
     // A ready answer names who is serving, as a refusal names who is not: a
     // caller with one address can then tell a whole cluster from a quorum.
+    // It also names the log itself, by where its committed segments are
+    // archived: every coordinator of one log answers the same whatever
+    // address the caller reached it at and however its membership changes,
+    // and no other log does. A writer names the log it appends to by it.
+    let log = log_digest(&state.gateway.archive.location());
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -14343,9 +14894,18 @@ async fn gateway_ready(
             "quorum": quorum,
             "healthy": healthy,
             "unreachable": unreachable,
+            "log": log,
         })),
     )
         .into_response()
+}
+
+/// A stable name for one log: where its committed segments are archived.
+fn log_digest(location: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"lakeday-cloud/log/v1\0");
+    digest.update(location.as_bytes());
+    hex::encode(digest.finalize())
 }
 
 #[derive(Serialize)]
@@ -15399,6 +15959,32 @@ struct NodeClient<'a> {
 }
 
 impl<'a> NodeClient<'a> {
+    async fn supersede(
+        &self,
+        stream: &str,
+        from_lsn: u64,
+        writer_epoch: u64,
+    ) -> Result<(), ReplicaError> {
+        let response = self
+            .http
+            .post(format!("{}/internal/v1/supersede", self.node.url))
+            .header(INTERNAL_AUTH_HEADER, self.internal_token)
+            .json(&SupersedeRequest {
+                stream: stream.to_owned(),
+                from_lsn,
+                writer_epoch,
+            })
+            .send()
+            .await
+            .map_err(|_| ReplicaError::NodeUnavailable)?;
+        match response.status() {
+            status if status.is_success() => Ok(()),
+            StatusCode::CONFLICT => Err(ReplicaError::LsnConflict),
+            StatusCode::UNAUTHORIZED => Err(ReplicaError::GatewayUnauthorized),
+            _ => Err(ReplicaError::NodeUnavailable),
+        }
+    }
+
     fn new(node: ReplicaNode, http: &'a reqwest::Client, internal_token: &'a str) -> Self {
         Self {
             node,
