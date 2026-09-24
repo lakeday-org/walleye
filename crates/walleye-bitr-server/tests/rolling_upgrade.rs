@@ -291,6 +291,22 @@ impl ReplicaGatewayTrait for FailoverGateway {
             result => result,
         }
     }
+
+    async fn extent(&self, stream: &str) -> Result<walleye_bitr::StreamExtent, ReplicaError> {
+        match self.primary.extent(stream).await {
+            Err(error) if Self::retry_on(&error) => self.secondary.extent(stream).await,
+            result => result,
+        }
+    }
+
+    async fn release(&self, stream: &str, through_lsn: u64) -> Result<(), ReplicaError> {
+        match self.primary.release(stream, through_lsn).await {
+            Err(error) if Self::retry_on(&error) => {
+                self.secondary.release(stream, through_lsn).await
+            }
+            result => result,
+        }
+    }
 }
 
 async fn nodes(directory: &Path, root: &str) -> TestResult<Vec<TestNode>> {

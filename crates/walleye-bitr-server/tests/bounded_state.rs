@@ -429,3 +429,147 @@ async fn a_long_written_stream_stays_the_same_size() {
     assert_eq!(recovered.len() as u64, lsn);
     cluster.stop();
 }
+
+/// How many objects the archive holds for its streams.
+async fn archive_objects(store: &Arc<dyn ObjectStore>) -> usize {
+    store
+        .list(Some(&object_store::path::Path::from("bitr/streams")))
+        .filter_map(|entry| async move { entry.ok() })
+        .count()
+        .await
+}
+
+/// Releasing through a table's checkpoint deletes the archive below it -
+/// segments and index pages - and the head names none of it; reads from the
+/// checkpoint on are unchanged, and a read from below it is refused rather
+/// than answered short.
+#[tokio::test]
+async fn a_release_deletes_the_archive_below_the_checkpoint() {
+    let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let archive = OpaqueArchive::new(Arc::clone(&store), "bitr", 64).expect("archive");
+    let mut sizes = Vec::new();
+    for lsn in 1..=1_200 {
+        archive
+            .archive_committed(&[record(STREAM, lsn, 1)])
+            .await
+            .expect("archived");
+        // A checkpoint every hundred records, trailing the tail by ten.
+        if lsn % 100 == 0 {
+            archive.release(STREAM, lsn - 10).await.expect("released");
+            sizes.push(archive_objects(&store).await);
+        }
+    }
+    assert!(
+        sizes.iter().all(|objects| *objects <= 120),
+        "the archive kept what its checkpoints released: {sizes:?} objects"
+    );
+    assert_eq!(
+        archive.extent(STREAM).await.expect("extent"),
+        (1_190, 1_200)
+    );
+    for after in [1_190, 1_195, 1_200] {
+        assert_eq!(
+            archive
+                .recover(STREAM, after)
+                .await
+                .expect("recovered")
+                .iter()
+                .map(EncryptedRecord::lsn)
+                .collect::<Vec<_>>(),
+            (after + 1..=1_200).collect::<Vec<_>>()
+        );
+    }
+    assert!(matches!(
+        archive.recover(STREAM, 0).await,
+        Err(walleye_bitr_server::ArchiveError::Released {
+            after_lsn: 0,
+            released_lsn: 1_190
+        })
+    ));
+    // A release never moves back, and never past what is archived.
+    assert_eq!(archive.release(STREAM, 5).await.expect("noop"), 1_190);
+    assert_eq!(archive.release(STREAM, 9_999).await.expect("capped"), 1_200);
+    assert_eq!(archive.recover(STREAM, 1_200).await.expect("tail"), vec![]);
+    assert_eq!(
+        archive.stream_heads().await.expect("heads"),
+        vec![(STREAM.to_owned(), 1_200, 1)]
+    );
+    // And the stream carries on after it.
+    archive
+        .archive_committed(&[record(STREAM, 1_201, 1)])
+        .await
+        .expect("archived after the release");
+    assert_eq!(archive.recover(STREAM, 1_200).await.expect("tail").len(), 1);
+}
+
+/// A member away while its peers wrote, archived and released far past where
+/// it stopped is brought past the released prefix by its own archive pass,
+/// then caught up, and carries a quorum; the coordinator reports the extent.
+#[tokio::test]
+async fn a_member_behind_a_release_catches_up() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut cluster = Cluster::start(dir.path(), Duration::ZERO).await;
+    for lsn in 1..=5 {
+        cluster
+            .gateway
+            .append_many(vec![record(STREAM, lsn, 1)])
+            .await
+            .expect("written");
+    }
+    cluster.archive_pass().await;
+    cluster.members[2].stop();
+    for lsn in 6..=300 {
+        cluster
+            .gateway
+            .append_many(vec![record(STREAM, lsn, 1)])
+            .await
+            .expect("written without c");
+        if lsn % 10 == 0 {
+            cluster.archive_pass().await;
+        }
+    }
+    cluster.archive_pass().await;
+    cluster
+        .gateway
+        .release(STREAM, 280)
+        .await
+        .expect("released");
+    assert_eq!(
+        cluster.gateway.extent(STREAM).await.expect("extent"),
+        walleye_bitr::StreamExtent {
+            released_lsn: 280,
+            committed_lsn: 300
+        }
+    );
+    let nodes = cluster.nodes.clone();
+    cluster.members[2].start(&nodes).await;
+    cluster.archive_pass().await;
+    let c = cluster.members[2].node.clone();
+    cluster
+        .gateway
+        .catch_up_member(STREAM, &c)
+        .await
+        .expect("caught up");
+    assert!(
+        cluster.members[2].position(STREAM) >= 299,
+        "c holds {}",
+        cluster.members[2].position(STREAM)
+    );
+    cluster.members[0].stop();
+    cluster
+        .gateway
+        .append_many(vec![record(STREAM, 301, 1)])
+        .await
+        .expect("b and c");
+    assert_eq!(cluster.members[2].position(STREAM), 301);
+    assert_eq!(
+        cluster
+            .gateway
+            .recover(STREAM, 280)
+            .await
+            .expect("recovered")
+            .len(),
+        21
+    );
+    cluster.stop();
+}
