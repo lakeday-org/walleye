@@ -94,6 +94,31 @@ A node that is stopped hands its tables over instead: it flushes each one,
 releases it, and removes its lease, and a peer takes each table on its next
 request or within one sampling interval, whichever comes first.
 
+**A node that comes back catches up.** Its replica holds the log only as far
+as it got before it went down, and a replica counts towards a quorum only for
+positions it actually holds: it refuses an append whose predecessor it does not
+have, so until it catches up the cluster runs on two complete copies. As soon
+as it restarts it copies what it missed from its peers, oldest first, taking
+only records that are committed - a later record's commit watermark covers
+them - and on which every copy agrees, and reading back from the archive any range
+the peers have already trimmed. A write that needs it in the meantime, because
+a second node is gone, brings it up to date first rather than failing. The
+replica logs `lakeday.replica catch_up outcome=complete` when it holds
+everything.
+
+If the node died mid-append, its replica can hold a record that only it ever
+received, from a writer the next owner replaced. That record was never
+acknowledged, and catch-up withdraws it, recorded durably in the replica's own
+log, before copying the committed record for that position. It withdraws only
+records from a writer older than the one that wrote the committed log.
+
+Committed segments are archived to `LAKEDAY_REPLICA_ARCHIVE_BUCKET` under
+`LAKEDAY_REPLICA_ARCHIVE_PREFIX`, once a second, and the local logs are
+trimmed behind them. A restarted replica whose volume survived does not seed
+from the archive - it already knows every stream - so a boot line of
+`seed_from_archive streams=0` is expected there; the archive is read by
+catch-up, for trimmed ranges, and by a replica with an empty volume.
+
 Restoring a node that lost its disk is the seeding path above: it reads the
 archive, catches up from its peers, and rejoins owning nothing; the others
 then hand it its share, one key per sweep.
