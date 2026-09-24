@@ -772,12 +772,7 @@ pub(crate) fn routes() -> access::Routes<Arc<Service>> {
         )
         // Records of any shape become rows in tables it decides, so it is a
         // write like any other ingest.
-        .route(
-            Method::POST,
-            "/v1/ingest/{source}",
-            Data(Write),
-            ingest_any,
-        )
+        .route(Method::POST, "/v1/ingest/{source}", Data(Write), ingest_any)
         .route(Method::POST, "/v1/query", Data(Read), query)
         .map(|router| router.layer(DefaultBodyLimit::max(8 * 1024 * 1024)))
         .merge(lancedb::routes())
@@ -1028,11 +1023,11 @@ struct Ingest {
 async fn ingest_any(
     State(s): State<Arc<Service>>,
     Path(source): Path<String>,
-    h: HeaderMap,
     body: Bytes,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     use serde_json::value::RawValue;
-    let engine = writable(&s, &h)?;
+    // Admitted already: the access gate checked this route's scope.
+    let engine = writable(&s)?;
     let _lease = engine
         .resources()
         .reserve_memory("ingest body", body.len().saturating_mul(8))

@@ -557,6 +557,7 @@ mod tests {
             ("POST", "/internal/cache/flush", System),
             ("POST", "/v1/streams", Data(Manage)),
             ("POST", "/v1/streams/{name}/events", Data(Write)),
+            ("POST", "/v1/ingest/{source}", Data(Write)),
             ("POST", "/v1/query", Data(Read)),
             ("GET", "/v1/table/", Data(Read)),
             ("GET", "/v1/namespace/{namespace}/table/list", Data(Read)),
