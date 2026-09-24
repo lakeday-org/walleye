@@ -140,6 +140,16 @@ one after another. The coordinator writing a stream keeps its newest
 acknowledged records in memory to bring a member level quickly, and forgets
 the rest once the archive holds them.
 
+Stopping an instance deletes its volumes, and starting it seeds fresh
+replicas from the archive, so a replica that is stopping archives everything
+it holds committed before it exits; the node waits for that. A table's own
+manifest remembers the last log position it saw, and that is only a hint: if
+the log does not hold it - committed after the last archive pass on replicas
+whose volumes are gone - the next entry goes after the log's actual tail, and
+if the table's checkpoint is past that tail the log is moved to the
+checkpoint. No stop, start, hand-back or kill leaves a table that cannot be
+opened.
+
 When a table flushes, the log below its checkpoint is never read again: the
 next owner replays only what comes after it. The writer tells the replicas,
 and the archive lets that prefix go - the head records the release first,
