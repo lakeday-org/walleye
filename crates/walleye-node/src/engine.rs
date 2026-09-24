@@ -927,10 +927,9 @@ impl Engine {
         if !forwarded
             && let Some(peer) = self.owners.preferred(name)
             && peer.node != me
-            // The last sample can be a lease behind: one that retired or
-            // lapsed since is no place to send the key.
-            && let crate::ownership::Liveness::Live { verdict_in, .. } =
-                self.owners.liveness(&peer.node, true).await?
+            // The last sample can be a lease behind: one that is draining,
+            // retired or lapsed since is no place to send the key.
+            && let Some(verdict_in) = self.owners.accepting(&peer.node).await?
         {
             return Ok(Route::Remote { peer, verdict_in });
         }

@@ -115,7 +115,9 @@ async fn every_member_serves_every_stream_with_one_owner() {
     let dir = tempfile::tempdir().unwrap();
     let members = start(dir.path(), 3).await;
     let client = reqwest::Client::new();
-    let tables: Vec<String> = (0..6).map(|i| format!("t{i}")).collect();
+    // Twelve, so that all of them landing on one owner is a one in a hundred
+    // thousand chance rather than a one in two hundred and fifty.
+    let tables: Vec<String> = (0..12).map(|i| format!("t{i}")).collect();
     let mut sessions = Vec::new();
     for member in &members {
         sessions.push(session(member).await);
@@ -169,7 +171,7 @@ async fn every_member_serves_every_stream_with_one_owner() {
     let owners: BTreeSet<&String> = owner_of.values().collect();
     assert!(
         owners.len() >= 2,
-        "six tables over several owners: {owners:?}"
+        "twelve tables over several owners: {owners:?}"
     );
 
     // Every member reports the same complete, duplicate-free contents.
@@ -291,7 +293,7 @@ async fn every_member_serves_every_stream_with_one_owner() {
         .await
         .unwrap();
     let listed = r.json::<serde_json::Value>().await.unwrap();
-    assert_eq!(listed["tables"].as_array().unwrap().len(), 6);
+    assert_eq!(listed["tables"].as_array().unwrap().len(), 12);
 
     for member in members {
         member.service.close().await;

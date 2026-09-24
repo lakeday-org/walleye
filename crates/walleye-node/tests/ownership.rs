@@ -219,9 +219,11 @@ async fn two_processes_racing_for_a_table_leave_one_owner() {
         assert_eq!((x.status, y.status), (200, 200), "{} {}", x.body, y.body);
         assert_eq!(x.owner, y.owner, "round {round}: one owner");
         let (a_held, b_held) = (held(&a.base).await, held(&b.base).await);
+        // Never both. Neither is possible for a moment, while one hands the
+        // table to the other as the tables are balanced between them.
         assert!(
-            a_held.contains_key(&table) ^ b_held.contains_key(&table),
-            "round {round}: exactly one process holds {table}"
+            !(a_held.contains_key(&table) && b_held.contains_key(&table)),
+            "round {round}: at most one process holds {table}"
         );
         exactly_once(&a.base, &table, &[1, 2]).await;
     }

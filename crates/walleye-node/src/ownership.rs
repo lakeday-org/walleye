@@ -807,6 +807,21 @@ impl Ownership {
         })
     }
 
+    /// How long until `node` could be judged dead, read from the bucket now,
+    /// if it is live and taking keys: not draining, not gone.
+    pub async fn accepting(&self, node: &str) -> Result<Option<Duration>, Error> {
+        let Liveness::Live { verdict_in, .. } = self.liveness(node, true).await? else {
+            return Ok(None);
+        };
+        let draining = self
+            .state()
+            .leases
+            .get(node)
+            .and_then(|seen| seen.lease.as_ref())
+            .is_some_and(|lease| lease.draining);
+        Ok((!draining).then_some(verdict_in))
+    }
+
     /// The epoch this process holds `table` at, if it owns it now.
     pub fn holds(&self, table: &str) -> Option<u64> {
         let mut state = self.state();
