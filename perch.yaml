@@ -333,3 +333,15 @@
     it holds committed, or a host that ends the process without waiting for
     it. A stopped instance's volumes are deleted; what the archive does not
     hold is gone.
+
+- name: nothing-done-means-nothing-was-sent
+  where: mentions owner-unreachable
+  each: method
+  min: 75
+  ensure: >
+    A route error whose contract is that nothing was applied -
+    `owner-unreachable`, `no-owner`, `stale-owner` - is returned only when no
+    attempt could have delivered the request: every attempt failed to
+    connect, or the answer came from a process that refused it. Once any
+    attempt may have delivered it, the answer is `outcome-unknown`, and a
+    request that is not safe to repeat is not sent again.

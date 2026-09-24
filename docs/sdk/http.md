@@ -274,7 +274,13 @@ table clicks already exists with a different definition
   `x-walleye-route-error` header: `stale-owner` (409, nothing was done; retry),
   `lost-ownership` (409, the owner changed before the write was acknowledged,
   so its outcome is unknown; a retry of keyed rows is safe), `no-owner` or
-  `owner-unreachable` (503 with `Retry-After`, nothing was done)
+  `owner-unreachable` (503 with `Retry-After`, nothing was done), `owner-lost`
+  (503, the owner stopped answering with the request in flight; its outcome is
+  unknown) or `outcome-unknown` (502, the request reached the owner or may
+  have, and the connection broke before the answer; its outcome is unknown).
+  Only `stale-owner`, `no-owner` and `owner-unreachable` mean nothing was
+  applied; after any other, retry only what is safe to apply twice, such as
+  rows with a primary key
 - not implemented anywhere: `update`, `delete` and `merge_insert` (404, no
   body), full-text search and full-text indexes, scalar indexes, ordering on a
   search, and column expressions in a projection. [Refusals](#refusals) has
