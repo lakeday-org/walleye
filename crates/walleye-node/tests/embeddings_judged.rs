@@ -78,6 +78,7 @@ async fn a_sentence_that_might_be_a_label_is_asked_about() {
         members: vec![Node::new("n", "http://n", 1.0).unwrap()],
         kubernetes: None,
         processor: None,
+        lease: Default::default(),
         api: Some(ApiConfig {
             root_uri: format!("file://{}/store", d.path().display()),
             bitr_url: None,
