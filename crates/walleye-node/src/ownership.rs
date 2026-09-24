@@ -1229,6 +1229,34 @@ impl Ownership {
             .collect()
     }
 
+    /// Of `keys`, those the last sample shows no live process owning: never
+    /// claimed, released, or named for a process whose lease is gone, lapsed
+    /// on this process's clock, or draining. Unlike [`Self::orphaned`] it does
+    /// not ask who should claim them; it is what a request for one of them
+    /// would find right now.
+    pub fn unowned(&self, keys: &[String]) -> Vec<String> {
+        let state = self.state();
+        keys.iter()
+            .filter(|key| {
+                if state.held.contains_key(*key) {
+                    return false;
+                }
+                match state.records.get(*key) {
+                    None => true,
+                    Some((_, record)) if record.node.is_empty() => true,
+                    Some((_, record)) => {
+                        state.dead.contains(&record.node)
+                            || state.leases.get(&record.node).is_none_or(|seen| {
+                                seen.first_seen.elapsed() >= self.config.verdict()
+                                    || seen.lease.as_ref().is_none_or(|lease| lease.draining)
+                            })
+                    }
+                }
+            })
+            .cloned()
+            .collect()
+    }
+
     /// What this process believes, for `/internal/ownership`.
     pub fn status(&self) -> serde_json::Value {
         let settled = self.settled();
@@ -1319,6 +1347,31 @@ mod tests {
             let (_, record) = nodes[0].read_latest(&table).await.unwrap();
             assert_eq!(record.unwrap().node, winners[0].node());
         }
+    }
+
+    /// What a request would find: a table held here or by a live peer is
+    /// owned; one never claimed, released, held by a draining peer or by a
+    /// peer whose lease has lapsed is not.
+    #[tokio::test]
+    async fn unowned_names_what_no_live_process_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = local_store(dir.path());
+        let a = node(&store, "a").await;
+        let b = node(&store, "b").await;
+        assert!(a.claim("mine").await.unwrap().is_ok());
+        assert!(b.claim("theirs").await.unwrap().is_ok());
+        assert!(b.claim("released").await.unwrap().is_ok());
+        b.release("released").await.unwrap();
+        a.sample().await.unwrap();
+        let keys: Vec<String> = ["mine", "theirs", "released", "never"]
+            .map(String::from)
+            .to_vec();
+        assert_eq!(a.unowned(&keys), vec!["released", "never"]);
+
+        // A peer that drains owns nothing a request could be sent to.
+        b.drain().await;
+        a.sample().await.unwrap();
+        assert_eq!(a.unowned(&keys), vec!["theirs", "released", "never"]);
     }
 
     /// A live owner is never displaced; a released record is taken at once;

@@ -736,6 +736,13 @@ pub struct Engine {
     background: Vec<tokio::task::AbortHandle>,
     /// The one crossing out of a worker's isolate.
     reach: Arc<dyn walleye_v8::Host>,
+    /// Why this process cannot yet say every table is served, as of the last
+    /// ownership sweep, or `None` once it can. See [`Self::tables_served`].
+    tables_pending: std::sync::Mutex<Option<String>>,
+    /// Tables this process holds whose writer failed to open. A claim stands
+    /// even when the open fails, so the sweep opens them again until they
+    /// open; until then the table is not served.
+    open_failed: std::sync::Mutex<BTreeSet<String>>,
 }
 impl Engine {
     /// How many times a request will claim the writer back before it gives up
@@ -844,6 +851,10 @@ impl Engine {
                 crate::reach::Allowed::from_env(),
                 tokio::runtime::Handle::current(),
             ),
+            tables_pending: std::sync::Mutex::new(Some(
+                "table ownership has not been swept yet".into(),
+            )),
+            open_failed: std::sync::Mutex::new(BTreeSet::new()),
         };
         // Open writers lazily: the combined Bitr service starts after configuration loads.
         Ok(engine)
@@ -957,8 +968,10 @@ impl Engine {
         let started = Instant::now();
         if let Err(error) = stream.table().await.map(drop) {
             eprintln!("walleye.ownership open table={name} outcome=error error={error}");
+            self.open_failed_mark(name, true);
             return;
         }
+        self.open_failed_mark(name, false);
         let mut seq = stream.seq.lock().await;
         if seq.is_none()
             && let Ok(high) = self.highest_seq(name).await
@@ -1041,11 +1054,20 @@ impl Engine {
     /// claimed.
     pub async fn sweep(&self) -> Vec<String> {
         self.close_lost().await;
-        if !self.owners.settled() || self.owners.draining() {
+        if self.owners.draining() {
+            self.set_tables_pending(Some("this process is draining".into()));
+            return Vec::new();
+        }
+        if !self.owners.settled() {
+            self.set_tables_pending(Some(format!(
+                "ownership is settling: leases found at start are judged after {} ms",
+                self.owners.config().verdict().as_millis()
+            )));
             return Vec::new();
         }
         if let Err(error) = self.refresh_catalog().await {
             eprintln!("walleye.ownership sweep stage=catalog outcome=error error={error}");
+            self.set_tables_pending(Some("the table catalog could not be read".into()));
             return Vec::new();
         }
         let mut names: Vec<String> = self.streams.lock().await.keys().cloned().collect();
@@ -1085,7 +1107,113 @@ impl Engine {
         if let Some(key) = self.owners.surplus(&names) {
             self.hand_back(&key).await;
         }
+        self.reopen_failed().await;
+        let pending = self.tables_pending_after_sweep(&names).await;
+        self.set_tables_pending(pending);
         claimed
+    }
+
+    /// Whether every table is served as far as this process can tell: it has
+    /// judged the leases it found at start, every known key has a live owner,
+    /// it is handing nothing back, every table it holds has an open writer,
+    /// and it can reach every live peer at the address it would forward to.
+    /// `None` when all of that holds; otherwise why not.
+    ///
+    /// This is the question a caller about to call a cluster `running` has to
+    /// ask every node: Bitr quorum says the log can take a write, and says
+    /// nothing about whether a table's owner is settled, open and reachable
+    /// from the node a request lands on.
+    pub fn tables_served(&self) -> Option<String> {
+        self.tables_pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+    fn set_tables_pending(&self, pending: Option<String>) {
+        let mut current = self
+            .tables_pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *current != pending {
+            match &pending {
+                Some(reason) => eprintln!("walleye.ownership tables_served=false reason={reason}"),
+                None => eprintln!("walleye.ownership tables_served=true"),
+            }
+        }
+        *current = pending;
+    }
+    fn open_failed_mark(&self, name: &str, failed: bool) {
+        let mut set = self
+            .open_failed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if failed {
+            set.insert(name.to_owned());
+        } else {
+            set.remove(name);
+        }
+    }
+    /// Open again every held table whose writer failed to open, so a failed
+    /// open is a delay rather than a table left unserved until a request
+    /// happens to arrive.
+    async fn reopen_failed(&self) {
+        let failed: Vec<String> = self
+            .open_failed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .cloned()
+            .collect();
+        for name in failed {
+            if self.owners.holds(&name).is_none() {
+                self.open_failed_mark(&name, false);
+                continue;
+            }
+            self.open_claimed(&name).await;
+        }
+    }
+    async fn tables_pending_after_sweep(&self, names: &[String]) -> Option<String> {
+        let unowned = self.owners.unowned(names);
+        if !unowned.is_empty() {
+            return Some(format!("no live owner yet for {}", unowned.join(", ")));
+        }
+        if let Some(key) = self.owners.surplus(names) {
+            return Some(format!("handing {key} back to where it belongs"));
+        }
+        let failed: Vec<String> = self
+            .open_failed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|name| self.owners.holds(name).is_some())
+            .cloned()
+            .collect();
+        if !failed.is_empty() {
+            return Some(format!(
+                "opening {} again after a failed open",
+                failed.join(", ")
+            ));
+        }
+        let me = self.owners.node();
+        let peers: Vec<crate::ownership::Peer> = self
+            .owners
+            .live_peers()
+            .into_iter()
+            .filter(|peer| peer.node != me)
+            .collect();
+        let unreachable: Vec<String> = futures::stream::iter(peers)
+            .map(|peer| async move { (!self.cluster.reaches(&peer).await).then_some(peer.node) })
+            .buffer_unordered(4)
+            .filter_map(|node| async move { node })
+            .collect()
+            .await;
+        if !unreachable.is_empty() {
+            return Some(format!(
+                "cannot yet connect to {} at the address it advertises",
+                unreachable.join(", ")
+            ));
+        }
+        None
     }
     /// The registered definition, loading it from the catalog if needed.
     /// Does not open a writer and does not check ownership.
@@ -1640,14 +1768,20 @@ impl Engine {
                 }
                 .await;
                 match outcome {
-                    Ok(generations) => eprintln!(
-                        "walleye.storage warm stream={name} generations={generations} elapsed_ms={}",
-                        started.elapsed().as_millis()
-                    ),
-                    Err(error) => eprintln!(
-                        "walleye.storage warm stream={name} outcome=error elapsed_ms={} error={error}",
-                        started.elapsed().as_millis()
-                    ),
+                    Ok(generations) => {
+                        self.open_failed_mark(&name, false);
+                        eprintln!(
+                            "walleye.storage warm stream={name} generations={generations} elapsed_ms={}",
+                            started.elapsed().as_millis()
+                        )
+                    }
+                    Err(error) => {
+                        self.open_failed_mark(&name, true);
+                        eprintln!(
+                            "walleye.storage warm stream={name} outcome=error elapsed_ms={} error={error}",
+                            started.elapsed().as_millis()
+                        )
+                    }
                 }
             })
             .await;
