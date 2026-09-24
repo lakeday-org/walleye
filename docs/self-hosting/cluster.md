@@ -82,7 +82,10 @@ them, each opening its share and replaying the write-ahead log from the
 surviving replicas before it serves. With the defaults a dead node's tables
 are served again within about 15 seconds. Until then a request for one of them
 is answered 503 with `Retry-After` and `x-walleye-route-error:
-owner-unreachable`, and nothing is written.
+owner-unreachable`, and nothing is written. A request that was already on its
+way to the node when it died may have been applied; it is answered 502 with
+`x-walleye-route-error: outcome-unknown`, never `owner-unreachable`, and a
+forwarding node does not send it again.
 
 A node that was not dead but cut off - paused, or unable to reach the bucket -
 stops acting as an owner when its own lease lapses, which by construction is
