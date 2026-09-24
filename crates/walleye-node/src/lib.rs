@@ -1,4 +1,7 @@
 //! Single-deployment stream API, Foyer peer service, and Bitr node composition.
+// The futures that route a request, fire an alarm and forward to an owner
+// nest deeply enough that proving them Send walks past the default limit.
+#![recursion_limit = "256"]
 pub mod access;
 pub(crate) mod alarms;
 pub mod ask;
