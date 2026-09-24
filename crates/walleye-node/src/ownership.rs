@@ -239,6 +239,14 @@ fn session_name(node_id: &str) -> String {
     format!("{node_id}.{}", &id[..12])
 }
 
+/// The configured node a session belongs to: its name without the session
+/// suffix. Two live sessions of one node are that node's old process and the
+/// process replacing it, as when a one-node instance is upgraded by starting
+/// the new process beside the old one.
+fn slot(session: &str) -> &str {
+    session.rsplit_once('.').map_or(session, |(node, _)| node)
+}
+
 fn wall_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1179,6 +1187,13 @@ impl Ownership {
     /// A key this process should hand back: it holds more than its fair share
     /// of the known keys, and the key belongs to another live process. One
     /// at a time, the one this process has least claim to.
+    ///
+    /// Never to a session of this process's own node. That session is the
+    /// process replacing this one, started beside it and not yet taking
+    /// traffic; it takes every key at once when this one stops and releases
+    /// them. Handing keys to it before then moves tables onto a process that
+    /// is still starting and makes every write to them wait for it, for no
+    /// balance worth having: the two are one node, not two.
     pub fn surplus(&self, known: &[String]) -> Option<String> {
         let me = self.node();
         let state = self.state();
@@ -1195,7 +1210,7 @@ impl Ownership {
                 state
                     .placement
                     .get(key.as_str())
-                    .is_some_and(|peer| peer.node != me)
+                    .is_some_and(|peer| peer.node != me && slot(&peer.node) != slot(&me))
             })
             .min_by_key(|key| score(key, &me))
             .cloned()
@@ -1363,6 +1378,46 @@ mod tests {
             b.claim("t").await.unwrap(),
             Err(Refusal::Owned { .. })
         ));
+    }
+
+    /// A process never hands keys to the session replacing it on its own node,
+    /// however far over its share it is; to another node it does.
+    #[tokio::test]
+    async fn no_hand_back_to_a_successor_of_the_same_node() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = local_store(dir.path());
+        let keys: Vec<String> = (0..8).map(|i| format!("t{i}")).collect();
+        let original = node(&store, "single").await;
+        for key in &keys {
+            assert!(original.claim(key).await.unwrap().is_ok());
+        }
+        let successor = node(&store, "single").await;
+        assert_ne!(original.node(), successor.node());
+        original.sample().await.unwrap();
+        original.plan(&keys);
+        assert_eq!(
+            original.live_peers().len(),
+            2,
+            "the successor is live and seen"
+        );
+        assert_eq!(
+            original.surplus(&keys),
+            None,
+            "nothing is handed to its own successor"
+        );
+
+        let other = node(&store, "node-1").await;
+        original.sample().await.unwrap();
+        original.plan(&keys);
+        let handed = original
+            .surplus(&keys)
+            .expect("over its share with another node live");
+        let placement = original
+            .state()
+            .placement
+            .get(&handed)
+            .map(|peer| peer.node.clone());
+        assert_eq!(placement, Some(other.node()), "only ever to the other node");
     }
 
     /// Placement is balanced within one, the same wherever it is worked out,
