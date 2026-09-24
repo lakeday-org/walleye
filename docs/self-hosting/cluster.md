@@ -102,7 +102,14 @@ as it restarts it copies what it missed from its peers, oldest first, taking
 only records that are committed - a later record's commit watermark covers
 them - and on which every copy agrees, and reading back from the archive any range
 the peers have already trimmed. A write that needs it in the meantime, because
-a second node is gone, brings it up to date first rather than failing. The
+a second node is gone, brings it up to date first rather than failing.
+
+Copying alone would leave it one record short while writes continue, since the
+newest record is never yet known committed, and it would refuse every live
+append after. So when it refuses an append the others already carried, the
+writer's coordinator - the one that knows that append had its quorum - brings
+it level and offers it that append again, and from then on it takes live
+appends itself; it logs `lakeday.replica catch_up outcome=rejoined`. The
 replica logs `lakeday.replica catch_up outcome=complete` when it holds
 everything.
 

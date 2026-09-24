@@ -6523,6 +6523,23 @@ pub struct ReplicaGateway {
     /// handed off to a freshly prepared cohort. Legacy/static gateways leave
     /// this unset.
     control_head: Option<ControlHeadStore>,
+    /// Members that refused a batch for want of its predecessor after the
+    /// batch already had its quorum. See [`Self::repair_lagging`].
+    lagging: Arc<Lagging>,
+}
+
+/// The newest batch each behind member refused, per stream, and a wake for
+/// whoever repairs them.
+#[derive(Default)]
+struct Lagging {
+    refused: Mutex<BTreeMap<(String, String), LateRefusal>>,
+    wake: tokio::sync::Notify,
+}
+
+struct LateRefusal {
+    member: ReplicaNode,
+    records: Vec<EncryptedRecord>,
+    placement: Option<PlacementEpoch>,
 }
 
 impl ReplicaGateway {
@@ -6771,6 +6788,7 @@ impl ReplicaGateway {
             writer_state: tokio::sync::Mutex::new(GatewayWriterState::default()),
             stream_writers: Mutex::new(BTreeMap::new()),
             route_repair_cache: Mutex::new(RouteRepairCache::default()),
+            lagging: Arc::new(Lagging::default()),
             client: reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(1))
                 .timeout(Duration::from_secs(5))
@@ -12881,6 +12899,7 @@ impl ReplicaGateway {
                 Ok(()) => {
                     acknowledgements += 1;
                     if acknowledgements >= self.quorum {
+                        self.note_late_refusals(result_rx, records, placement);
                         return Ok(acknowledgements);
                     }
                 }
@@ -12922,6 +12941,84 @@ impl ReplicaGateway {
             return Err(ReplicaError::LsnConflict);
         }
         Err(ReplicaError::QuorumUnavailable)
+    }
+
+    /// Keeps listening, after a batch had its quorum, to the members that had
+    /// not answered, and notes each one that refused it for want of its
+    /// predecessor.
+    ///
+    /// Such a member is behind, and catch-up alone cannot bring it level while
+    /// writes continue: catch-up copies only what is certainly committed, and
+    /// the newest record never is yet, so the member stays one short and
+    /// refuses every append after. Offering it this batch once it is caught up
+    /// to the batch's predecessor is what closes the gap, as the path short of
+    /// a quorum does inline. Here the write has already been answered, so the
+    /// repair is left to [`Self::repair_lagging`].
+    fn note_late_refusals(
+        &self,
+        mut results: tokio::sync::mpsc::UnboundedReceiver<(ReplicaNode, Result<(), ReplicaError>)>,
+        records: &[EncryptedRecord],
+        placement: Option<PlacementEpoch>,
+    ) {
+        let lagging = Arc::clone(&self.lagging);
+        let records = records.to_vec();
+        tokio::spawn(async move {
+            while let Some((member, result)) = results.recv().await {
+                if !matches!(result, Err(ReplicaError::LsnConflict)) {
+                    continue;
+                }
+                let Some(stream) = records.first().map(|record| record.stream().to_owned()) else {
+                    return;
+                };
+                // Only the newest refusal matters: repairing it covers every
+                // one before it.
+                if let Ok(mut refused) = lagging.refused.lock() {
+                    refused.insert(
+                        (member.id.clone(), stream),
+                        LateRefusal {
+                            member,
+                            records: records.clone(),
+                            placement: placement.clone(),
+                        },
+                    );
+                }
+                lagging.wake.notify_one();
+            }
+        });
+    }
+
+    /// Brings each member noted by [`Self::note_late_refusals`] up to the
+    /// batch it refused, and offers it the batch again. The node's own LSN and
+    /// writer fences decide whether it takes it, exactly as for a first offer.
+    /// Returns how many members took theirs.
+    pub async fn repair_lagging(&self) -> usize {
+        let refused = match self.lagging.refused.lock() {
+            Ok(mut refused) => std::mem::take(&mut *refused),
+            Err(_) => return 0,
+        };
+        let mut repaired = 0;
+        for ((_, stream), late) in refused {
+            // Already level with the batch's predecessor is as good as
+            // brought level: either way the batch is what it lacks.
+            if self.catch_up_member(&stream, &late.member).await.is_err() {
+                continue;
+            }
+            let client = NodeClient::new(late.member.clone(), &self.client, &self.internal_token);
+            if client
+                .append_and_commit_many_with_placement(&late.records, late.placement)
+                .await
+                .is_ok()
+            {
+                repaired += 1;
+            }
+        }
+        repaired
+    }
+
+    /// Resolves once a member has been noted as behind since the last call
+    /// to [`Self::repair_lagging`].
+    pub async fn lagging_noted(&self) {
+        self.lagging.wake.notified().await;
     }
 
     /// Sends the route repair to the members of a route that did not answer

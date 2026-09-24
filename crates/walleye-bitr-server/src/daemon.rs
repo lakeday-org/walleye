@@ -291,6 +291,10 @@ async fn catch_up_loop(gateway: Arc<ReplicaGateway>) -> Result<(), Box<dyn std::
     let started = std::time::Instant::now();
     let mut complete = false;
     loop {
+        let repaired = gateway.repair_lagging().await;
+        if repaired > 0 {
+            eprintln!("lakeday.replica catch_up outcome=rejoined members={repaired}");
+        }
         match gateway.catch_up_local().await {
             Ok(0) => {
                 if !complete {
@@ -300,7 +304,12 @@ async fn catch_up_loop(gateway: Arc<ReplicaGateway>) -> Result<(), Box<dyn std::
                         started.elapsed().as_millis()
                     );
                 }
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                // A member refusing live appends is behind now, not in five
+                // seconds.
+                tokio::select! {
+                    () = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
+                    () = gateway.lagging_noted() => {}
+                }
             }
             Ok(appended) => {
                 eprintln!("lakeday.replica catch_up outcome=appended records={appended}");

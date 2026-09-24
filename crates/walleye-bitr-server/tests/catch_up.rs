@@ -320,3 +320,72 @@ async fn a_withdrawn_orphan_stays_withdrawn_and_committed_records_are_kept() {
         member.stop();
     }
 }
+
+/// A member behind while writes carry on without it rejoins them. Catch-up
+/// alone leaves it one short, since the newest record is not yet certainly
+/// committed, so it refuses every live append after; the refusal of a batch
+/// that already had its quorum is noted, and repairing it offers the member
+/// that batch once it is level, after which it takes live appends itself.
+#[tokio::test]
+async fn a_member_behind_rejoins_live_appends() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (mut members, nodes, gateway) = with_c_behind(dir.path(), false).await;
+    let c = members[2].node.clone();
+    let last = |member: &Member| member.held().last().map(EncryptedRecord::lsn);
+
+    // A and B carry 11; C refuses it for want of 6 to 10, after the quorum.
+    assert_eq!(
+        gateway
+            .append_many(vec![record(11, 2)])
+            .await
+            .expect("a and b"),
+        2
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(5), gateway.lagging_noted())
+        .await
+        .expect("C's refusal is noted");
+
+    // Catch-up by any other coordinator stops at 10, which is what C's own
+    // node does: only the writer's knows 11 had its quorum.
+    let elsewhere = dir.path().join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).expect("dir");
+    let other = self::gateway(&elsewhere, &nodes, true);
+    assert_eq!(
+        other.catch_up_member(STREAM, &c).await.expect("caught up"),
+        Some(6..=10)
+    );
+    assert_eq!(last(&members[2]), Some(10));
+    assert_eq!(
+        other.catch_up_member(STREAM, &c).await.expect("again"),
+        None,
+        "and no further however often it runs"
+    );
+
+    // Repairing offers C the batch it refused, which it now takes.
+    assert_eq!(gateway.repair_lagging().await, 1);
+    assert_eq!(last(&members[2]), Some(11));
+    assert_eq!(members[2].held(), members[0].held());
+    assert_eq!(gateway.repair_lagging().await, 0, "nothing left to repair");
+
+    // And the next append reaches C directly.
+    assert_eq!(
+        gateway.append_many(vec![record(12, 2)]).await.expect("all"),
+        2
+    );
+    let started = std::time::Instant::now();
+    while last(&members[2]) != Some(12) {
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "C took 12 itself"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        gateway.repair_lagging().await,
+        0,
+        "and was never behind again"
+    );
+    for member in &mut members {
+        member.stop();
+    }
+}
