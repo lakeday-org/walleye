@@ -375,19 +375,26 @@ pub async fn get_json(base: &str, path: &str) -> Value {
 }
 
 /// How many of `tables` each of `bases` holds, once every table has an owner
-/// and nothing has moved for several samples.
+/// and nothing has moved for several sweeps.
+///
+/// Stillness counts only once every process sweeps: until a process has
+/// watched the bucket for a lease verdict it hands nothing back, so the
+/// spread holds still then without being settled.
 pub async fn settled_spread(bases: &[&str], tables: &[String], limit: Duration) -> Vec<usize> {
     let started = std::time::Instant::now();
     let mut last: Option<Vec<usize>> = None;
     let mut steady = 0;
     loop {
         let mut counts = Vec::new();
+        let mut sweeping = true;
         for base in bases {
-            let held = held(base).await;
+            let status = status(base).await;
+            sweeping &= status["settled"].as_bool() == Some(true);
+            let held = status["held"].as_object().cloned().unwrap_or_default();
             counts.push(tables.iter().filter(|t| held.contains_key(*t)).count());
         }
         let owned: usize = counts.iter().sum();
-        if owned == tables.len() && last.as_ref() == Some(&counts) {
+        if sweeping && owned == tables.len() && last.as_ref() == Some(&counts) {
             steady += 1;
             if steady >= 6 {
                 return counts;

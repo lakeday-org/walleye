@@ -1231,6 +1231,7 @@ impl Ownership {
 
     /// What this process believes, for `/internal/ownership`.
     pub fn status(&self) -> serde_json::Value {
+        let settled = self.settled();
         let mut state = self.state();
         let authoritative = self.authoritative_locked(&mut state);
         let held: serde_json::Map<String, serde_json::Value> = state
@@ -1255,6 +1256,8 @@ impl Ownership {
             "node": state.session.node,
             "authoritative": authoritative,
             "draining": state.session.draining,
+            // Whether it sweeps yet: claims orphans and hands back surplus.
+            "settled": settled,
             "held": held,
             "leases": leases,
         })
