@@ -746,6 +746,33 @@ async fn asked(engine: &Engine, id: String, question: &str) -> Result<Panel, Err
     })
 }
 
+/// A title from what a result holds: "Revenue by country", "Signups per
+/// day", "Total revenue". None when its shape says nothing so plain.
+fn shape_title(frame: &Frame) -> Option<String> {
+    let columns = frame.profile();
+    let measures: Vec<String> = columns
+        .iter()
+        .filter(|c| c.role == Role::Measure)
+        .map(|c| c.name.replace('_', " "))
+        .collect();
+    let axes: Vec<&Column> = columns.iter().filter(|c| c.role != Role::Measure).collect();
+    if measures.is_empty() || measures.len() > 3 || axes.len() > 1 {
+        return None;
+    }
+    let what = measures.join(" and ");
+    let title = match axes.first() {
+        None => what,
+        Some(axis) if axis.role == Role::Time => {
+            format!("{what} per {}", axis.name.replace('_', " "))
+        }
+        Some(axis) => format!("{what} by {}", axis.name.replace('_', " ")),
+    };
+    let mut chars = title.chars();
+    chars
+        .next()
+        .map(|first| first.to_uppercase().chain(chars).collect())
+}
+
 /// A short title from a question: its first sentence, capitalised, without
 /// the question mark.
 fn title_of(question: &str) -> String {
@@ -896,7 +923,12 @@ pub async fn chat(
             .map(|n| format!("q{n}"))
             .find(|id| !panels.iter().any(|p| &p.id == id))
             .expect("an unused id");
-        let panel = asked(engine, id, message).await?;
+        let mut panel = asked(engine, id, message).await?;
+        // A message says what to do - "also show revenue by country, and put
+        // it first" - which is no title. What came back says what it shows.
+        if let Some(title) = run(engine, &panel).await.ok().and_then(|f| shape_title(&f)) {
+            panel.title = title;
+        }
         added = Some(panel.title.clone());
         panels.push(panel);
     }
@@ -1511,6 +1543,21 @@ mod tests {
         for measure in ["paid", "valid", "amount", "idle"] {
             assert!(!is_identifier(measure), "{measure}");
         }
+    }
+
+    #[test]
+    fn a_result_names_itself_by_its_shape() {
+        let by = |json: &str| shape_title(&frame(json));
+        assert_eq!(
+            by(r#"[{"country":"US","total_revenue":5}]"#).as_deref(),
+            Some("Total revenue by country")
+        );
+        assert_eq!(
+            by(r#"[{"day":"2026-09-01","signups":3}]"#).as_deref(),
+            Some("Signups per day")
+        );
+        assert_eq!(by(r#"[{"revenue":340}]"#).as_deref(), Some("Revenue"));
+        assert_eq!(by(r#"[{"id":1,"plan":"pro","paid":3}]"#), None);
     }
 
     #[test]

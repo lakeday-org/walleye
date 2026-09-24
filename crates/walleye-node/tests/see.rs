@@ -326,10 +326,8 @@ async fn chat_adds_what_was_asked_for() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{changed}");
-    assert_eq!(
-        changed["did"], "added Also show chat revenue by plan",
-        "{changed}"
-    );
+    // Titled by what it shows, not by the instruction that asked for it.
+    assert_eq!(changed["did"], "added Revenue by plan", "{changed}");
     let dashboard = &changed["dashboard"];
     assert_eq!(
         dashboard["panels"].as_array().unwrap().len(),
