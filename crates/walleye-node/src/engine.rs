@@ -3868,6 +3868,21 @@ impl Engine {
             .or_default()
             .clone();
         let _one = lock.lock().await;
+        // A worker's alarm is set by its view's pass, and written before the
+        // pass moves its cursor, so an owner that died between the two left a
+        // pass to replay that sets the alarm again. Replay it before firing:
+        // its setAlarm then replaces this alarm, as setting one again does,
+        // and `begin` below finds it not yet due. Fired first, the old alarm
+        // ran and the replay set a second one, and the worker woke twice.
+        if let Some(view_name) = name.strip_prefix("worker:")
+            && let Ok(view) = self.view(view_name).await
+            && view.source.is_some()
+            && driver_key(&view) == key
+            && let Err(error) = self.drain_rows(&view, 1000).await
+        {
+            // The view's own retry takes it from here; the alarm still fires.
+            eprintln!("walleye.alarm fire key={key} alarm={name} catch_up=error error={error}");
+        }
         let now = wall_ms();
         let begun = self
             .owners

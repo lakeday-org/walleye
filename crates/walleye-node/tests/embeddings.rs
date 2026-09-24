@@ -91,7 +91,6 @@ async fn node(dir: &std::path::Path) -> (Arc<Service>, Router) {
         bitr: false,
         members: vec![Node::new("n", "http://n", 1.0).unwrap()],
         kubernetes: None,
-        processor: None,
         lease: Default::default(),
         api: Some(ApiConfig {
             root_uri: format!("file://{}/store", dir.display()),

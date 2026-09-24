@@ -64,7 +64,6 @@ async fn a_question_about_meaning_is_answered_by_meaning() {
         bitr: false,
         members: vec![Node::new("n", "http://n", 1.0).unwrap()],
         kubernetes: None,
-        processor: None,
         lease: Default::default(),
         api: Some(ApiConfig {
             root_uri: format!("file://{}/store", d.path().display()),
