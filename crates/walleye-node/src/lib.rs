@@ -7,6 +7,7 @@ pub(crate) mod alarms;
 pub mod ask;
 pub mod cluster;
 pub mod cron;
+pub mod edge;
 mod engine;
 pub mod ingest;
 pub mod kubernetes;
@@ -359,6 +360,7 @@ impl Service {
                 (config.members.len() > 1 || config.kubernetes.is_some()).then(|| PeerConfig {
                     token: config.token.clone(),
                     ring: ring.clone(),
+                    headers: edge::peer_headers(),
                 });
             let cached = walleye_lance::CachedStorage::from_backend(
                 cache.clone(),
@@ -911,16 +913,19 @@ pub fn router(service: Arc<Service>) -> Router {
         access: service.access.clone(),
         table: Arc::new(table),
     };
-    router
+    let served = router
         .layer(axum::middleware::from_fn_with_state(
             service.clone(),
             cluster::route_to_owner,
         ))
-        // Outermost, so nothing - not even the forward to a stream's owner,
-        // which carries this node's own token - happens for a caller the
-        // route does not admit.
+        // Outermost but for the edge check, so nothing - not even the
+        // forward to a stream's owner, which carries this node's own token -
+        // happens for a caller the route does not admit.
         .layer(axum::middleware::from_fn_with_state(gate, access::gate))
-        .with_state(service)
+        .with_state(service);
+    // Outside everything: a request the edge did not forward is refused
+    // before any token is read.
+    edge::require(served, edge::configured())
 }
 /// Liveness plus first-boot readiness. A node that has never been write-ready
 /// reports unavailable so a load balancer does not route to it before its
