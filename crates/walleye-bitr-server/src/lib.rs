@@ -6495,6 +6495,13 @@ pub struct GatewayStatus {
 /// Records appended to a catching-up member per request.
 const CATCH_UP_BATCH: usize = 256;
 
+/// Streams one archive pass works on at once.
+const ARCHIVE_STREAMS_IN_FLIGHT: usize = 16;
+
+/// Acknowledged records a writer keeps per stream once the archive holds
+/// them, so a member a moment behind is brought level from memory.
+const WRITER_RECORDS_KEPT: u64 = 128;
+
 /// How many times bringing a member level looks again after the member moved
 /// under it, before giving up until the next refusal.
 const LEVEL_ATTEMPTS: usize = 8;
@@ -6608,35 +6615,102 @@ impl ReplicaGateway {
             .chain(snapshot.committed)
             .map(|record| record.stream().to_owned())
             .collect::<BTreeSet<_>>();
+        // Streams are archived side by side: on an object store every step
+        // is a round trip, and one pass visiting a node's streams one after
+        // another takes as long as all of their round trips added together.
+        let streams: Vec<String> = streams.into_iter().collect();
         let mut archived_records = 0_usize;
         let mut compacted_prefixes = Vec::new();
-        for stream in streams {
-            let archived_lsn = self
-                .archive
-                .archived_lsn(&stream)
-                .await
-                .map_err(|error| ReplicaError::NodeStorage(error.to_string()))?;
-            let (records, _) = self
-                .recover_hot_tail(&stream, archived_lsn, None, None)
-                .await?;
-            if !records.is_empty() {
-                archived_records = archived_records.saturating_add(records.len());
-                self.archive
-                    .archive_committed(&records)
-                    .await
-                    .map_err(|error| ReplicaError::NodeStorage(error.to_string()))?;
-            }
-            if let Some((published_lsn, writer_epoch)) = self
-                .archive
-                .archived_tail(&stream, trimmed.get(&stream).copied().unwrap_or(0))
-                .await
-                .map_err(|error| ReplicaError::NodeStorage(error.to_string()))?
-            {
-                compacted_prefixes.push((stream, published_lsn, writer_epoch));
+        let mut failure = None;
+        for chunk in streams.chunks(ARCHIVE_STREAMS_IN_FLIGHT) {
+            let passes: Vec<_> = chunk
+                .iter()
+                .map(|stream| {
+                    self.archive_stream(stream, trimmed.get(stream).copied().unwrap_or(0))
+                })
+                .collect();
+            for (stream, result) in chunk.iter().zip(join_all(passes).await) {
+                match result {
+                    Ok((records, compacted)) => {
+                        archived_records = archived_records.saturating_add(records);
+                        if let Some((published_lsn, writer_epoch)) = compacted {
+                            compacted_prefixes.push((stream.clone(), published_lsn, writer_epoch));
+                        }
+                    }
+                    Err(error) => {
+                        failure.get_or_insert(error);
+                    }
+                }
             }
         }
         node.compact_archived_batch(&compacted_prefixes)?;
-        Ok(archived_records)
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(archived_records),
+        }
+    }
+
+    /// Archives one stream's newly committed records, lets this coordinator
+    /// forget the acknowledged records the archive now holds, and says how
+    /// far the local member may trim: how many records were archived, and
+    /// the archive's tail when it is past `trimmed_lsn`.
+    async fn archive_stream(
+        &self,
+        stream: &str,
+        trimmed_lsn: u64,
+    ) -> Result<(usize, Option<(u64, u64)>), ReplicaError> {
+        let archived_lsn = self
+            .archive
+            .archived_lsn(stream)
+            .await
+            .map_err(|error| ReplicaError::NodeStorage(error.to_string()))?;
+        let (records, _) = self
+            .recover_hot_tail(stream, archived_lsn, None, None)
+            .await?;
+        let archived_lsn = if records.is_empty() {
+            archived_lsn
+        } else {
+            self.archive
+                .archive_committed(&records)
+                .await
+                .map_err(|error| ReplicaError::NodeStorage(error.to_string()))?
+        };
+        self.forget_archived(stream, archived_lsn).await;
+        let compacted = self
+            .archive
+            .archived_tail(stream, trimmed_lsn)
+            .await
+            .map_err(|error| ReplicaError::NodeStorage(error.to_string()))?;
+        Ok((records.len(), compacted))
+    }
+
+    /// Drops the acknowledged records this coordinator holds for `stream`
+    /// that the archive holds through `archived_lsn`, keeping the newest
+    /// [`WRITER_RECORDS_KEPT`]. The map is what lets the writer bring a member
+    /// level with its tail and certify what it just acknowledged; anything
+    /// older a member lacks comes from the archive through catch-up, and a
+    /// resend of an archived record is proved against the archive. Without
+    /// this the map holds every record the stream was ever written.
+    async fn forget_archived(&self, stream: &str, archived_lsn: u64) {
+        let mut state = self.writer_state.lock().await;
+        if let Some(writer) = state.streams.get_mut(stream) {
+            let below = archived_lsn
+                .min(writer.committed_lsn.saturating_sub(WRITER_RECORDS_KEPT))
+                .saturating_add(1);
+            writer.records = writer.records.split_off(&below);
+        }
+    }
+
+    /// How many acknowledged records this coordinator holds, over every
+    /// stream it writes.
+    pub async fn acknowledged_records(&self) -> usize {
+        self.writer_state
+            .lock()
+            .await
+            .streams
+            .values()
+            .map(|stream| stream.records.len())
+            .sum()
     }
 
     /// Creates a gateway from an immutable explicit membership snapshot.
@@ -13055,9 +13129,13 @@ impl ReplicaGateway {
                 match state.streams.get(stream) {
                     Some(writer) => (
                         writer.committed_lsn,
+                        // A member trimmed past what this writer knows is
+                        // committed wants nothing from it: an empty range,
+                        // never an inverted one.
                         writer
                             .records
-                            .range(floor.saturating_add(1)..=writer.committed_lsn.max(floor))
+                            .range(floor.saturating_add(1)..)
+                            .take_while(|(lsn, _)| **lsn <= writer.committed_lsn)
                             .map(|(lsn, record)| (*lsn, record.clone()))
                             .collect::<BTreeMap<_, _>>(),
                     ),
