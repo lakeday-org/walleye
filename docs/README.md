@@ -24,6 +24,7 @@ managed side adds operations, not capability, and
 - [Lifecycle](concepts/lifecycle.md) — tables open, close and reopen; nodes stop and start
 - [Ingest anything](concepts/ingest.md) — send JSON of any shape, get typed tables
 - [Alarms and schedules](concepts/alarms.md) — scheduled work that runs once, on the owner
+- [Seeing data](concepts/see.md) — a question, a statement or a table, drawn as a dashboard
 
 ## SDKs
 

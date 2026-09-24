@@ -271,3 +271,32 @@
     withdraws a member's own record only when a newer writer's committed
     record replaced it. Counting a member for a position it lacks, or copying
     an uncommitted record, lets a second failure lose an acknowledged write.
+
+- name: dashboard-rows-stay-in-the-node
+  where: "crates/walleye-node/src/see.rs"
+  each: method
+  min: 80
+  ensure: >
+    A request this method sends to the composer worker, or a question it puts to
+    Jev, carries no query rows: only what each panel could be drawn as, described
+    in words, and an empty list in place of each panel's rows. Rows reach only
+    the spec a dashboard is drawn with, after composing.
+
+- name: drawing-a-dashboard-composes-nothing
+  where: "crates/walleye-node/src/see.rs"
+  each: method
+  min: 80
+  ensure: >
+    Drawing a saved dashboard runs its panels' queries and binds their rows into
+    its saved spec, and nothing else: it does not ask Jev, run the composer or
+    call a model. Composing is paid once, when a dashboard is made or changed.
+
+- name: dashboards-say-who-composed-them
+  where: "crates/walleye-node/src/see.rs"
+  each: method
+  min: 80
+  ensure: >
+    A dashboard says `jev` in composed_by only when Jev's choices produced its
+    spec. When Jev is not configured, fails, or leaves a question unanswered and
+    the engine's own first choices are used instead, it says `rules`, so a
+    worse drawing is never passed off as a judged one.

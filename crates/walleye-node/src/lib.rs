@@ -13,6 +13,7 @@ pub mod kubernetes;
 mod lancedb;
 pub mod ownership;
 pub mod reach;
+pub mod see;
 pub mod values;
 use axum::{
     Json, Router,
@@ -902,6 +903,30 @@ pub(crate) fn routes() -> access::Routes<Arc<Service>> {
         // write like any other ingest.
         .route(Method::POST, "/v1/ingest/{source}", Data(Write), ingest_any)
         .route(Method::POST, "/v1/query", Data(Read), query)
+        // Seeing is reading: a question or a table, drawn. A table's own
+        // dashboard is saved as it is made, but that is a cache of reads.
+        .route(Method::POST, "/v1/see", Data(Read), see)
+        .route(Method::GET, "/v1/see/tables/{table}", Data(Read), see_table)
+        .route(Method::GET, "/v1/dashboards", Data(Read), dashboards)
+        .route(Method::GET, "/v1/dashboards/{name}", Data(Read), dashboard)
+        .route(
+            Method::PUT,
+            "/v1/dashboards/{name}",
+            Data(Manage),
+            save_dashboard,
+        )
+        .route(
+            Method::DELETE,
+            "/v1/dashboards/{name}",
+            Data(Manage),
+            delete_dashboard,
+        )
+        .route(
+            Method::POST,
+            "/v1/dashboards/{name}/chat",
+            Data(Manage),
+            chat_dashboard,
+        )
         .map(|router| router.layer(DefaultBodyLimit::max(8 * 1024 * 1024)))
         .merge(lancedb::routes())
 }
@@ -1286,6 +1311,140 @@ async fn query(
         (Some(_), Some(_)) => Err(failure("give a statement or a question, not both")),
         (None, None) => Err(failure("give a statement in `sql` or a question in `text`")),
     }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+/// Something to see: a question in words, or a statement.
+struct Look {
+    #[serde(default)]
+    question: Option<String>,
+    #[serde(default)]
+    sql: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
+}
+fn not_found(what: String) -> ApiError {
+    (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({ "error": what })),
+    )
+}
+fn dashboard_name(name: &str) -> Result<(), ApiError> {
+    if see::valid(name) {
+        Ok(())
+    } else {
+        Err(failure("a dashboard name is letters, digits, `_` and `-`"))
+    }
+}
+/// One question or statement, drawn as Jev thinks it should be, not saved.
+/// What comes back can be saved as it is with `PUT /v1/dashboards/{name}`.
+async fn see(
+    State(s): State<Arc<Service>>,
+    Json(look): Json<Look>,
+) -> Result<Json<see::Drawn>, ApiError> {
+    let engine = api(&s)?;
+    let made = see::look(
+        engine,
+        look.question.as_deref(),
+        look.sql.as_deref(),
+        look.title,
+    )
+    .await
+    .map_err(failure)?;
+    Ok(Json(see::draw(engine, made).await))
+}
+#[derive(Deserialize)]
+struct Fresh {
+    #[serde(default)]
+    fresh: bool,
+}
+/// A table's own dashboard, made the first time it is asked for and again
+/// whenever the table's columns change, or on `?fresh=true`.
+async fn see_table(
+    State(s): State<Arc<Service>>,
+    Path(table): Path<String>,
+    axum::extract::Query(fresh): axum::extract::Query<Fresh>,
+) -> Result<Json<see::Drawn>, ApiError> {
+    let engine = api(&s)?;
+    if !engine::valid_name(&table) {
+        return Err(failure("invalid table name"));
+    }
+    let made = see::for_table(engine, &table, fresh.fresh)
+        .await
+        .map_err(|error| {
+            if error.to_string().starts_with("no table named") {
+                not_found(error.to_string())
+            } else {
+                failure(error)
+            }
+        })?;
+    Ok(Json(see::draw(engine, made).await))
+}
+async fn dashboards(State(s): State<Arc<Service>>) -> Result<Json<serde_json::Value>, ApiError> {
+    let engine = api(&s)?;
+    let listed = see::list(engine).await.map_err(failure)?;
+    Ok(Json(serde_json::json!({ "dashboards": listed })))
+}
+async fn dashboard(
+    State(s): State<Arc<Service>>,
+    Path(name): Path<String>,
+) -> Result<Json<see::Drawn>, ApiError> {
+    let engine = api(&s)?;
+    dashboard_name(&name)?;
+    let saved = see::load(engine, &name)
+        .await
+        .map_err(failure)?
+        .ok_or_else(|| not_found(format!("no dashboard named {name}")))?;
+    Ok(Json(see::draw(engine, saved).await))
+}
+/// Make a dashboard from questions and statements and save it, or save one
+/// already composed as it is.
+async fn save_dashboard(
+    State(s): State<Arc<Service>>,
+    Path(name): Path<String>,
+    Json(request): Json<see::Request>,
+) -> Result<Json<see::Drawn>, ApiError> {
+    let engine = api(&s)?;
+    dashboard_name(&name)?;
+    let made = see::make(engine, &name, request).await.map_err(failure)?;
+    see::save(engine, &made).await.map_err(failure)?;
+    Ok(Json(see::draw(engine, made).await))
+}
+async fn delete_dashboard(
+    State(s): State<Arc<Service>>,
+    Path(name): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let engine = api(&s)?;
+    dashboard_name(&name)?;
+    match see::remove(engine, &name).await.map_err(failure)? {
+        true => Ok(StatusCode::NO_CONTENT),
+        false => Err(not_found(format!("no dashboard named {name}"))),
+    }
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Said {
+    message: String,
+}
+/// Change a saved dashboard by saying what to change.
+async fn chat_dashboard(
+    State(s): State<Arc<Service>>,
+    Path(name): Path<String>,
+    Json(said): Json<Said>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let engine = api(&s)?;
+    dashboard_name(&name)?;
+    let saved = see::load(engine, &name)
+        .await
+        .map_err(failure)?
+        .ok_or_else(|| not_found(format!("no dashboard named {name}")))?;
+    let (changed, did) = see::chat(engine, saved, &said.message)
+        .await
+        .map_err(failure)?;
+    see::save(engine, &changed).await.map_err(failure)?;
+    let drawn = see::draw(engine, changed).await;
+    Ok(Json(serde_json::json!({ "did": did, "dashboard": drawn })))
 }
 
 #[cfg(test)]

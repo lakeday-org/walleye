@@ -28,9 +28,9 @@ one of them.
 
 | Scope | Routes |
 |---|---|
-| `data:read` | list and describe tables and views, `query/`, `count_rows/`, `index/list/`, `get_lsm_stats/`, `POST /v1/query` |
+| `data:read` | list and describe tables and views, `query/`, `count_rows/`, `index/list/`, `get_lsm_stats/`, `POST /v1/query`, `POST /v1/see`, `GET /v1/see/tables/{table}`, and listing and drawing dashboards |
 | `data:write` | `insert/`, `POST /v1/streams/{name}/events`, and a worker's `/v1/worker/{name}/` |
-| `data:manage` | `create/`, `drop/`, `create_index/`, `compact_lsm/`, `flush_lsm/`, `POST /v1/streams`, and creating, dropping and refreshing views |
+| `data:manage` | `create/`, `drop/`, `create_index/`, `compact_lsm/`, `flush_lsm/`, `POST /v1/streams`, creating, dropping and refreshing views, and saving, changing and removing dashboards |
 
 No scope implies another: a token that creates tables and reads them holds
 `data:manage` and `data:read`. A route that names no scope is refused to every
@@ -109,6 +109,21 @@ That gather refuses any single table over a million rows — see
 
 This is a Walleye route. LanceDB has no SQL endpoint, so no client has a call
 for it.
+
+## Dashboards
+
+| Route | What it does |
+|---|---|
+| `POST /v1/see` | Draw a `question` or a `sql` statement, without saving it |
+| `GET /v1/see/tables/{table}` | A table's own dashboard, made once and kept; `?fresh=true` makes it again |
+| `GET /v1/dashboards` | Every saved dashboard, newest first |
+| `PUT /v1/dashboards/{name}` | Make one from `questions` and `panels`, or save a `spec` as it is |
+| `GET /v1/dashboards/{name}` | Draw it from its queries' rows as they are now |
+| `POST /v1/dashboards/{name}/chat` | Change it: `{"message": "Also show revenue by country"}` |
+| `DELETE /v1/dashboards/{name}` | Remove it |
+
+Each answers with a json-render spec whose state holds every panel's rows.
+[Seeing data](../concepts/see.md) says how the drawing is chosen.
 
 ## Health
 

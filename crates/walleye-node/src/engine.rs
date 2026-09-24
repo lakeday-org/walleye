@@ -699,6 +699,8 @@ pub struct Engine {
     data_path: Path,
     /// Where the ingest path keeps its routes and table rules.
     ingest_path: Path,
+    /// Where saved dashboards are kept.
+    dashboards_path: Path,
     ingest: crate::ingest::State,
     /// One pass per view at a time. A pass reads the cursor, does its work and
     /// only then moves the cursor, so two overlapping passes both start from
@@ -825,6 +827,7 @@ impl Engine {
             catalog_path: prefix.clone().join("streams"),
             views_path: prefix.clone().join("views"),
             ingest_path: prefix.clone().join("ingest"),
+            dashboards_path: prefix.clone().join("dashboards"),
             ingest: crate::ingest::State::default(),
             view_passes: Mutex::new(HashMap::new()),
             data_path: prefix.join("data"),
@@ -1655,6 +1658,10 @@ impl Engine {
     /// The object store and prefix the ingest path keeps its rules under.
     pub(crate) fn ingest_store(&self) -> (&Arc<ObjectStore>, &Path, &crate::ingest::State) {
         (&self.catalog, &self.ingest_path, &self.ingest)
+    }
+    /// The object store and prefix saved dashboards are kept under.
+    pub(crate) fn dashboard_store(&self) -> (&Arc<ObjectStore>, &Path) {
+        (&self.catalog, &self.dashboards_path)
     }
     pub async fn table_names(&self) -> Result<Vec<String>, Error> {
         self.refresh_catalog().await?;

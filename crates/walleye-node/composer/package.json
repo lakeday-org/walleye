@@ -1,0 +1,16 @@
+{
+  "name": "walleye-composer",
+  "private": true,
+  "description": "Chooses and lays out a dashboard from app-owned panels, with json-render's composer, inside a walleye V8 worker.",
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs"
+  },
+  "dependencies": {
+    "@json-render/core": "0.21.0",
+    "zod": "4.3.6"
+  },
+  "devDependencies": {
+    "esbuild": "0.25.10"
+  }
+}
