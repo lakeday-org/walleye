@@ -366,7 +366,10 @@ async fn a_fenced_writer_takes_the_stream_back_on_its_next_write() {
         schema,
         vec!["id".into()],
     )
-    .unwrap();
+    .unwrap()
+    // The engine names the bucket's own write-ahead log this way; a writer
+    // replays another's tail only in the log both name.
+    .with_log("object-store");
     let claimed = Table::open(
         interloper,
         LanceStorageOptions::default(),
@@ -463,7 +466,10 @@ async fn a_write_fenced_by_another_writer_is_retryable() {
         schema,
         vec!["id".into()],
     )
-    .unwrap();
+    .unwrap()
+    // The engine names the bucket's own write-ahead log this way; a writer
+    // replays another's tail only in the log both name.
+    .with_log("object-store");
     let _claimed = Table::open(
         successor,
         LanceStorageOptions::default(),
