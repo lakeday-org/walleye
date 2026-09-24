@@ -40,8 +40,8 @@ pub use lance::dataset::mem_wal::{CompactionResult, Compactor};
 pub use sql::{SnapshotSource, TableSnapshot, query, query_with_gathered, sql_table_names};
 pub use storage_options::LanceStorageOptions;
 pub use table::{
-    LsmStats, ScanResult, SearchRequest, SsTableStats, Table, TableConfig, TextIndexSpec,
-    TextQuery, VectorIndexSpec, VectorQuery, is_claim_race, next_writer_epoch,
+    LsmStats, Prepared, ScanResult, SearchRequest, SsTableStats, Table, TableConfig, TextIndexSpec,
+    TextQuery, VectorIndexSpec, VectorQuery, Warmer, is_claim_race, next_writer_epoch,
     prepare_bitr_takeover,
 };
 pub type Error = WalBackendError;
