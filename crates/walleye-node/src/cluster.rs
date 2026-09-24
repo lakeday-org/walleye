@@ -194,10 +194,7 @@ impl Cluster {
     /// not the peer's state.
     pub async fn reaches(&self, peer: &Peer) -> bool {
         let url = format!("{}/healthz", peer.addr.trim_end_matches('/'));
-        let Ok(client) = Self::client() else {
-            return false;
-        };
-        client
+        self.client
             .get(&url)
             .timeout(std::time::Duration::from_secs(3))
             .send()
