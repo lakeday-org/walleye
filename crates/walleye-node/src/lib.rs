@@ -948,6 +948,14 @@ async fn healthz(State(s): State<Arc<Service>>) -> Response {
 /// with one address has to ask: is the whole cluster serving, rather than a
 /// quorum of it. A ready answer names the members that are serving, so the
 /// caller can tell those apart without reaching each node.
+///
+/// `?require=all&tables=served` adds the table question, which only this node
+/// can answer for itself: it has judged the leases it found at start, every
+/// table has a live owner, it is handing nothing back, every table it holds
+/// has an open writer, and it reaches every live peer where that peer says it
+/// is. A caller that gets this from every node may call the cluster running
+/// and have every table answer its first request. A roll or a swap asks
+/// without it: they move tables on purpose.
 async fn readyz(
     State(s): State<Arc<Service>>,
     axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>,
@@ -973,6 +981,19 @@ async fn readyz(
                 serving + absent
             ));
         }
+    }
+    // `tables=served` asks, beyond the members, whether every table is served
+    // from here: settled owners, open writers, reachable peers. A caller about
+    // to call a cluster running asks each node this; a roll or a swap does not.
+    if ready
+        && query.get("require").map(String::as_str) == Some("all")
+        && query.get("tables").map(String::as_str) == Some("served")
+        && let Some(engine) = s.engine()
+        && let Some(reason) = engine.tables_served()
+    {
+        ready = false;
+        detail["ready"] = serde_json::json!(false);
+        detail["reason"] = serde_json::json!(reason);
     }
     if ready {
         (StatusCode::OK, Json(detail)).into_response()

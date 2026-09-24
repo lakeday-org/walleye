@@ -188,6 +188,22 @@ impl Cluster {
             .pool_idle_timeout(std::time::Duration::from_secs(5))
             .build()
     }
+    /// Whether `peer` accepts a connection at the address it advertises, the
+    /// one a forward would use. Any HTTP answer counts, `/healthz` included
+    /// while the peer is still starting: the question is the network path,
+    /// not the peer's state.
+    pub async fn reaches(&self, peer: &Peer) -> bool {
+        let url = format!("{}/healthz", peer.addr.trim_end_matches('/'));
+        let Ok(client) = Self::client() else {
+            return false;
+        };
+        client
+            .get(&url)
+            .timeout(std::time::Duration::from_secs(3))
+            .send()
+            .await
+            .is_ok()
+    }
     /// Fetch every row of `stream` from the member that owns it, as an Arrow
     /// IPC file, for a query that spans owners.
     pub async fn fetch_snapshot(&self, owner: &Peer, stream: &str) -> Result<bytes::Bytes, String> {
