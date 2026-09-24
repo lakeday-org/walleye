@@ -1148,6 +1148,17 @@ impl Engine {
     /// connect to every live peer at the address it advertises.
     pub async fn check_served(&self) {
         self.reopen_failed().await;
+        // Peers are only worth probing once ownership has settled: until then
+        // the answer is already no, and the probes would only add load while
+        // tables are moving.
+        let settled = self
+            .tables_pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_none();
+        if !settled {
+            return;
+        }
         let me = self.owners.node();
         let peers: Vec<crate::ownership::Peer> = self
             .owners
