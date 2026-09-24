@@ -553,29 +553,41 @@ impl OpaqueArchive {
         Ok((head.released_lsn, head.archived_lsn))
     }
 
-    /// Lets go of the stream's archive through `through_lsn`, as far as it is
-    /// archived: the head records the release first, so no read that loads
-    /// it afterwards asks for what follows, and then every segment wholly
-    /// inside the released prefix is deleted, with every index page that
-    /// names only such segments. A read that loaded the head before the
-    /// release and wanted part of that prefix fails and is retried; nothing
-    /// that reads from the table's checkpoint onwards ever wanted it.
-    /// Returns the released watermark.
-    pub async fn release(&self, stream: &str, through_lsn: u64) -> Result<u64, ArchiveError> {
+    /// Lets go of the stream's archive through `through_lsn`, a position the
+    /// table's durable checkpoint covers: the head records the release
+    /// first, so no read that loads it afterwards asks for what precedes it,
+    /// and then every segment wholly inside the released prefix is deleted,
+    /// with every index page that names only such segments. A read that
+    /// loaded the head before the release and wanted part of that prefix
+    /// fails and is retried; nothing that reads from the table's checkpoint
+    /// onwards ever wanted it.
+    ///
+    /// A checkpoint can cover positions the archive never received - records
+    /// committed after the last archive pass on replicas whose volumes are
+    /// gone, which the checkpoint made unnecessary. The release then moves
+    /// the archive's tail to the checkpoint too, so the log continues after
+    /// it rather than stopping short of what the table has already flushed.
+    /// Returns the released watermark and the head's writer epoch.
+    pub async fn release(
+        &self,
+        stream: &str,
+        through_lsn: u64,
+    ) -> Result<(u64, u64), ArchiveError> {
         let mut contention_attempts = 0_usize;
         loop {
             let loaded = self.load_head(stream).await?;
             let head = loaded.head;
             self.validate_head_chain(stream, &head)?;
-            let target = through_lsn.min(head.archived_lsn);
+            let target = through_lsn;
             if target <= head.released_lsn {
-                return Ok(head.released_lsn);
+                return Ok((head.released_lsn, head.writer_epoch));
             }
             let (references, pages) = self.walk(stream, &head, head.released_lsn).await?;
             // The head names nothing released: those references, and the
             // newest page once all it names is released, go with the objects.
             let mut next = head.clone();
             next.released_lsn = target;
+            next.archived_lsn = next.archived_lsn.max(target);
             next.segments
                 .retain(|reference| reference.last_lsn > target);
             if next
@@ -619,7 +631,7 @@ impl OpaqueArchive {
                     }
                 }
             }
-            return Ok(target);
+            return Ok((target, next.writer_epoch));
         }
     }
 

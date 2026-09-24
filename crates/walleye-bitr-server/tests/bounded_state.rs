@@ -486,9 +486,12 @@ async fn a_release_deletes_the_archive_below_the_checkpoint() {
             released_lsn: 1_190
         })
     ));
-    // A release never moves back, and never past what is archived.
-    assert_eq!(archive.release(STREAM, 5).await.expect("noop"), 1_190);
-    assert_eq!(archive.release(STREAM, 9_999).await.expect("capped"), 1_200);
+    // A release never moves back.
+    assert_eq!(archive.release(STREAM, 5).await.expect("noop"), (1_190, 1));
+    assert_eq!(
+        archive.release(STREAM, 1_200).await.expect("to the tail"),
+        (1_200, 1)
+    );
     assert_eq!(archive.recover(STREAM, 1_200).await.expect("tail"), vec![]);
     assert_eq!(
         archive.stream_heads().await.expect("heads"),
@@ -500,6 +503,31 @@ async fn a_release_deletes_the_archive_below_the_checkpoint() {
         .await
         .expect("archived after the release");
     assert_eq!(archive.recover(STREAM, 1_200).await.expect("tail").len(), 1);
+    // A checkpoint past the archive's tail - records the archive never got,
+    // which the checkpoint made unnecessary - moves the tail with it, and the
+    // stream continues after it.
+    assert_eq!(
+        archive.release(STREAM, 1_205).await.expect("past the tail"),
+        (1_205, 1)
+    );
+    assert_eq!(
+        archive.extent(STREAM).await.expect("extent"),
+        (1_205, 1_205)
+    );
+    archive
+        .archive_committed(&[record(STREAM, 1_206, 1)])
+        .await
+        .expect("archived after the checkpoint");
+    assert_eq!(
+        archive
+            .recover(STREAM, 1_205)
+            .await
+            .expect("tail")
+            .iter()
+            .map(EncryptedRecord::lsn)
+            .collect::<Vec<_>>(),
+        vec![1_206]
+    );
 }
 
 /// A member away while its peers wrote, archived and released far past where
