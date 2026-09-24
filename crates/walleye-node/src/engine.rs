@@ -724,6 +724,11 @@ pub struct Engine {
     /// Where the ingest path keeps its routes and table rules.
     ingest_path: Path,
     ingest: crate::ingest::State,
+    /// One pass per view at a time. A pass reads the cursor, does its work and
+    /// only then moves the cursor, so two overlapping passes both start from
+    /// the same place and both deliver the same rows. The node's processor
+    /// and a caller's refresh are two such passes.
+    view_passes: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     streams: Mutex<BTreeMap<String, Arc<Stream>>>,
     // Names whose drop is still in flight. A catalog load that read the
     // definition object before `drop_table` deleted it would otherwise
@@ -795,6 +800,7 @@ impl Engine {
             views_path: prefix.clone().join("views"),
             ingest_path: prefix.clone().join("ingest"),
             ingest: crate::ingest::State::default(),
+            view_passes: Mutex::new(HashMap::new()),
             data_path: prefix.join("data"),
             streams: Mutex::new(BTreeMap::new()),
             dropping: Mutex::new(BTreeSet::new()),
@@ -2663,6 +2669,16 @@ impl Engine {
     /// holds only while the query is a deterministic function of its input,
     /// which is the contract a view signs.
     pub async fn refresh_view(&self, name: &str) -> Result<Progress, Error> {
+        // Held from before the cursor is read until after it moves, so a pass
+        // that waited here starts from wherever the one before it finished.
+        let pass = self
+            .view_passes
+            .lock()
+            .await
+            .entry(name.to_owned())
+            .or_default()
+            .clone();
+        let _only_pass = pass.lock().await;
         let view = self.view(name).await?;
         let consumer = format!("view:{name}");
         let cursor = self.cursor(&consumer).await?;

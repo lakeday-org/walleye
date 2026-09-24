@@ -283,38 +283,48 @@ async fn an_alert_delivers_rows_and_retries_until_it_lands() {
     )
     .await;
 
-    // The endpoint refuses, so the pass fails and nothing is consumed.
-    let (status, body) = post(&app, "/v1/view/overheating/refresh/", JSON, b"{}".to_vec()).await;
-    assert_ne!(
-        status,
-        StatusCode::OK,
-        "a refused delivery is not a success"
-    );
-    assert!(body.to_string().contains("503"), "{body}");
-    let described = post(&app, "/v1/view/overheating/describe/", JSON, b"{}".to_vec()).await;
+    // The node's own driver runs this view too, woken by every write, so which
+    // pass meets the refusal and which delivers is not something to assert.
+    // What the endpoint heard is: refused once, the same rows offered again,
+    // accepted once. Were the cursor to move on a refusal, those rows would
+    // never be offered again and nothing would land.
+    for _ in 0..20 {
+        if !seen.lock().unwrap().is_empty() {
+            break;
+        }
+        let _ = post(&app, "/v1/view/overheating/refresh/", JSON, b"{}".to_vec()).await;
+    }
     assert_eq!(
-        described.1["cursor"].as_u64().unwrap(),
-        0,
-        "nothing consumed"
-    );
-
-    // On the next pass the endpoint accepts, and the same rows arrive.
-    let progress = refresh(&app, "overheating").await;
-    assert_eq!(progress["delivered"], 1, "{progress}");
-    assert_eq!(
-        progress["written"], 0,
-        "a watching view writes nothing: {progress}"
+        refused.load(Ordering::SeqCst),
+        2,
+        "refused once, then offered again and accepted"
     );
     let delivered = seen.lock().unwrap().clone();
     assert_eq!(delivered.len(), 1, "one delivery landed");
     let rows = delivered[0].as_array().expect("an array of rows");
     assert_eq!(rows.len(), 1, "only the hot sensor: {:?}", rows);
     assert_eq!(rows[0]["sensor"], "b");
+    let described = post(&app, "/v1/view/overheating/describe/", JSON, b"{}".to_vec()).await;
+    assert!(
+        described.1["cursor"].as_u64().unwrap() > 0,
+        "consumed once delivered: {}",
+        described.1
+    );
+    let progress = refresh(&app, "overheating").await;
+    assert_eq!(
+        progress["written"], 0,
+        "a watching view writes nothing: {progress}"
+    );
 
     // And a caught-up view stops firing, rather than repeating itself.
     let quiet = refresh(&app, "overheating").await;
     assert_eq!(quiet["delivered"], 0, "{quiet}");
     assert_eq!(seen.lock().unwrap().len(), 1, "no repeat delivery");
+    assert_eq!(
+        refused.load(Ordering::SeqCst),
+        2,
+        "and nothing was sent again"
+    );
 }
 
 /// A view must produce something. One that neither writes nor tells anyone is
@@ -983,4 +993,59 @@ async fn a_socket_view_is_checked_when_it_is_declared() {
         assert_ne!(status, StatusCode::OK, "{wanted}");
         assert!(body.to_string().contains(wanted), "{wanted}: {body}");
     }
+}
+
+/// Two passes over one view at once - the node's own processor and a caller's
+/// refresh, say - must not both deliver the same rows. Each read the cursor
+/// before either moved it, so an alert fired once per pass rather than once
+/// per row: at least once had quietly become at least twice.
+///
+/// The endpoint takes its time answering, which holds the window open that the
+/// passes used to race through, so this fails every time rather than now and
+/// then.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_passes_at_once_deliver_each_row_once() {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+    let recorded = Arc::clone(&seen);
+    let endpoint = axum::Router::new().route(
+        "/fire",
+        axum::routing::post(move |body: String| {
+            let recorded = Arc::clone(&recorded);
+            async move {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                let rows: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+                recorded.lock().unwrap().push(rows);
+                StatusCode::OK
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, endpoint).await;
+    });
+
+    let d = tempfile::tempdir().unwrap();
+    let app = seeded(d.path(), &["a", "b"], &[20.0, 99.0]).await;
+    define(
+        &app,
+        "overheating_twice",
+        json!({
+            "source": "raw",
+            "sql": "SELECT sensor, celsius FROM raw WHERE celsius > 90",
+            "alert": {"url": format!("http://{address}/fire")}
+        }),
+    )
+    .await;
+
+    let (first, second) = tokio::join!(
+        refresh(&app, "overheating_twice"),
+        refresh(&app, "overheating_twice")
+    );
+    let delivered = first["delivered"].as_u64().unwrap() + second["delivered"].as_u64().unwrap();
+    assert_eq!(
+        delivered, 1,
+        "one pass delivered, the other found nothing: {first} {second}"
+    );
+    assert_eq!(seen.lock().unwrap().len(), 1, "the endpoint heard once");
 }
