@@ -21,6 +21,14 @@ const HEAD_UPDATE_ATTEMPTS: usize = 8;
 /// segments, which grows with the history since the last flush.
 const SEGMENT_READS_IN_FLIGHT: usize = 32;
 
+/// Segment references the head holds before it folds the oldest into an index
+/// page, and how many of the newest it keeps when it does. The head is read
+/// and rewritten on every archive pass by every member, so it has to stay the
+/// same size however long the stream lives; the newest references stay in it
+/// because recovery and catch-up almost always start there.
+const HEAD_SEGMENTS_MAX: usize = 64;
+const HEAD_SEGMENTS_KEPT: usize = 16;
+
 /// Failure to publish or verify an opaque archive stream.
 #[derive(Debug, Error)]
 pub enum ArchiveError {
@@ -65,7 +73,28 @@ struct ArchiveHead {
     stream: String,
     archived_lsn: u64,
     writer_epoch: u64,
+    /// The newest index page: the references to every segment before
+    /// `segments`, folded out of the head so it stays small.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    page: Option<PageRef>,
     segments: Vec<SegmentRef>,
+}
+
+/// An immutable, content-addressed page of segment references, and the page
+/// before it. Pages chain back to the stream's first segment.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct IndexPage {
+    stream: String,
+    previous: Option<PageRef>,
+    segments: Vec<SegmentRef>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct PageRef {
+    first_lsn: u64,
+    last_lsn: u64,
+    key: String,
+    digest: String,
 }
 
 struct LoadedHead {
@@ -187,6 +216,9 @@ impl OpaqueArchive {
                 .last()
                 .map_or(next.writer_epoch, EncryptedRecord::writer_epoch);
             next.segments.push(segment_ref);
+            if next.segments.len() > HEAD_SEGMENTS_MAX {
+                self.fold(&mut next).await?;
+            }
             match self.put_head(&next, loaded.update).await {
                 Ok(()) => {
                     contention_attempts = 0;
@@ -270,10 +302,12 @@ impl OpaqueArchive {
         let mut expected_lsn = start_lsn;
         let mut range_complete = false;
         let mut previous_writer_epoch = None;
-        let wanted: Vec<&SegmentRef> = head
-            .segments
+        let references = self
+            .references_after(stream, &head, start_lsn.saturating_sub(1))
+            .await?;
+        let wanted: Vec<&SegmentRef> = references
             .iter()
-            .filter(|reference| reference.last_lsn >= start_lsn && reference.first_lsn <= end_lsn)
+            .filter(|reference| reference.first_lsn <= end_lsn)
             .collect();
         for segment in self.load_segments(stream, &wanted).await? {
             for record in &segment.records {
@@ -335,21 +369,9 @@ impl OpaqueArchive {
         if head.archived_lsn == after_lsn {
             return Ok(None);
         }
-        let mut expected = 1_u64;
-        for reference in &head.segments {
-            if reference.first_lsn != expected || reference.last_lsn < reference.first_lsn {
-                return Err(ArchiveError::Contiguity(format!(
-                    "expected segment at LSN {expected}, received {}",
-                    reference.first_lsn
-                )));
-            }
-            expected = reference.last_lsn.saturating_add(1);
-        }
-        let wanted: Vec<&SegmentRef> = head
-            .segments
-            .iter()
-            .filter(|reference| reference.last_lsn > after_lsn)
-            .collect();
+        self.validate_head_chain(stream, &head)?;
+        let references = self.references_after(stream, &head, after_lsn).await?;
+        let wanted: Vec<&SegmentRef> = references.iter().collect();
         let mut verified_epoch = 0_u64;
         for segment in self.load_segments(stream, &wanted).await? {
             if segment
@@ -366,7 +388,7 @@ impl OpaqueArchive {
                 .last()
                 .map_or(verified_epoch, EncryptedRecord::writer_epoch);
         }
-        if head.archived_lsn != expected.saturating_sub(1) || verified_epoch != head.writer_epoch {
+        if verified_epoch != head.writer_epoch {
             return Err(ArchiveError::Contiguity(
                 "archive head does not match its verified tail".to_owned(),
             ));
@@ -381,25 +403,13 @@ impl OpaqueArchive {
         after_lsn: u64,
     ) -> Result<Vec<EncryptedRecord>, ArchiveError> {
         let head = self.load_head(stream).await?.head;
-        let mut expected = 1_u64;
-        for reference in &head.segments {
-            if reference.first_lsn != expected || reference.last_lsn < reference.first_lsn {
-                return Err(ArchiveError::Contiguity(format!(
-                    "expected segment at LSN {expected}, received {}",
-                    reference.first_lsn
-                )));
-            }
-            expected = reference.last_lsn.saturating_add(1);
-        }
+        self.validate_head_chain(stream, &head)?;
         // A segment wholly below the requested tail contributes no record.
-        // Its place in the chain is proven by the head's references; fetching
-        // and hashing it would make every open of a long-lived stream walk
-        // its entire history for nothing.
-        let wanted: Vec<&SegmentRef> = head
-            .segments
-            .iter()
-            .filter(|reference| reference.last_lsn > after_lsn)
-            .collect();
+        // Its place in the chain is proven by the references; fetching and
+        // hashing it would make every open of a long-lived stream walk its
+        // entire history for nothing.
+        let references = self.references_after(stream, &head, after_lsn).await?;
+        let wanted: Vec<&SegmentRef> = references.iter().collect();
         let mut tail_writer_epoch = 0_u64;
         let mut recovered = Vec::new();
         for segment in self.load_segments(stream, &wanted).await? {
@@ -423,13 +433,6 @@ impl OpaqueArchive {
                     .filter(|record| record.lsn() > after_lsn),
             );
         }
-        if head.archived_lsn != expected.saturating_sub(1) {
-            return Err(ArchiveError::Contiguity(format!(
-                "head {} does not match segment tail {}",
-                head.archived_lsn,
-                expected.saturating_sub(1)
-            )));
-        }
         // The epoch chain is checked across the segments that were read. When
         // the requested tail lies at or beyond the archived head, none were,
         // and the head's own epoch is the only evidence there is.
@@ -439,6 +442,133 @@ impl OpaqueArchive {
             ));
         }
         Ok(recovered)
+    }
+
+    /// Every segment reference with records after `after_lsn`, in order:
+    /// the head's own, and as many index pages back as the range reaches.
+    /// Each page is checked against its digest, and the chain must run
+    /// contiguously from the first reference returned to the archived tail.
+    async fn references_after(
+        &self,
+        stream: &str,
+        head: &ArchiveHead,
+        after_lsn: u64,
+    ) -> Result<Vec<SegmentRef>, ArchiveError> {
+        if after_lsn >= head.archived_lsn {
+            return Ok(Vec::new());
+        }
+        let mut references = head.segments.clone();
+        let mut next_page = head.page.clone();
+        while references
+            .first()
+            .is_none_or(|first| first.first_lsn > after_lsn.saturating_add(1))
+        {
+            let Some(reference) = next_page else {
+                break;
+            };
+            let page = self.read_page(stream, &reference).await?;
+            if page.segments.last().map(|last| last.last_lsn)
+                != references
+                    .first()
+                    .map(|first| first.first_lsn.saturating_sub(1))
+                    .or(Some(reference.last_lsn))
+            {
+                return Err(ArchiveError::Contiguity(format!(
+                    "index page {} does not meet the references after it",
+                    reference.key
+                )));
+            }
+            next_page = page.previous;
+            let mut older = page.segments;
+            older.append(&mut references);
+            references = older;
+        }
+        let mut expected = references.first().map_or(1, |first| first.first_lsn);
+        if expected > after_lsn.saturating_add(1) {
+            return Err(ArchiveError::Contiguity(format!(
+                "archive references start at LSN {expected}, after {after_lsn} was requested"
+            )));
+        }
+        for reference in &references {
+            if reference.first_lsn != expected || reference.last_lsn < reference.first_lsn {
+                return Err(ArchiveError::Contiguity(format!(
+                    "expected segment at LSN {expected}, received {}",
+                    reference.first_lsn
+                )));
+            }
+            expected = reference.last_lsn.saturating_add(1);
+        }
+        if expected.saturating_sub(1) != head.archived_lsn {
+            return Err(ArchiveError::Contiguity(format!(
+                "head {} does not match segment tail {}",
+                head.archived_lsn,
+                expected.saturating_sub(1)
+            )));
+        }
+        references.retain(|reference| reference.last_lsn > after_lsn);
+        Ok(references)
+    }
+
+    /// Moves all but the newest references out of `head` into a new index
+    /// page, chained to the page before it.
+    async fn fold(&self, head: &mut ArchiveHead) -> Result<(), ArchiveError> {
+        let kept = head
+            .segments
+            .split_off(head.segments.len() - HEAD_SEGMENTS_KEPT);
+        let folded = std::mem::replace(&mut head.segments, kept);
+        let (Some(first), Some(last)) = (folded.first(), folded.last()) else {
+            return Ok(());
+        };
+        let (first_lsn, last_lsn) = (first.first_lsn, last.last_lsn);
+        let page = IndexPage {
+            stream: head.stream.clone(),
+            previous: head.page.take(),
+            segments: folded,
+        };
+        let bytes = serde_json::to_vec(&page)?;
+        let digest = hex::encode(Sha256::digest(&bytes));
+        let key = format!(
+            "{}/streams/{}/index/{first_lsn:020}-{last_lsn:020}-{digest}.json",
+            self.prefix,
+            stream_digest(&head.stream)
+        );
+        self.put_immutable(&key, bytes).await?;
+        head.page = Some(PageRef {
+            first_lsn,
+            last_lsn,
+            key,
+            digest,
+        });
+        Ok(())
+    }
+
+    /// Reads one index page and checks it against the reference to it.
+    async fn read_page(
+        &self,
+        stream: &str,
+        reference: &PageRef,
+    ) -> Result<IndexPage, ArchiveError> {
+        let path = Path::from(reference.key.as_str());
+        let bytes = self.store.get(&path).await?.bytes().await?;
+        if hex::encode(Sha256::digest(&bytes)) != reference.digest {
+            return Err(ArchiveError::Checksum(reference.key.clone()));
+        }
+        let page: IndexPage = serde_json::from_slice(&bytes)?;
+        if page.stream != stream
+            || page.segments.first().map(|first| first.first_lsn) != Some(reference.first_lsn)
+            || page.segments.last().map(|last| last.last_lsn) != Some(reference.last_lsn)
+            || page
+                .previous
+                .as_ref()
+                .is_some_and(|previous| previous.last_lsn.saturating_add(1) != reference.first_lsn)
+            || (page.previous.is_none() && reference.first_lsn != 1)
+        {
+            return Err(ArchiveError::Contiguity(format!(
+                "index page {} does not match the reference to it",
+                reference.key
+            )));
+        }
+        Ok(page)
     }
 
     /// Reads the segments `references` name, several at a time, each checked
@@ -487,7 +617,18 @@ impl OpaqueArchive {
             self.prefix,
             stream_digest(stream)
         );
-        let path = Path::from(key.as_str());
+        self.put_immutable(&key, bytes).await?;
+        Ok(SegmentRef {
+            first_lsn,
+            last_lsn,
+            key,
+            digest,
+        })
+    }
+
+    /// Writes one content-addressed object, accepting an exact retry.
+    async fn put_immutable(&self, key: &str, bytes: Vec<u8>) -> Result<(), ArchiveError> {
+        let path = Path::from(key);
         let result = self
             .store
             .put_opts(
@@ -502,17 +643,12 @@ impl OpaqueArchive {
         if let Err(object_store::Error::AlreadyExists { .. }) = result {
             let existing = self.store.get(&path).await?.bytes().await?;
             if existing.as_ref() != bytes.as_slice() {
-                return Err(ArchiveError::Checksum(key));
+                return Err(ArchiveError::Checksum(key.to_owned()));
             }
         } else {
             result?;
         }
-        Ok(SegmentRef {
-            first_lsn,
-            last_lsn,
-            key,
-            digest,
-        })
+        Ok(())
     }
 
     /// Loads one head with its conditional-update identity or an empty stream head.
@@ -536,6 +672,7 @@ impl OpaqueArchive {
                     stream: stream.to_owned(),
                     archived_lsn: 0,
                     writer_epoch: 0,
+                    page: None,
                     segments: Vec::new(),
                 },
                 update: None,
@@ -615,6 +752,20 @@ impl OpaqueArchive {
             stream_digest(stream)
         );
         let mut expected = 1_u64;
+        if let Some(page) = &head.page {
+            let index_prefix = format!("{}/streams/{}/index/", self.prefix, stream_digest(stream));
+            if !page.key.starts_with(&index_prefix)
+                || page.digest.len() != 64
+                || !page.digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+                || page.first_lsn == 0
+                || page.last_lsn < page.first_lsn
+            {
+                return Err(ArchiveError::Checksum(page.key.clone()));
+            }
+            expected = page.last_lsn.checked_add(1).ok_or_else(|| {
+                ArchiveError::Contiguity("archive LSN range exhausted".to_owned())
+            })?;
+        }
         for reference in &head.segments {
             if reference.first_lsn != expected || reference.last_lsn < reference.first_lsn {
                 return Err(ArchiveError::Contiguity(format!(
@@ -707,6 +858,7 @@ mod tests {
             stream: stream.to_owned(),
             archived_lsn: 9,
             writer_epoch: 7,
+            page: None,
             segments: Vec::new(),
         };
         store
@@ -740,6 +892,7 @@ mod tests {
             stream: stream.to_owned(),
             archived_lsn: 3,
             writer_epoch: 7,
+            page: None,
             segments: vec![SegmentRef {
                 first_lsn: 1,
                 last_lsn: 3,
