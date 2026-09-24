@@ -294,3 +294,23 @@
     bounded. The archive head is read and rewritten by every member on every
     pass, and a coordinator runs for months, so either one growing with
     history slows every pass and eventually exhausts memory.
+
+- name: nothing-reads-the-log-from-the-start
+  where: "crates/**/src/**/*.rs"
+  ensure_absent: >
+    A read of a stream's replicated log from LSN 0 - `recover(stream, 0)` or
+    an equivalent - on a path that runs per claim, per open, per pass or per
+    request. Its cost grows with the table's age, and below a durable
+    checkpoint the log has been released and the read is refused. Ask for the
+    stream's extent, or read from the checkpoint.
+
+- name: a-release-never-outruns-a-durable-checkpoint
+  where: mentions release
+  each: method
+  min: 75
+  ensure: >
+    The replicated log is released only through a position a published,
+    durable table checkpoint covers, never past the archived tail, and never
+    backwards; the archive head records the release before any segment or
+    index page below it is deleted, and nothing the head still names is
+    deleted.

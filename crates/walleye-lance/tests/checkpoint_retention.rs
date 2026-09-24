@@ -71,8 +71,16 @@ async fn checkpoints_release_payloads_and_reopen_recovers_only_the_new_tail() {
         assert_eq!(backend.retained_wal_bytes().await, 0);
         assert_eq!(backend.commit_knowledge().await.unwrap(), before);
     }
-    // Explicit historical reads still work, but cannot repopulate checkpointed buffers.
-    assert!(backend.read_entry(1).await.unwrap().is_some());
+    // The checkpointed prefix is released from the log itself, not only from
+    // this writer's buffers: nothing reads below a durable checkpoint again,
+    // and a read that asks is refused rather than served from nowhere.
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while backend.read_entry(1).await.is_ok() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("a checkpointed position is released from the log");
     assert_eq!(backend.retained_wal_bytes().await, 0);
     table
         .append(vec![row(schema.clone(), 4, "tail")])

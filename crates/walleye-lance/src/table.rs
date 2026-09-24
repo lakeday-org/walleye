@@ -481,7 +481,7 @@ impl Table {
         // holds the stream, so a writer that is going to refuse has to refuse
         // before it takes anything: otherwise a doomed open still knocks the
         // incumbent off a stream it was serving correctly.
-        reachable_tail(&dataset, &config, &durability).await?;
+        reachable_tail(&dataset, &config).await?;
         let writer_started = open_stage_start(&config, "mem_wal_writer");
         let writer = match dataset.mem_wal_writer(config.shard_id, writer_config).await {
             Ok(writer) => {
@@ -959,87 +959,27 @@ fn same_fields(left: &Schema, right: &Schema) -> bool {
             .all(|(a, b)| a.name() == b.name() && a.data_type() == b.data_type())
 }
 
-/// Prepare a stream that was last written by a single node for a Bitr
-/// cluster taking ownership. Bitr LSNs must start at 1 for a stream it has
-/// never seen, while the MemWAL manifest continues from the object-store WAL
-/// tail. When Bitr holds no history for the stream and that tail was fully
-/// checkpointed, the manifest's WAL positions are reset so the first Bitr
-/// append lands at LSN 1. Returns whether a reset happened.
-///
-/// A tail with entries after the last checkpoint is refused: only the
-/// object-store WAL holds them, and a Bitr-backed writer could not replay
-/// them. Reopen in single-node mode, checkpoint, then move.
 /// Whether the tail the last writer left is one this writer can actually read.
 ///
 /// The note in shared storage says acknowledged rows exist that no flush has
-/// covered. It does not say whose log they are in, so this asks the only
-/// question that settles it: can this writer produce them? A Bitr writer
-/// recovers its stream and sees whether the quorum has anything; a node on the
-/// object-store WAL looks in the WAL directory, which is shared and therefore
-/// always readable by whoever gets here.
+/// covered, and names the write-ahead log they are in, as the writer that left
+/// it named its own. Equal names mean one log and an ordinary replay; any
+/// other means the rows are somewhere this writer cannot reach. The engine
+/// names every log it opens, so an unnamed writer only meets unnamed notes
+/// where one process's tables share one log.
 ///
 /// An unreachable tail is refused rather than replayed-as-empty, because the
 /// alternative is a stream that silently loses rows a client was told were
 /// stored. The fix is to drain it where it lives - check point the writer that
 /// holds it - after which any writer may take the stream.
-///
-/// What this catches is a log that has never held the stream, which is the
-/// shape a second cluster arrives in. It does not catch a cluster that held
-/// the stream once, was drained, and is now being handed a tail that grew
-/// somewhere else: its log is not empty, so it looks able to serve. Telling
-/// that apart needs the note to say which log the tail is in and the claimant
-/// to prove it holds those positions, and positions are per-cluster, so it
-/// needs an identity for a log as well. Worth doing; not done here.
-async fn reachable_tail(
-    dataset: &Dataset,
-    config: &TableConfig,
-    durability: &LanceDurability,
-) -> lance::Result<()> {
+async fn reachable_tail(dataset: &Dataset, config: &TableConfig) -> lance::Result<()> {
     let store = dataset.object_store(None).await?;
     let base = dataset.branch_location().path;
     let note = crate::open_tail::read(&store, &base, config.shard_id, &config.stream).await?;
     let Some(note) = note else {
         return Ok(());
     };
-    // The note names the log the tail is in, and this writer knows the name of
-    // its own. Equal names mean one log and an ordinary replay; different
-    // names mean the rows are somewhere this writer cannot reach, whatever its
-    // own log happens to hold.
-    let reachable = match (&note.log, &config.log) {
-        (Some(held), Some(mine)) => held == mine,
-        // A note from before logs were named, or a writer that was not told
-        // its own. Fall back to asking whether this writer's log has anything
-        // for the stream at all. That is right for a log which has never held
-        // it and wrong for one that held it, flushed, and handed it on - which
-        // is why the names exist.
-        _ => match durability {
-            LanceDurability::ObjectStore => {
-                let wal_dir =
-                    lance::dataset::mem_wal::util::shard_wal_path(&base, &config.shard_id);
-                let mut entries = store.inner.list(Some(&wal_dir));
-                let mut found = false;
-                while let Some(object) = entries.try_next().await? {
-                    if object
-                        .location
-                        .filename()
-                        .and_then(lance::dataset::mem_wal::util::parse_bit_reversed_filename)
-                        .is_some()
-                    {
-                        found = true;
-                        break;
-                    }
-                }
-                found
-            }
-            LanceDurability::Bitr(backend) => !backend
-                .writer()
-                .recover(&config.stream, 0)
-                .await
-                .map_err(|e| lance::Error::io(format!("Bitr recovery for {}: {e}", config.stream)))?
-                .is_empty(),
-        },
-    };
-    if reachable {
+    if note.log == config.log {
         return Ok(());
     }
     Err(lance::Error::invalid_input(format!(
@@ -1067,6 +1007,16 @@ pub fn is_claim_race(error: &lance::Error) -> bool {
         || (said.contains("Failed to claim shard") && said.contains("already exists"))
 }
 
+/// Prepare a stream that was last written by a single node for a Bitr
+/// cluster taking ownership. Bitr LSNs must start at 1 for a stream it has
+/// never seen, while the MemWAL manifest continues from the object-store WAL
+/// tail. When Bitr holds no history for the stream and that tail was fully
+/// checkpointed, the manifest's WAL positions are reset so the first Bitr
+/// append lands at LSN 1. Returns whether a reset happened.
+///
+/// A tail with entries after the last checkpoint is refused: only the
+/// object-store WAL holds them, and a Bitr-backed writer could not replay
+/// them. Reopen in single-node mode, checkpoint, then move.
 pub async fn prepare_bitr_takeover(
     storage: &LanceStorageOptions,
     uri: &str,
@@ -1105,11 +1055,14 @@ pub async fn prepare_bitr_takeover(
     if newest_wal_entry == 0 && manifest.wal_entry_position_last_seen == 0 {
         return Ok(false);
     }
-    let history = writer
-        .recover(stream, 0)
+    // Whether Bitr ever held the stream is the log's extent, not its history:
+    // reading the records to find out would cost every claim the table's
+    // whole life.
+    let extent = writer
+        .extent(stream)
         .await
-        .map_err(|e| lance::Error::io(format!("Bitr recovery for {stream}: {e}")))?;
-    if !history.is_empty() {
+        .map_err(|e| lance::Error::io(format!("Bitr extent for {stream}: {e}")))?;
+    if extent.ever_written() {
         return Ok(false);
     }
     if newest_wal_entry > manifest.replay_after_wal_entry_position {
