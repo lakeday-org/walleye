@@ -23,6 +23,7 @@ managed side adds operations, not capability, and
 - [Cache tiers](concepts/cache-tiers.md) — what the cache holds, and how many tables fit
 - [Lifecycle](concepts/lifecycle.md) — tables open, close and reopen; nodes stop and start
 - [Ingest anything](concepts/ingest.md) — send JSON of any shape, get typed tables
+- [Alarms and schedules](concepts/alarms.md) — scheduled work that runs once, on the owner
 
 ## SDKs
 

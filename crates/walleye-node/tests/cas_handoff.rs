@@ -75,7 +75,6 @@ fn config(cache: &std::path::Path, node: &str, root: &str, at: &str) -> Config {
         // bucket, and so is the address to forward to.
         members: vec![Node::new(node, at, 1.0).unwrap()],
         kubernetes: None,
-        processor: None,
         lease: Default::default(),
         api: Some(ApiConfig {
             root_uri: root.to_owned(),

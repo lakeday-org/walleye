@@ -733,9 +733,19 @@ async fn describe_view(State(s): State<Arc<Service>>, Path(name): Path<String>) 
         .cursor(&format!("view:{name}"))
         .await
         .map_err(|e| error(e.as_ref()))?;
+    let alarms = engine
+        .view_alarms(&view)
+        .await
+        .map_err(|e| error(e.as_ref()))?;
     let mut described = serde_json::to_value(&view).map_err(|e| bad(e.to_string()))?;
     if let Some(fields) = described.as_object_mut() {
         fields.insert("cursor".into(), serde_json::json!(cursor));
+        // When it next runs and what it has pending, from its owner's record.
+        if let Some(alarms) = alarms.as_object() {
+            for (label, alarm) in alarms {
+                fields.insert(label.clone(), alarm.clone());
+            }
+        }
     }
     Ok(Json(described).into_response())
 }

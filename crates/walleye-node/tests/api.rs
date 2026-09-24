@@ -18,7 +18,6 @@ fn config(path: &std::path::Path, api: bool) -> Config {
         bitr: false,
         members: vec![Node::new("n", "http://n", 1.0).unwrap()],
         kubernetes: None,
-        processor: None,
         lease: Default::default(),
         api: api.then(|| ApiConfig {
             root_uri: format!("file://{}/store", path.display()),
@@ -185,7 +184,7 @@ async fn define_ingest_sql_and_reopen_preserve_data_and_reject_invalid_requests(
     service.close().await;
 }
 
-/// Concurrent stream processors cannot commit against a superseded read snapshot.
+/// Concurrent conditional writers cannot commit against a superseded read snapshot.
 #[tokio::test]
 async fn conditional_ingestion_rejects_stale_readers_and_previous_boots() {
     let d = tempfile::tempdir().unwrap();
@@ -263,96 +262,6 @@ async fn conditional_ingestion_rejects_stale_readers_and_previous_boots() {
     reopened.close().await;
 }
 
-#[tokio::test]
-async fn stream_processor_recovers_due_work_and_retries_failed_callbacks() {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    let d = tempfile::tempdir().unwrap();
-    let service = Service::open(config(d.path(), true)).await.unwrap();
-    let app = router(service.clone());
-    assert_eq!(call(&app, "/v1/streams", json!({"name":"work","columns":[{"name":"key","type":"string"},{"name":"available_at","type":"int64"}],"primary_key":["key"]})).await.0, StatusCode::OK);
-    assert_eq!(
-        call(
-            &app,
-            "/v1/streams/work/events",
-            json!({"rows":[{"key":"repository_123","available_at":0}]})
-        )
-        .await
-        .0,
-        StatusCode::OK
-    );
-    drop(app);
-    service.close().await;
-    drop(service);
-    let service = Service::open(config(d.path(), true)).await.unwrap();
-    let count = Arc::new(AtomicUsize::new(0));
-    let release = Arc::new(tokio::sync::Notify::new());
-    let callback_release = release.clone();
-    let observed = count.clone();
-    let callback_service = service.clone();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let endpoint = format!("http://{}/consume/", listener.local_addr().unwrap());
-    let callback = axum::Router::new().route(
-        "/consume/{key}",
-        axum::routing::post(
-            move |axum::extract::Path(key): axum::extract::Path<String>,
-                  headers: axum::http::HeaderMap| {
-                let release = callback_release.clone();
-                let count = observed.clone();
-                let service = callback_service.clone();
-                async move {
-                    assert_eq!(key, "repository_123");
-                    assert_eq!(headers["x-lakeday-worker-ingress"], "host-only-token");
-                    if count.fetch_add(1, Ordering::SeqCst) == 0 {
-                        return StatusCode::SERVICE_UNAVAILABLE;
-                    }
-                    release.notified().await;
-                    let result = call(
-                        &router(service),
-                        "/v1/streams/work/events",
-                        json!({"rows":[{"key":key,"available_at":i64::MAX}]}),
-                    )
-                    .await;
-                    assert_eq!(result.0, StatusCode::OK);
-                    StatusCode::OK
-                }
-            },
-        ),
-    );
-    let server = tokio::spawn(async move { axum::serve(listener, callback).await.unwrap() });
-    let config: walleye_node::ProcessorConfig=serde_json::from_value(json!({"query":"SELECT key, available_at FROM work", "endpoint":endpoint,"headers":{"x-lakeday-worker-ingress":"host-only-token"},"retry_ms":20,"poll_ms":20})).unwrap();
-    let task_service = service.clone();
-    let task = tokio::spawn(async move { task_service.process(config).await.unwrap() });
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        while count.load(Ordering::SeqCst) < 2 {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("persisted due work retried after restart");
-    service.quiesce();
-    assert!(
-        !task.is_finished(),
-        "active callbacks must drain before shutdown"
-    );
-    release.notify_one();
-    assert_eq!(
-        count.load(Ordering::SeqCst),
-        2,
-        "future work must not run repeatedly"
-    );
-    tokio::time::timeout(std::time::Duration::from_secs(1), task)
-        .await
-        .expect("processor stops on quiesce")
-        .unwrap();
-    server.abort();
-    let _ = server.await;
-    service.close().await;
-}
-
-/// A definition written by a later version must still open here, or an
-/// upgrade could not be rolled back. Requests stay strict: a field the server
-/// derives, or a misspelled one, is refused rather than silently ignored.
 #[tokio::test]
 async fn the_catalog_tolerates_fields_this_version_does_not_know() {
     let d = tempfile::tempdir().unwrap();

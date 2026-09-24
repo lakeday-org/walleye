@@ -94,7 +94,6 @@ async fn start(root: &std::path::Path, count: usize) -> Vec<Member> {
             bitr: false,
             members: members.clone(),
             kubernetes: None,
-            processor: None,
             lease: Default::default(),
             api: Some(ApiConfig {
                 root_uri: format!("file://{}/store", root.display()),

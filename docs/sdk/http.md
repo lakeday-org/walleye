@@ -148,8 +148,8 @@ transforming.
 | `POST /v1/ingest/{source}` | Ingest records of any shape; the table is worked out for you. See [Ingest anything](../concepts/ingest.md) |
 | `GET /v1/view/` | List views |
 | `POST /v1/view/{name}/create/` | Define a view and its worker |
-| `POST /v1/view/{name}/describe/` | What a view is and where its cursor is |
-| `POST /v1/view/{name}/refresh/` | Run a turn now |
+| `POST /v1/view/{name}/describe/` | What a view is, where its cursor is, and its pending alarms: `next_run`, `worker_alarm`, `retry` ([alarms](../concepts/alarms.md)) |
+| `POST /v1/view/{name}/refresh/` | Run a turn now; a view on a clock runs only if its schedule is due |
 | `POST /v1/view/{name}/drop/` | Remove it |
 | `/v1/worker/{name}/` | Call a worker directly |
 
@@ -171,6 +171,8 @@ Useful when something is wrong, not part of the contract.
 | `GET /internal/cache/stats` | The budget: memory total, reserved and available, and the disk figures |
 | `GET /internal/snapshot/{name}` | A table's current snapshot |
 | `POST /internal/cache/flush` | Wait for queued cache writes to reach disk |
+| `GET /internal/ownership` | What this node owns and which leases it has seen |
+| `GET /internal/alarms` | Every alarm pending on the keys this node owns |
 
 [Budgets](../self-hosting/budgets.md) reads the first one. It reports totals
 only: reservations are made under names, but the names are not surfaced, so it

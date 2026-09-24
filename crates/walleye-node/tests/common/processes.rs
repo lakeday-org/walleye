@@ -21,11 +21,14 @@ pub const ROOT_KEY: [u8; 32] = [23; 32];
 
 /// Short enough to run in seconds, with the production proportions: renew
 /// every third of the ttl, a skew allowance under that, sampling well inside
-/// the ttl.
+/// the ttl. The skew is what a renewal may take to land, so it is sized for a
+/// busy machine rather than an idle one: a renewal slower than it does not
+/// count, and a process that misses enough of them stands down, which is right
+/// but is not what these tests are about.
 pub fn fast() -> LeaseConfig {
     LeaseConfig {
-        ttl_ms: 1_500,
-        skew_ms: 300,
+        ttl_ms: 3_000,
+        skew_ms: 900,
         sample_ms: 250,
     }
 }
@@ -67,7 +70,6 @@ impl Proc {
             bitr: bitr.is_some(),
             members: vec![Node::new(node_id, base.clone(), 1.0).unwrap()],
             kubernetes: None,
-            processor: None,
             lease,
             api: Some(ApiConfig {
                 root_uri: root.to_owned(),
@@ -128,7 +130,9 @@ impl Proc {
                     }
                 }
             });
-            runtime.shutdown_background();
+            // Wait for the workers to stop, so a killed process's port is
+            // closed when `kill` returns rather than some time after.
+            runtime.shutdown_timeout(Duration::from_secs(5));
         });
         started.await.expect("the process started");
         Self {
@@ -352,4 +356,16 @@ pub async fn bitr(dir: &std::path::Path) -> (String, Vec<tokio::task::JoinHandle
         let _ = axum::serve(listener, gateway_router(gateway)).await;
     }));
     (format!("http://{address}"), tasks)
+}
+
+pub async fn get_json(base: &str, path: &str) -> Value {
+    client()
+        .get(format!("{base}{path}"))
+        .header("authorization", format!("Bearer {TOKEN}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
 }

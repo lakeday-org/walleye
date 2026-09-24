@@ -556,6 +556,7 @@ mod tests {
             ("GET", "/internal/snapshot/{name}", System),
             ("POST", "/internal/cache/flush", System),
             ("GET", "/internal/ownership", System),
+            ("GET", "/internal/alarms", System),
             ("POST", "/v1/streams", Data(Manage)),
             ("POST", "/v1/streams/{name}/events", Data(Write)),
             ("POST", "/v1/ingest/{source}", Data(Write)),
