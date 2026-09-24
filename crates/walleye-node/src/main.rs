@@ -77,8 +77,8 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     tokio::pin!(server, bitr);
-    let (result, closed) = tokio::select! {
-        r=&mut server=>(r.map_err(Into::into), false),r=&mut bitr=>(r, false),r=service.discover()=>(r, false),
+    let (result, closed, bitr_running) = tokio::select! {
+        r=&mut server=>(r.map_err(Into::into), false, true),r=&mut bitr=>(r, false, false),r=service.discover()=>(r, false, true),
         _=shutdown()=> {
             // Everything from here runs with the embedded replica still
             // serving: the release flushes each table through it, and a write
@@ -116,7 +116,7 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
             let mut replica_running = true;
             loop {
                 tokio::select! {
-                    r = &mut drain => break (r, true),
+                    r = &mut drain => break (r, true, replica_running),
                     r = &mut bitr, if replica_running => {
                         // The replica ended on its own mid-drain. The drain
                         // goes on; whatever it still has to make durable
@@ -135,8 +135,22 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         service.close().await;
     }
     let _ = stop_bitr.send(());
+    // The replica archives what it holds before it ends: a stopped instance's
+    // volumes are deleted, and what the archive does not have is gone.
+    if bitr_running && service.config.bitr {
+        match tokio::time::timeout(REPLICA_STOP_BUDGET, &mut bitr).await {
+            Ok(Err(error)) => {
+                eprintln!("walleye.shutdown stage=replica outcome=error error={error}")
+            }
+            Ok(Ok(())) => {}
+            Err(_) => eprintln!("walleye.shutdown stage=replica outcome=timeout"),
+        }
+    }
     result
 }
+
+/// Longest the process waits for its replica's last archive pass.
+const REPLICA_STOP_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// How long a stopping process keeps accepting requests after it has handed
 /// its tables over. Fly Proxy was measured acting on a routing change in about

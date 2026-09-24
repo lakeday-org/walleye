@@ -211,15 +211,62 @@ pub async fn serve_combined(
     let gateway_listener = TcpListener::bind(&gateway_address).await?;
     let storage_app = node_router(Arc::clone(&node), root_key, Some(&internal_token))?;
     let gateway_app = gateway_router(Arc::clone(&gateway));
-    let result = tokio::select! {
-        result = axum::serve(storage_listener, storage_app) => result.map_err(Into::into),
-        result = axum::serve(gateway_listener, gateway_app) => result.map_err(Into::into),
-        result = archive_loop(Arc::clone(&gateway), Arc::clone(&node)) => result,
-        result = catch_up_loop(Arc::clone(&gateway)) => result,
-        result = rejoin_loop(Arc::clone(&gateway)) => result,
-        () = stop => Ok(()),
+    let serving = async {
+        let result: Result<(), Box<dyn std::error::Error>> = tokio::select! {
+            result = axum::serve(storage_listener, storage_app) => result.map_err(Into::into),
+            result = axum::serve(gateway_listener, gateway_app) => result.map_err(Into::into),
+            result = archive_loop(Arc::clone(&gateway), Arc::clone(&node)) => result,
+            result = catch_up_loop(Arc::clone(&gateway)) => result,
+            result = rejoin_loop(Arc::clone(&gateway)) => result,
+        };
+        result
     };
-    result
+    tokio::pin!(serving);
+    tokio::select! {
+        result = &mut serving => result,
+        () = stop => {
+            // Still serving its peers while it does: their last archive
+            // passes read this member too.
+            tokio::select! {
+                () = final_archive(&gateway, &node) => Ok(()),
+                result = &mut serving => result,
+            }
+        }
+    }
+}
+
+/// How long a stopping replica keeps archiving before it lets go.
+const FINAL_ARCHIVE_BUDGET: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Archives everything this member holds committed before the process ends.
+///
+/// A stopped instance's volumes are deleted and a started one seeds from the
+/// archive, so a record committed after the last one-second pass would
+/// otherwise be gone from the log - and the handover that runs just before
+/// this, flushing and claiming tables, is exactly what writes such records.
+/// Passes repeat until one archives nothing, or the budget runs out.
+async fn final_archive(gateway: &Arc<ReplicaGateway>, node: &Arc<DiskReplica>) {
+    let started = std::time::Instant::now();
+    let mut archived = 0_usize;
+    let outcome = loop {
+        if started.elapsed() > FINAL_ARCHIVE_BUDGET {
+            break "budget".to_owned();
+        }
+        match gateway.archive_local_commits(node).await {
+            Ok(0) => break "complete".to_owned(),
+            Ok(records) => archived = archived.saturating_add(records),
+            Err(error) => {
+                if started.elapsed() > FINAL_ARCHIVE_BUDGET / 3 {
+                    break format!("error error={error}");
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+        }
+    };
+    eprintln!(
+        "lakeday.replica shutdown stage=archive records={archived} elapsed_ms={} outcome={outcome}",
+        started.elapsed().as_millis()
+    );
 }
 
 fn direct_nodes() -> Result<Vec<crate::ReplicaNode>, Box<dyn std::error::Error>> {
