@@ -368,9 +368,20 @@ async fn manifest_cas_response_loss_converges_for_a_second_gateway()
         first_gateway.append(event.clone()).await,
         Err(ReplicaError::QuorumUnavailable)
     );
+    // The gateway stops waiting once a quorum has answered, so the last
+    // member's write may still be landing: every member persists it, but not
+    // necessarily before `append` returns.
     for node in &nodes {
         let control = node.disk.control().ok_or("direct node control missing")?;
-        assert_eq!(control.state()?.manifest_revision, 1);
+        let started = std::time::Instant::now();
+        while control.state()?.manifest_revision != 1 {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(5),
+                "{} never persisted the manifest",
+                node.member.id
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
         assert!(node.disk.records("tenant-a/cas").await.is_empty());
     }
 
