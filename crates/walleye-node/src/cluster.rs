@@ -319,10 +319,8 @@ pub async fn route_to_owner(
     if !routed {
         return next.run(request).await;
     }
-    // Forwarding carries this node's token, so authenticate first.
-    if crate::authorize(&s, request.headers()).is_err() {
-        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
-    }
+    // Forwarding carries this node's token; the access gate in front of this
+    // has already admitted the caller for this route.
     if let Err(response) = cluster.check_fence(request.headers()) {
         return response;
     }

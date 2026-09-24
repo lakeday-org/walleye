@@ -69,13 +69,16 @@ again before taking the next node out is what keeps that to one node's share at
 a time. [Losing a node](shapes.md#losing-a-node) is the same mechanism without
 the plan.
 
-## Rotating the token
+## Tokens
 
-The token is the deployment's, not a user's. Changing it revokes every client at
-once, which is the point of it, and the cutover is not instantaneous on more
-than one node: for a short window which token a request is accepted with
-depends on which node served it, so a client should retry a 401 for that long
-rather than treat it as a bad token.
+Clients use [access tokens](../sdk/http.md#access-tokens), which come and go
+without touching the node: revoking one takes effect within a few seconds and
+restarts nothing. Give each client its own, with only the scopes it uses, and
+revoke the one you no longer trust rather than all of them.
+
+The deployment token is the node's own. Changing it is a restart, and on more
+than one node the cutover is not instantaneous: for a short window which token
+a request is accepted with depends on which node served it.
 
 ## Deleting
 
@@ -98,7 +101,8 @@ rule admits no exceptions.
 The same clocks, with the node half driven through an API instead of a process
 manager: `stop` checkpoints every table and releases the nodes, `start` brings
 them back on the current shape and cache, `resize` is accepted while stopped,
-`token` mints a new one, and `delete` removes the instance and its storage. A
-stopped instance keeps its data and runs no nodes.
+and `delete` removes the instance and its storage. A stopped instance keeps its
+data and runs no nodes. Access tokens are made and revoked separately, in any
+state, and none of that restarts anything.
 
 What a table does is identical, because it is the same engine.

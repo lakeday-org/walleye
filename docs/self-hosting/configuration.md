@@ -24,7 +24,7 @@ and `AWS_REGION`.
 |---|---|---|
 | `WALLEYE_PORT` | `8080` | Port to listen on. |
 | `WALLEYE_BIND` | `[::]` | Address to bind. The default is dual-stack. |
-| `WALLEYE_TOKEN` | generated | The deployment token, at least 16 characters. |
+| `WALLEYE_TOKEN` | generated | The deployment token, at least 16 characters. It may call every route. |
 
 The bind default reaches IPv6-only private networks and maps IPv4 clients in.
 On a host with no IPv6 at all the node falls back to the same port on
@@ -33,6 +33,11 @@ On a host with no IPv6 at all the node falls back to the same port on
 A generated token is printed to standard error once, at startup. That is fine
 for a local trial and wrong for anything else, because it lands in whatever
 collects your logs.
+
+Clients other than your own tooling should use scoped
+[access tokens](../sdk/http.md#access-tokens), which the node reads from
+`_walleye/access.json` under its root and which change without a restart. A
+node refuses to start when that file exists and cannot be read.
 
 ## Resources
 

@@ -30,11 +30,13 @@ after `db://` is a label the client wants and the node ignores — one node is
 one database.
 
 **The token.** Self-hosted, it is `WALLEYE_TOKEN`, or the one the node
-generated and printed to standard error at startup. On the managed service it
-is the instance token, shown once when the instance is created and once each
-time it is rotated. Either way the client sends it as `x-api-key`;
-`Authorization: Bearer` works too if you are calling
-[the HTTP surface](../sdk/http.md) directly.
+generated and printed to standard error at startup, or an
+[access token](../sdk/http.md#access-tokens) you published for the node. On
+the managed service you make access tokens for an instance from its page or
+its API: each has a name, the scopes it may use, and an optional expiry, and
+its value is shown once, when you make it. Creating an instance does not make
+one. Either way the client sends it as `x-api-key`; `Authorization: Bearer`
+works too if you are calling [the HTTP surface](../sdk/http.md) directly.
 
 **`region`.** The client requires it and the node ignores it. It is part of
 the client's own default addressing, which a host override replaces, so any

@@ -43,8 +43,8 @@ object store if you would rather not point at a real bucket yet.
 ## Let somebody else run it
 
 The managed service at [walleye.dev](https://walleye.dev) runs this binary
-for you: you create an instance, and you get a URL and a token instead of a
-process. Nothing below changes — the client, the protocol and the guarantees
+for you: you create an instance and make access tokens for it, and you get a
+URL instead of a process. Nothing below changes — the client, the protocol and the guarantees
 are the same — so the rest of these pages applies either way, and says so
 where it does not.
 

@@ -3,16 +3,19 @@
 //! else is JSON. Unsupported operations return 400 with a plain message.
 // axum responses are the natural error type for handlers; boxing them buys nothing.
 #![allow(clippy::result_large_err)]
-use crate::{Service, api, engine};
+use crate::{
+    Service,
+    access::{Required::Data, Routes, Scope::*},
+    api, engine,
+};
 use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Schema};
 use axum::{
-    Json, Router,
+    Json,
     body::Bytes,
     extract::{DefaultBodyLimit, Path, Query, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, Method, StatusCode},
     response::{IntoResponse, Response},
-    routing::{get, post},
 };
 use serde::Deserialize;
 use std::{io::Cursor, sync::Arc};
@@ -20,38 +23,123 @@ use walleye_lance::{JsonSchema, SearchRequest, VectorIndexSpec, VectorQuery};
 
 const ARROW_FILE: &str = "application/vnd.apache.arrow.file";
 
-pub fn routes() -> Router<Arc<Service>> {
-    Router::new()
-        .route("/v1/table/", get(list))
+pub fn routes() -> Routes<Arc<Service>> {
+    Routes::default()
+        .route(Method::GET, "/v1/table/", Data(Read), list)
         // Walleye has no namespaces: every namespace id lists the root.
         .route(
+            Method::GET,
             "/v1/namespace/{namespace}/table/list",
-            get(list_in_namespace),
+            Data(Read),
+            list_in_namespace,
         )
-        .route("/v1/table/{name}/create/", post(create))
-        .route("/v1/table/{name}/describe/", post(describe))
-        .route("/v1/table/{name}/drop/", post(drop))
-        .route("/v1/table/{name}/insert/", post(insert))
-        .route("/v1/table/{name}/query/", post(query))
-        .route("/v1/table/{name}/count_rows/", post(count_rows))
-        .route("/v1/table/{name}/create_index/", post(create_index))
-        .route("/v1/table/{name}/index/list/", post(list_indices))
-        .route("/v1/table/{name}/compact_lsm/", post(compact_lsm))
-        .route("/v1/table/{name}/flush_lsm/", post(flush_lsm))
-        .route("/v1/table/{name}/get_lsm_stats/", post(lsm_stats))
-        .route("/v1/view/", get(list_views))
-        .route("/v1/view/{name}/create/", post(create_view))
-        .route("/v1/view/{name}/describe/", post(describe_view))
-        .route("/v1/view/{name}/drop/", post(drop_view))
-        .route("/v1/view/{name}/refresh/", post(refresh_view))
         .route(
-            "/v1/worker/{name}/",
-            get(worker_request)
-                .post(worker_request)
-                .put(worker_request)
-                .delete(worker_request),
+            Method::POST,
+            "/v1/table/{name}/create/",
+            Data(Manage),
+            create,
         )
-        .layer(DefaultBodyLimit::max(512 * 1024 * 1024))
+        .route(
+            Method::POST,
+            "/v1/table/{name}/describe/",
+            Data(Read),
+            describe,
+        )
+        .route(Method::POST, "/v1/table/{name}/drop/", Data(Manage), drop)
+        .route(
+            Method::POST,
+            "/v1/table/{name}/insert/",
+            Data(Write),
+            insert,
+        )
+        .route(Method::POST, "/v1/table/{name}/query/", Data(Read), query)
+        .route(
+            Method::POST,
+            "/v1/table/{name}/count_rows/",
+            Data(Read),
+            count_rows,
+        )
+        .route(
+            Method::POST,
+            "/v1/table/{name}/create_index/",
+            Data(Manage),
+            create_index,
+        )
+        .route(
+            Method::POST,
+            "/v1/table/{name}/index/list/",
+            Data(Read),
+            list_indices,
+        )
+        .route(
+            Method::POST,
+            "/v1/table/{name}/compact_lsm/",
+            Data(Manage),
+            compact_lsm,
+        )
+        .route(
+            Method::POST,
+            "/v1/table/{name}/flush_lsm/",
+            Data(Manage),
+            flush_lsm,
+        )
+        .route(
+            Method::POST,
+            "/v1/table/{name}/get_lsm_stats/",
+            Data(Read),
+            lsm_stats,
+        )
+        .route(Method::GET, "/v1/view/", Data(Read), list_views)
+        .route(
+            Method::POST,
+            "/v1/view/{name}/create/",
+            Data(Manage),
+            create_view,
+        )
+        .route(
+            Method::POST,
+            "/v1/view/{name}/describe/",
+            Data(Read),
+            describe_view,
+        )
+        .route(
+            Method::POST,
+            "/v1/view/{name}/drop/",
+            Data(Manage),
+            drop_view,
+        )
+        .route(
+            Method::POST,
+            "/v1/view/{name}/refresh/",
+            Data(Manage),
+            refresh_view,
+        )
+        // A worker answers a request by writing what it was sent.
+        .route(
+            Method::GET,
+            "/v1/worker/{name}/",
+            Data(Write),
+            worker_request,
+        )
+        .route(
+            Method::POST,
+            "/v1/worker/{name}/",
+            Data(Write),
+            worker_request,
+        )
+        .route(
+            Method::PUT,
+            "/v1/worker/{name}/",
+            Data(Write),
+            worker_request,
+        )
+        .route(
+            Method::DELETE,
+            "/v1/worker/{name}/",
+            Data(Write),
+            worker_request,
+        )
+        .map(|router| router.layer(DefaultBodyLimit::max(512 * 1024 * 1024)))
 }
 
 type Reply = Result<Response, Response>;
@@ -104,13 +192,13 @@ fn error(e: &(dyn std::error::Error + 'static)) -> Response {
 fn bad(message: impl Into<String>) -> Response {
     (StatusCode::BAD_REQUEST, message.into()).into_response()
 }
-fn engine<'a>(s: &'a Service, h: &HeaderMap) -> Result<&'a engine::Engine, Response> {
-    api(s, h).map_err(|(status, body)| (status, body).into_response())
+fn engine(s: &Service) -> Result<&engine::Engine, Response> {
+    api(s).map_err(|(status, body)| (status, body).into_response())
 }
 /// The engine for a durable write; 503 with `Retry-After` while this node's
 /// replica quorum is unreachable.
-fn writable_engine<'a>(s: &'a Service, h: &HeaderMap) -> Result<&'a engine::Engine, Response> {
-    crate::writable(s, h)
+fn writable_engine(s: &Service) -> Result<&engine::Engine, Response> {
+    crate::writable(s)
         .map_err(|(status, body)| (status, [("retry-after", "1")], body).into_response())
 }
 /// An inbound Arrow body is held raw and decoded at once; reserve both before
@@ -151,8 +239,8 @@ struct Page {
     limit: Option<usize>,
     page_token: Option<String>,
 }
-async fn list(State(s): State<Arc<Service>>, h: HeaderMap, Query(page): Query<Page>) -> Reply {
-    let engine = engine(&s, &h)?;
+async fn list(State(s): State<Arc<Service>>, Query(page): Query<Page>) -> Reply {
+    let engine = engine(&s)?;
     let mut names = engine.table_names().await.map_err(|e| error(e.as_ref()))?;
     if let Some(after) = page.page_token.filter(|t| !t.is_empty()) {
         names.retain(|n| n > &after);
@@ -170,10 +258,9 @@ async fn list(State(s): State<Arc<Service>>, h: HeaderMap, Query(page): Query<Pa
 async fn list_in_namespace(
     state: State<Arc<Service>>,
     Path(_namespace): Path<String>,
-    h: HeaderMap,
     page: Query<Page>,
 ) -> Reply {
-    list(state, h, page).await
+    list(state, page).await
 }
 
 #[derive(Deserialize)]
@@ -183,11 +270,10 @@ struct Mode {
 async fn create(
     State(s): State<Arc<Service>>,
     Path(name): Path<String>,
-    h: HeaderMap,
     Query(mode): Query<Mode>,
     body: Bytes,
 ) -> Reply {
-    let engine = writable_engine(&s, &h)?;
+    let engine = writable_engine(&s)?;
     let _lease = body_lease(engine, &body)?;
     let (schema, batches) = read_ipc(&body)?;
     let definition =
@@ -219,8 +305,8 @@ async fn create(
     Ok(Json(serde_json::json!({"version": version})).into_response())
 }
 
-async fn describe(State(s): State<Arc<Service>>, Path(name): Path<String>, h: HeaderMap) -> Reply {
-    let engine = engine(&s, &h)?;
+async fn describe(State(s): State<Arc<Service>>, Path(name): Path<String>) -> Reply {
+    let engine = engine(&s)?;
     let (version, schema) = engine
         .describe(&name)
         .await
@@ -229,8 +315,8 @@ async fn describe(State(s): State<Arc<Service>>, Path(name): Path<String>, h: He
     Ok(Json(serde_json::json!({"version": version, "schema": schema})).into_response())
 }
 
-async fn drop(State(s): State<Arc<Service>>, Path(name): Path<String>, h: HeaderMap) -> Reply {
-    let engine = writable_engine(&s, &h)?;
+async fn drop(State(s): State<Arc<Service>>, Path(name): Path<String>) -> Reply {
+    let engine = writable_engine(&s)?;
     let mut revision = s.revision.lock().await;
     *revision = format!("\"{}\"", uuid::Uuid::new_v4());
     engine
@@ -243,11 +329,10 @@ async fn drop(State(s): State<Arc<Service>>, Path(name): Path<String>, h: Header
 async fn insert(
     State(s): State<Arc<Service>>,
     Path(name): Path<String>,
-    h: HeaderMap,
     Query(mode): Query<Mode>,
     body: Bytes,
 ) -> Reply {
-    let engine = writable_engine(&s, &h)?;
+    let engine = writable_engine(&s)?;
     if mode.mode.as_deref() == Some("overwrite") {
         return Err(bad(
             "insert mode=overwrite is not supported; drop and recreate the table",
@@ -297,10 +382,9 @@ fn vector_column(schema: &Schema, requested: Option<&str>) -> Result<String, Res
 async fn query(
     State(s): State<Arc<Service>>,
     Path(name): Path<String>,
-    h: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Reply {
-    let engine = engine(&s, &h)?;
+    let engine = engine(&s)?;
     if body.get("order_by").is_some_and(|v| !v.is_null()) {
         return Err(bad("order_by is not supported; use SQL via /v1/query"));
     }
@@ -465,10 +549,9 @@ async fn query(
 async fn count_rows(
     State(s): State<Arc<Service>>,
     Path(name): Path<String>,
-    h: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Reply {
-    let engine = engine(&s, &h)?;
+    let engine = engine(&s)?;
     let filter = body.get("predicate").and_then(|v| v.as_str());
     let count = engine
         .count(&name, filter)
@@ -490,10 +573,9 @@ struct CreateIndex {
 async fn create_index(
     State(s): State<Arc<Service>>,
     Path(name): Path<String>,
-    h: HeaderMap,
     Json(body): Json<CreateIndex>,
 ) -> Reply {
-    let engine = writable_engine(&s, &h)?;
+    let engine = writable_engine(&s)?;
     let kind = body
         .index_type
         .unwrap_or_else(|| "IVF_PQ".into())
@@ -542,12 +624,8 @@ async fn create_index(
 
 /// Every index the table maintains, vector and text alike. Listing only the
 /// vector ones made a text index look like it had not been created.
-async fn list_indices(
-    State(s): State<Arc<Service>>,
-    Path(name): Path<String>,
-    h: HeaderMap,
-) -> Reply {
-    let engine = engine(&s, &h)?;
+async fn list_indices(State(s): State<Arc<Service>>, Path(name): Path<String>) -> Reply {
+    let engine = engine(&s)?;
     let mut indexes: Vec<serde_json::Value> = engine
         .vector_indexes(&name)
         .await
@@ -581,12 +659,8 @@ async fn list_indices(
     Ok(Json(serde_json::json!({"indexes": indexes})).into_response())
 }
 
-async fn compact_lsm(
-    State(s): State<Arc<Service>>,
-    Path(name): Path<String>,
-    h: HeaderMap,
-) -> Reply {
-    let engine = writable_engine(&s, &h)?;
+async fn compact_lsm(State(s): State<Arc<Service>>, Path(name): Path<String>) -> Reply {
+    let engine = writable_engine(&s)?;
     let result = engine.compact(&name).await.map_err(|e| error(e.as_ref()))?;
     Ok(Json(match result {
         Some(r) => serde_json::json!({"merged": r.merged.len(), "rows": r.rows, "generation": r.output.generation}),
@@ -595,14 +669,14 @@ async fn compact_lsm(
     .into_response())
 }
 
-async fn flush_lsm(State(s): State<Arc<Service>>, Path(name): Path<String>, h: HeaderMap) -> Reply {
-    let engine = writable_engine(&s, &h)?;
+async fn flush_lsm(State(s): State<Arc<Service>>, Path(name): Path<String>) -> Reply {
+    let engine = writable_engine(&s)?;
     engine.flush(&name).await.map_err(|e| error(e.as_ref()))?;
     Ok(Json(serde_json::json!({})).into_response())
 }
 
-async fn lsm_stats(State(s): State<Arc<Service>>, Path(name): Path<String>, h: HeaderMap) -> Reply {
-    let engine = engine(&s, &h)?;
+async fn lsm_stats(State(s): State<Arc<Service>>, Path(name): Path<String>) -> Reply {
+    let engine = engine(&s)?;
     let stats = engine
         .lsm_stats(&name)
         .await
@@ -619,8 +693,8 @@ struct Passes {
     passes: Option<usize>,
 }
 
-async fn list_views(State(s): State<Arc<Service>>, h: HeaderMap) -> Reply {
-    let engine = engine(&s, &h)?;
+async fn list_views(State(s): State<Arc<Service>>) -> Reply {
+    let engine = engine(&s)?;
     let names = engine.view_names().await.map_err(|e| error(e.as_ref()))?;
     Ok(Json(serde_json::json!({ "views": names })).into_response())
 }
@@ -628,10 +702,9 @@ async fn list_views(State(s): State<Arc<Service>>, h: HeaderMap) -> Reply {
 async fn create_view(
     State(s): State<Arc<Service>>,
     Path(name): Path<String>,
-    h: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Reply {
-    let engine = writable_engine(&s, &h)?;
+    let engine = writable_engine(&s)?;
     let mut view: engine::ViewDefinition = serde_json::from_value(
         // The name lives in the path, so a body that repeats it is accepted
         // and a body that omits it is too.
@@ -652,12 +725,8 @@ async fn create_view(
     Ok(Json(serde_json::json!({ "created": true })).into_response())
 }
 
-async fn describe_view(
-    State(s): State<Arc<Service>>,
-    Path(name): Path<String>,
-    h: HeaderMap,
-) -> Reply {
-    let engine = engine(&s, &h)?;
+async fn describe_view(State(s): State<Arc<Service>>, Path(name): Path<String>) -> Reply {
+    let engine = engine(&s)?;
     let view = engine.view(&name).await.map_err(|e| error(e.as_ref()))?;
     let cursor = engine
         .cursor(&format!("view:{name}"))
@@ -670,8 +739,8 @@ async fn describe_view(
     Ok(Json(described).into_response())
 }
 
-async fn drop_view(State(s): State<Arc<Service>>, Path(name): Path<String>, h: HeaderMap) -> Reply {
-    let engine = writable_engine(&s, &h)?;
+async fn drop_view(State(s): State<Arc<Service>>, Path(name): Path<String>) -> Reply {
+    let engine = writable_engine(&s)?;
     engine
         .drop_view(&name)
         .await
@@ -682,10 +751,9 @@ async fn drop_view(State(s): State<Arc<Service>>, Path(name): Path<String>, h: H
 async fn refresh_view(
     State(s): State<Arc<Service>>,
     Path(name): Path<String>,
-    h: HeaderMap,
     passes: Query<Passes>,
 ) -> Reply {
-    let engine = writable_engine(&s, &h)?;
+    let engine = writable_engine(&s)?;
     let progress = engine
         .drain_view(&name, passes.passes.unwrap_or(1))
         .await
@@ -708,10 +776,10 @@ async fn worker_request(
     h: HeaderMap,
     body: Bytes,
 ) -> Reply {
-    let engine = writable_engine(&s, &h)?;
+    let engine = writable_engine(&s)?;
     let headers: std::collections::HashMap<String, String> = h
         .iter()
-        // The deployment token is the node's business, not the worker's.
+        // The caller's token is the node's business, not the worker's.
         .filter(|(name, _)| !matches!(name.as_str(), "authorization" | "x-api-key" | "cookie"))
         .filter_map(|(name, value)| {
             value
