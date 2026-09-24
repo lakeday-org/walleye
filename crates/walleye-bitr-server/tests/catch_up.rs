@@ -389,3 +389,44 @@ async fn a_member_behind_rejoins_live_appends() {
         member.stop();
     }
 }
+
+/// A member behind rejoins while writes carry on without pause. Catch-up
+/// from the peers alone would chase the tail; the writer brings it level
+/// from what it acknowledged, so it is taking live appends itself well
+/// before the writes stop.
+#[tokio::test]
+async fn a_member_behind_rejoins_while_writes_carry_on() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (mut members, _nodes, gateway) = with_c_behind(dir.path(), false).await;
+    let gateway = Arc::new(gateway);
+    let repairer = {
+        let gateway = Arc::clone(&gateway);
+        tokio::spawn(async move {
+            loop {
+                gateway.lagging_noted().await;
+                gateway.repair_lagging().await;
+            }
+        })
+    };
+    let last = |member: &Member| member.held().last().map(EncryptedRecord::lsn);
+    let mut level_at = None;
+    for lsn in 11..=200 {
+        gateway
+            .append_many(vec![record(lsn, 2)])
+            .await
+            .expect("a quorum");
+        if level_at.is_none() && last(&members[2]) == Some(lsn) {
+            level_at = Some(lsn);
+        }
+    }
+    repairer.abort();
+    let level_at = level_at.expect("C never took a live append");
+    assert!(
+        level_at < 60,
+        "C was level only at {level_at}, chasing the writer"
+    );
+    assert_eq!(members[2].held(), members[0].held());
+    for member in &mut members {
+        member.stop();
+    }
+}
