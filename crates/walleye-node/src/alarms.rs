@@ -101,6 +101,11 @@ pub struct Alarm {
     /// Set for a schedule, which re-arms itself; absent for a one-shot alarm.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repeat: Option<Repeat>,
+    /// For a schedule whose firing is in flight or being retried, the first
+    /// occurrence that firing stands for. An occurrence given up hands this
+    /// range on to the next run rather than dropping it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub covers_from_ms: Option<u64>,
 }
 
 impl Alarm {
@@ -112,6 +117,7 @@ impl Alarm {
             attempt: 0,
             id,
             repeat: None,
+            covers_from_ms: None,
         }
     }
 
@@ -123,6 +129,7 @@ impl Alarm {
             attempt: 0,
             id,
             repeat: Some(repeat),
+            covers_from_ms: None,
         }
     }
 }
@@ -152,12 +159,17 @@ pub fn begin(alarm: &mut Alarm, now_ms: u64) -> Option<Firing> {
         return None;
     }
     let mut missed = 0;
-    if alarm.attempt == 0
-        && let Some(repeat) = &alarm.repeat
-    {
-        let (latest, skipped) = repeat.catch_up(alarm.scheduled_ms, now_ms);
-        alarm.scheduled_ms = latest;
-        missed = skipped;
+    if let Some(repeat) = &alarm.repeat {
+        let from = alarm.covers_from_ms.unwrap_or(alarm.scheduled_ms);
+        if alarm.attempt == 0 {
+            let (latest, skipped) = repeat.catch_up(alarm.scheduled_ms, now_ms);
+            alarm.scheduled_ms = latest;
+            alarm.covers_from_ms = Some(alarm.covers_from_ms.unwrap_or(from).min(from));
+            missed = skipped;
+        } else if let Some(from) = alarm.covers_from_ms {
+            // A retry stands for the same occurrences as the first try.
+            missed = repeat.catch_up(from, alarm.scheduled_ms).1;
+        }
     }
     alarm.attempt += 1;
     alarm.at_ms = now_ms.saturating_add(backoff_ms(alarm.attempt));
@@ -196,6 +208,7 @@ pub fn complete(alarm: &mut Alarm, firing: &Firing, ok: bool, now_ms: u64) -> Se
             alarm.at_ms = next;
             alarm.scheduled_ms = next;
             alarm.attempt = 0;
+            alarm.covers_from_ms = None;
             Settled::Keep
         }
         None => Settled::Remove,
@@ -203,12 +216,24 @@ pub fn complete(alarm: &mut Alarm, firing: &Firing, ok: bool, now_ms: u64) -> Se
     if ok {
         return move_on(alarm);
     }
+    // An occurrence that is given up is not dropped silently: the alarm moves
+    // to the next occurrence but keeps pointing at the one that failed, so the
+    // next run catches up over it and reports it among those it covers.
+    let hand_over = |alarm: &mut Alarm| match next {
+        Some(next) => {
+            alarm.at_ms = next.max(now_ms.min(alarm.at_ms));
+            alarm.scheduled_ms = alarm.covers_from_ms.take().unwrap_or(alarm.scheduled_ms);
+            alarm.attempt = 0;
+            Settled::Keep
+        }
+        None => Settled::Remove,
+    };
     if firing.attempt >= MAX_ATTEMPTS {
-        return move_on(alarm);
+        return hand_over(alarm);
     }
     // A retry never holds up the next occurrence: whichever is sooner wins.
     match next {
-        Some(next) if next <= alarm.at_ms && next > now_ms => move_on(alarm),
+        Some(next) if next <= alarm.at_ms => hand_over(alarm),
         _ => Settled::Keep,
     }
 }
@@ -216,6 +241,29 @@ pub fn complete(alarm: &mut Alarm, firing: &Firing, ok: bool, now_ms: u64) -> Se
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Occurrences a failed run stood for are not lost when a second run fails
+    /// too: the run that finally succeeds stands for all of them.
+    #[test]
+    fn consecutive_given_up_occurrences_all_reach_the_next_run() {
+        let mut alarm = Alarm::repeating(Repeat::Every(1), 0, 1);
+        // Down until 2.5 s: 0, 1 and 2 are due, and the run for 2 fails.
+        let first = begin(&mut alarm, 2_500).unwrap();
+        assert_eq!((first.scheduled_ms, first.missed), (2_000, 2));
+        complete(&mut alarm, &first, false, 2_600);
+        // Its retry would wait 2 s; the occurrence at 3 s wins, and fails too.
+        let second = begin(&mut alarm, 3_000).unwrap();
+        assert_eq!((second.scheduled_ms, second.missed), (3_000, 3));
+        complete(&mut alarm, &second, false, 3_100);
+        let third = begin(&mut alarm, 4_000).unwrap();
+        assert_eq!(
+            (third.scheduled_ms, third.missed),
+            (4_000, 4),
+            "0, 1, 2 and 3 are all covered by the run for 4"
+        );
+        complete(&mut alarm, &third, true, 4_100);
+        assert_eq!((alarm.scheduled_ms, alarm.covers_from_ms), (5_000, None));
+    }
 
     #[test]
     fn backoff_doubles_and_then_holds() {
@@ -311,11 +359,17 @@ mod tests {
         assert_eq!((alarm.at_ms, alarm.scheduled_ms), (2_000, 0));
         let retry = begin(&mut alarm, 2_000).unwrap();
         assert_eq!((retry.attempt, retry.scheduled_ms), (2, 0));
-        // The next retry would be at 6 s; the occurrence at 3 s comes first.
+        // The next retry would be at 6 s; the occurrence at 3 s comes first,
+        // and its run stands for the one that failed as well.
         assert_eq!(complete(&mut alarm, &retry, false, 2_000), Settled::Keep);
+        let next = {
+            let mut probe = alarm.clone();
+            begin(&mut probe, 3_000).unwrap()
+        };
+        assert_eq!((next.scheduled_ms, next.missed), (3_000, 1));
         assert_eq!(
             (alarm.at_ms, alarm.scheduled_ms, alarm.attempt),
-            (3_000, 3_000, 0)
+            (3_000, 0, 0)
         );
     }
 }

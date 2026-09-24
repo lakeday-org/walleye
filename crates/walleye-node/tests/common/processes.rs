@@ -9,7 +9,11 @@
 #![allow(dead_code)]
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde_json::{Value, json};
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tokio::net::TcpListener;
 use walleye_bitr_server::{DiskReplica, OpaqueArchive, ReplicaNode, gateway_router, node_router};
 use walleye_node::{ApiConfig, Config, LeaseConfig, Service, cluster, router};
@@ -368,4 +372,138 @@ pub async fn get_json(base: &str, path: &str) -> Value {
         .json()
         .await
         .unwrap()
+}
+
+/// How many of `tables` each of `bases` holds, once every table has an owner
+/// and nothing has moved for several sweeps.
+///
+/// Stillness counts only once every process sweeps: until a process has
+/// watched the bucket for a lease verdict it hands nothing back, so the
+/// spread holds still then without being settled.
+pub async fn settled_spread(bases: &[&str], tables: &[String], limit: Duration) -> Vec<usize> {
+    let started = std::time::Instant::now();
+    let mut last: Option<Vec<usize>> = None;
+    let mut steady = 0;
+    loop {
+        let mut counts = Vec::new();
+        let mut sweeping = true;
+        for base in bases {
+            let status = status(base).await;
+            sweeping &= status["settled"].as_bool() == Some(true);
+            let held = status["held"].as_object().cloned().unwrap_or_default();
+            counts.push(tables.iter().filter(|t| held.contains_key(*t)).count());
+        }
+        let owned: usize = counts.iter().sum();
+        if sweeping && owned == tables.len() && last.as_ref() == Some(&counts) {
+            steady += 1;
+            if steady >= 6 {
+                return counts;
+            }
+        } else {
+            steady = 0;
+        }
+        last = Some(counts.clone());
+        assert!(started.elapsed() < limit, "never settled: {counts:?}");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// Which of `bases` holds `key`, once one does.
+pub async fn holder_of(bases: &[&str], key: &str) -> usize {
+    for _ in 0..200 {
+        for (index, base) in bases.iter().enumerate() {
+            if held(base).await.contains_key(key) {
+                return index;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("nobody holds {key}");
+}
+
+pub async fn view(base: &str, name: &str, definition: Value) {
+    let answer = post(base, &format!("/v1/view/{name}/create/"), definition, false).await;
+    assert_eq!(answer.status, 200, "create view {name}: {}", answer.body);
+}
+
+/// Rows of a query, or none while the table does not exist yet.
+pub async fn rows(base: &str, sql: &str) -> Vec<Value> {
+    let answer = post(base, "/v1/query", json!({ "sql": sql }), false).await;
+    match answer.body {
+        Value::Array(rows) if answer.status == 200 => rows,
+        _ => Vec::new(),
+    }
+}
+
+pub async fn wait_for<F, Fut>(what: &str, limit: Duration, mut check: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let started = Instant::now();
+    while !check().await {
+        assert!(started.elapsed() < limit, "{what} within {limit:?}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Which of `bases` holds `key`.
+pub async fn holder(bases: &[&str], key: &str) -> Option<usize> {
+    for (index, base) in bases.iter().enumerate() {
+        if held(base).await.contains_key(key) {
+            return Some(index);
+        }
+    }
+    None
+}
+
+/// A view on a one-second clock whose worker records which occurrence each
+/// run stands for and how many it covered, into `ticks`.
+pub fn ticker() -> Value {
+    ticker_into("ticks")
+}
+
+/// The same, into `target`.
+pub fn ticker_into(target: &str) -> Value {
+    json!({
+        "every_seconds": 1,
+        "target": target,
+        // Small, so several can run at once inside a test's memory budget.
+        "worker_heap_mb": 16,
+        "worker": "export default (rows, ctx) => [{ at: ctx.scheduled.scheduledTime, \
+                   missed: ctx.scheduled.missed, nonce: Math.random() }]",
+    })
+}
+
+/// Every run of the ticker, as (scheduled time, missed), ordered.
+pub async fn ticks(base: &str) -> Vec<(u64, u64)> {
+    ticks_in(base, "ticks").await
+}
+
+/// Every run recorded in `table`, as (scheduled time, missed), ordered.
+pub async fn ticks_in(base: &str, table: &str) -> Vec<(u64, u64)> {
+    let mut runs: Vec<(u64, u64)> = rows(base, &format!("SELECT at, missed FROM {table}"))
+        .await
+        .iter()
+        .map(|row| (row["at"].as_u64().unwrap(), row["missed"].as_u64().unwrap()))
+        .collect();
+    runs.sort_unstable();
+    runs
+}
+
+/// Each occurrence of a one-second schedule is accounted for exactly once:
+/// run by one run, or covered by the next run's missed count. No time is run
+/// twice and none is skipped silently.
+pub fn each_occurrence_once(runs: &[(u64, u64)]) {
+    let mut times: Vec<u64> = runs.iter().map(|(at, _)| *at).collect();
+    times.dedup();
+    assert_eq!(times.len(), runs.len(), "an occurrence ran twice: {runs:?}");
+    for pair in runs.windows(2) {
+        let ((previous, _), (at, missed)) = (pair[0], pair[1]);
+        assert_eq!(
+            at - previous,
+            (missed + 1) * 1000,
+            "occurrences between {previous} and {at} are unaccounted for: {runs:?}"
+        );
+    }
 }

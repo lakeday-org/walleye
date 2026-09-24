@@ -95,8 +95,8 @@ releases it, and removes its lease, and a peer takes each table on its next
 request or within one sampling interval, whichever comes first.
 
 Restoring a node that lost its disk is the seeding path above: it reads the
-archive, catches up from its peers, and rejoins owning nothing. Tables do not
-move back to it; they move only when their owner leaves.
+archive, catches up from its peers, and rejoins owning nothing; the others
+then hand it its share, one key per sweep.
 
 ## Ownership in the bucket
 
@@ -140,8 +140,18 @@ The rules:
   gone. No wall clock is compared anywhere.
 - A table is claimed only when its record is absent, released, or names a dead
   lease. A live owner is never displaced.
-- A dead owner's tables go to the live process with the highest rendezvous
-  score for each table, so they spread across the survivors.
+- Every process works out where each known key belongs: rendezvous hashing
+  with bounded load, so no live process is given more than
+  `ceil(keys / live processes)`. Every process that sees the same keys and the
+  same leases gets the same answer. A key nobody owns is claimed by the
+  process it belongs to; a request for it that arrives elsewhere is sent there.
+- A process holding more than that share hands one key back per sweep, one
+  that belongs elsewhere: it flushes the key's writer and releases it, after
+  any alarm firing in flight has finished, and the process it belongs to
+  claims it. Keys only ever move to where they belong, so this stops once no
+  process is over its share, and a cluster that is not changing moves
+  nothing. A restarted or added process therefore gets its share back within
+  a few sweeps; a hand-back costs the key's writes about half a second.
 - A stopping process marks its lease draining, flushes and releases each table
   at the same epoch, then deletes its lease.
 
