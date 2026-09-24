@@ -82,3 +82,22 @@ Only relevant if you use `prompt` or `prompt_jev` in SQL.
 | `TYPESAFE_URL` | the public endpoint | |
 | `TYPESAFE_MODEL` | `jev-latest` | |
 | `TYPESAFE_CONCURRENCY` | `16` | Requests in flight. |
+
+The ingest path uses the same key. It asks Jev to decide what columns mean,
+which table a new source belongs to, and which text to embed. Without a key it
+still works: every judgement takes its safe default instead. See
+[Ingest anything](../concepts/ingest.md).
+
+## Embeddings
+
+Only relevant if you want ingested text to be searchable by meaning, or to use
+`embed()` in SQL. This is
+configured separately from the model that answers questions in SQL, because
+the two are chosen for different things and billed separately.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `WALLEYE_EMBEDDING_KEY` | none | Without it nothing is embedded, and no table gets a vector column. |
+| `WALLEYE_EMBEDDING_URL` | `https://api.openai.com/v1/embeddings` | Any endpoint that speaks OpenAI's embeddings format. |
+| `WALLEYE_EMBEDDING_MODEL` | `text-embedding-3-small` | A table's vectors all come from one model. |
+| `WALLEYE_EMBEDDING_TIMEOUT` | `20` | Seconds to wait for one call. |

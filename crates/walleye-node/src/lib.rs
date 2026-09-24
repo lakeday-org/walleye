@@ -3,6 +3,7 @@ pub mod ask;
 pub mod cluster;
 pub mod cron;
 mod engine;
+pub mod ingest;
 mod lancedb;
 mod processor;
 pub mod reach;
@@ -743,6 +744,7 @@ pub fn router(service: Arc<Service>) -> Router {
         .route("/internal/cache/flush", post(flush))
         .route("/v1/streams", post(define))
         .route("/v1/streams/{name}/events", post(ingest))
+        .route("/v1/ingest/{source}", post(ingest_any))
         .route("/v1/query", post(query))
         .layer(DefaultBodyLimit::max(8 * 1024 * 1024))
         .merge(lancedb::routes())
@@ -1009,6 +1011,48 @@ async fn define(
 #[serde(deny_unknown_fields)]
 struct Ingest {
     rows: Vec<serde_json::Value>,
+}
+/// Take records of any shape and turn them into a table, deciding what needs
+/// deciding once and by rule after. See [`ingest`](crate::ingest).
+///
+/// The body is a JSON array of records, a single record, or an object whose
+/// `records` field is the array.
+async fn ingest_any(
+    State(s): State<Arc<Service>>,
+    Path(source): Path<String>,
+    h: HeaderMap,
+    body: Bytes,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    use serde_json::value::RawValue;
+    let engine = writable(&s, &h)?;
+    let _lease = engine
+        .resources()
+        .reserve_memory("ingest body", body.len().saturating_mul(8))
+        .map_err(|error| {
+            (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(serde_json::json!({"error": error.to_string()})),
+            )
+        })?;
+    let whole: Box<RawValue> = serde_json::from_slice(&body).map_err(failure)?;
+    let text = whole.get().trim_start();
+    let records: Vec<Box<RawValue>> = if text.starts_with('[') {
+        serde_json::from_str(whole.get()).map_err(failure)?
+    } else {
+        #[derive(serde::Deserialize)]
+        struct Wrapped {
+            records: Vec<Box<RawValue>>,
+        }
+        match serde_json::from_str::<Wrapped>(whole.get()) {
+            Ok(wrapped) => wrapped.records,
+            Err(_) => vec![whole],
+        }
+    };
+    let report = crate::ingest::ingest(engine, &source, records)
+        .await
+        .map_err(|error| write_failure(&error))?;
+    s.changed.notify_one();
+    Ok(Json(serde_json::to_value(report).map_err(failure)?))
 }
 async fn ingest(
     State(s): State<Arc<Service>>,

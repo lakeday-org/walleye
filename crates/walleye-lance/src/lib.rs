@@ -2,6 +2,7 @@
 mod backend;
 mod cached_storage;
 mod decisions;
+pub mod embed;
 mod error;
 mod identity;
 mod ipc;

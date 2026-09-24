@@ -121,8 +121,10 @@ async fn every_allocation_borrows_from_the_one_budget_and_fails_closed() {
     );
     assert_eq!(at_rest["budget"]["memory_reserved"], 0);
 
-    // Opening a 128-dim vector table takes its memtable footprint out of the
-    // cache: 48 MiB of memtable plus 100k x (512 + 128) bytes of graph.
+    // Opening a vector table takes its memtable footprint out of the cache:
+    // 48 MiB of memtable plus 100k x 576 bytes of graph. Not per dimension:
+    // the vectors live in the memtable, and the graph measures the same at
+    // 128 dimensions as at 3072.
     let arrow = "application/vnd.apache.arrow.stream";
     let (status, body) = send(
         &app,
@@ -135,7 +137,7 @@ async fn every_allocation_borrows_from_the_one_budget_and_fails_closed() {
     assert_eq!(status, StatusCode::OK, "{body}");
     let open = stats(&app).await;
     let reserved = open["budget"]["memory_reserved"].as_u64().unwrap() as usize;
-    let expected = 48 * MIB + 100_000 * (128 * 4 + 128);
+    let expected = 48 * MIB + 100_000 * 576;
     assert_eq!(reserved, expected, "{open}");
     let capacity = open["memory_capacity"].as_u64().unwrap() as usize;
     assert!(

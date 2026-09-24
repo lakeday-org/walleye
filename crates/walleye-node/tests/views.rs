@@ -20,9 +20,7 @@ const TOKEN: &str = "deployment-secret-token";
 const ARROW: &str = "application/vnd.apache.arrow.stream";
 const JSON: &str = "application/json";
 
-fn keyed() -> bool {
-    std::env::var("TYPESAFE_API_KEY").is_ok_and(|key| !key.trim().is_empty())
-}
+mod common;
 
 fn config(path: &std::path::Path) -> Config {
     Config {
@@ -291,10 +289,17 @@ async fn a_view_may_not_write_back_into_its_source() {
 /// than discarding them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tiers_refine_raw_rows_into_confident_labels() {
-    if !keyed() {
-        eprintln!("skipping: no decision service key configured");
-        return;
-    }
+    // The decision service is a stand-in: which team a ticket goes to is not
+    // what this tests, how the tiers carry and gate the answer is. One ticket
+    // is answered unsure on purpose, so the gold tier's gate has something
+    // to hold back.
+    common::start(common::JEV);
+    let sure =
+        |label: &str, confidence: f64| common::choice(label, confidence, &[(label, confidence)]);
+    common::answer("wrong size", "team", sure("returns", 0.95));
+    common::answer("tracking number", "team", sure("shipping", 0.97));
+    common::answer("charged twice", "team", sure("billing", 0.6));
+    common::answer("two weeks late", "team", sure("shipping", 0.93));
     let d = tempfile::tempdir().unwrap();
     let app = seed(
         d.path(),
@@ -353,27 +358,17 @@ async fn tiers_refine_raw_rows_into_confident_labels() {
     let gold = refresh(&app, "gold").await;
     assert_eq!(gold["written"], 3, "{gold}");
 
-    let rows = sql(&app, "SELECT routed FROM gold_tickets").await;
+    let rows = sql(&app, "SELECT routed FROM gold_tickets ORDER BY routed").await;
     let routed: Vec<&str> = rows
         .as_array()
         .unwrap()
         .iter()
         .map(|row| row["routed"].as_str().unwrap())
         .collect();
-    assert_eq!(routed.len(), 3, "{rows}");
-    assert!(
-        routed
-            .iter()
-            .all(|label| { matches!(*label, "returns" | "shipping" | "billing" | "needs_triage") }),
-        "every row carries a usable label: {rows}"
-    );
-    assert!(
-        routed
-            .iter()
-            .filter(|label| **label != "needs_triage")
-            .count()
-            >= 2,
-        "clear tickets route without triage: {rows}"
+    assert_eq!(
+        routed,
+        ["needs_triage", "returns", "shipping"],
+        "the sure answers route and the unsure one is held for triage: {rows}"
     );
 
     // And the tiers advance independently as new rows arrive.

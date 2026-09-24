@@ -114,6 +114,7 @@ transforming.
 |---|---|
 | `POST /v1/streams` | Define a stream |
 | `POST /v1/streams/{name}/events` | Ingest rows as JSON |
+| `POST /v1/ingest/{source}` | Ingest records of any shape; the table is worked out for you. See [Ingest anything](../concepts/ingest.md) |
 | `GET /v1/view/` | List views |
 | `POST /v1/view/{name}/create/` | Define a view and its worker |
 | `POST /v1/view/{name}/describe/` | What a view is and where its cursor is |

@@ -1,9 +1,10 @@
 //! Typed decisions inside SQL, over rows the node is holding.
 //!
-//! These tests call the real decision service, because the thing worth
-//! proving is that a column of text becomes a column of labels end to end.
-//! Without a key they skip rather than fail: a checkout with no credentials
-//! is not a broken build.
+//! The decision service is a stand-in served in the test (see `common`), so
+//! these run in CI and do not depend on a live service being up or quick.
+//! What they prove is the plumbing - a column of text becomes a column of
+//! labels, a confidence comes back as a number, identical rows are one call -
+//! not how well any model labels tickets.
 use arrow_array::{ArrayRef, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use axum::{
@@ -18,8 +19,10 @@ use walleye_ring::Node;
 
 const TOKEN: &str = "deployment-secret-token";
 
-fn keyed() -> bool {
-    std::env::var("TYPESAFE_API_KEY").is_ok_and(|key| !key.trim().is_empty())
+mod common;
+
+fn sure(label: &str, confidence: f64) -> Value {
+    common::choice(label, confidence, &[(label, confidence)])
 }
 
 fn config(path: &std::path::Path) -> Config {
@@ -127,10 +130,18 @@ async fn seeded(path: &std::path::Path, rows: &[&str]) -> axum::Router {
 /// query writes inline.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sql_classifies_a_column_against_an_inline_taxonomy() {
-    if !keyed() {
-        eprintln!("skipping: no decision service key configured");
-        return;
-    }
+    common::start(common::JEV);
+    common::answer("wrong size", "answer", sure("returns", 0.92));
+    common::answer(
+        "has not moved in nine days",
+        "answer",
+        sure("shipping", 0.95),
+    );
+    common::answer(
+        "charged twice for the same order.",
+        "answer",
+        sure("billing", 0.97),
+    );
     let d = tempfile::tempdir().unwrap();
     let app = seeded(
         d.path(),
@@ -162,12 +173,12 @@ async fn sql_classifies_a_column_against_an_inline_taxonomy() {
 /// compare against, which is what makes a tier able to hold a row back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn confidence_is_queryable_so_a_tier_can_gate_on_it() {
-    if !keyed() {
-        eprintln!("skipping: no decision service key configured");
-        return;
-    }
+    common::start(common::JEV);
+    let row = "Two charges hit my card for one order.";
+    common::answer_to(row, "Which team", "answer", sure("billing", 0.88));
+    common::answer_to(row, "money back", "answer", common::noul(0.2));
     let d = tempfile::tempdir().unwrap();
-    let app = seeded(d.path(), &["I was charged twice for the same order."]).await;
+    let app = seeded(d.path(), &["Two charges hit my card for one order."]).await;
 
     let (status, body) = sql(
         &app,
@@ -181,19 +192,15 @@ async fn confidence_is_queryable_so_a_tier_can_gate_on_it() {
     assert_eq!(status, StatusCode::OK, "{body}");
     let row = &body.as_array().expect("rows")[0];
     assert_eq!(row["team"], "billing", "{body}");
-    let sure = row["sure"].as_f64().expect("a confidence");
-    assert!(
-        (0.0..=1.0).contains(&sure),
-        "confidence in range, got {sure}"
+    assert_eq!(
+        row["sure"].as_f64(),
+        Some(0.88),
+        "the confidence comes back as the number it was: {body}"
     );
-    assert!(
-        sure > 0.5,
-        "an unambiguous billing complaint is not a coin flip, got {sure}"
-    );
-    let refund = row["refund"].as_f64().expect("a probability");
-    assert!(
-        (0.0..=1.0).contains(&refund),
-        "probability in range, got {refund}"
+    assert_eq!(
+        row["refund"].as_f64(),
+        Some(0.2),
+        "a yes or no comes back as its probability: {body}"
     );
 }
 
@@ -236,15 +243,12 @@ async fn a_malformed_question_fails_the_query_and_says_why() {
 /// materialising a tier over a large table affordable.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn repeated_text_is_asked_about_once() {
-    if !keyed() {
-        eprintln!("skipping: no decision service key configured");
-        return;
-    }
+    common::start(common::JEV);
     let d = tempfile::tempdir().unwrap();
-    let repeated = "The tracking number has not moved in nine days.";
+    let repeated = "The tracking number has not moved in nine days. (repeated)";
+    common::answer(repeated, "answer", sure("shipping", 0.95));
     let app = seeded(d.path(), &[repeated; 24]).await;
 
-    let started = std::time::Instant::now();
     let (status, body) = sql(
         &app,
         &format!(
@@ -253,7 +257,6 @@ async fn repeated_text_is_asked_about_once() {
         ),
     )
     .await;
-    let elapsed = started.elapsed();
     assert_eq!(status, StatusCode::OK, "{body}");
     let rows = body.as_array().expect("rows");
     assert_eq!(rows.len(), 24, "{body}");
@@ -261,11 +264,12 @@ async fn repeated_text_is_asked_about_once() {
         rows.iter().all(|row| row["team"] == "shipping"),
         "every copy gets the same label, got {body}"
     );
-    // Twenty-four separate calls take several seconds; one takes a fraction
-    // of one. The margin is wide enough not to be timing sensitive.
-    assert!(
-        elapsed < std::time::Duration::from_secs(3),
-        "identical rows collapsed to one question, took {elapsed:?}"
+    // Counted, not timed: twenty-four identical rows are one request to the
+    // service, however quickly or slowly it answers.
+    assert_eq!(
+        common::jev_requests(repeated).len(),
+        1,
+        "identical rows collapsed to one question"
     );
 }
 
@@ -274,10 +278,11 @@ async fn repeated_text_is_asked_about_once() {
 /// wide tier affordable: one call per row, not one per question.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn one_call_answers_a_whole_question_set() {
-    if !keyed() {
-        eprintln!("skipping: no decision service key configured");
-        return;
-    }
+    common::start(common::JEV);
+    let row = "I was charged twice for the same order and I want a refund.";
+    common::answer(row, "team", sure("billing", 0.91));
+    common::answer(row, "refund", common::noul(0.94));
+    common::answer(row, "severity", common::score("moderate", 0.7));
     let d = tempfile::tempdir().unwrap();
     let app = seeded(
         d.path(),
@@ -324,9 +329,14 @@ async fn one_call_answers_a_whole_question_set() {
         row["refund"].as_f64().expect("probability") > 0.5,
         "an explicit refund request, got {body}"
     );
-    assert!(
-        row["severity"].is_string(),
-        "a score names its level, got {body}"
+    assert_eq!(
+        row["severity"], "moderate",
+        "a score names its level: {body}"
+    );
+    assert_eq!(
+        common::jev_requests("I was charged twice for the same order and I want a refund.").len(),
+        1,
+        "three questions, one request"
     );
 }
 

@@ -32,6 +32,7 @@ fn context(storage: &LanceStorageOptions) -> lance::Result<SessionContext> {
     // wherever a session is built rather than only on one path.
     // A model and a decision service, as functions a query can call.
     crate::prompt::register(&context);
+    crate::embed::register(&context);
     Ok(context)
 }
 fn err(e: impl std::fmt::Display) -> lance::Error {
