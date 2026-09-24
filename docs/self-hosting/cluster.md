@@ -131,6 +131,15 @@ and by a replica with an empty volume. Those reads fetch many small segments
 at once, so on an object store they cost a few round trips however much
 history has built up since a table last flushed.
 
+Each stream's archive has one head object, which every replica reads and
+rewrites on every pass. It names the newest segments only; older ones are
+moved into immutable index pages it points back through, so it stays a few
+kilobytes however long the stream lives, and a read that starts further back
+follows the pages. A pass archives a node's streams side by side rather than
+one after another. The coordinator writing a stream keeps its newest
+acknowledged records in memory to bring a member level quickly, and forgets
+the rest once the archive holds them.
+
 Restoring a node that lost its disk is the seeding path above: it reads the
 archive, catches up from its peers, and rejoins owning nothing; the others
 then hand it its share, one key per sweep.

@@ -284,3 +284,13 @@
     writer lacks, or one that differs - goes through catch-up from the peers.
     Sending past an unchecked record can chain committed records onto an
     orphan the member kept from a dead writer.
+
+- name: replica-state-stays-the-size-of-its-window
+  where: "crates/walleye-bitr-server/src/**/*.rs"
+  ensure_absent: >
+    State kept for as long as a stream lives that grows with every record or
+    every archive pass: a list in the archive head, or a map in a
+    coordinator's memory, that is appended to and never folded, pruned or
+    bounded. The archive head is read and rewritten by every member on every
+    pass, and a coordinator runs for months, so either one growing with
+    history slows every pass and eventually exhausts memory.
