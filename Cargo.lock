@@ -6681,6 +6681,7 @@ dependencies = [
  "arrow-ipc",
  "arrow-schema",
  "async-trait",
+ "axum",
  "bytes",
  "datafusion-execution",
  "futures",
@@ -6690,6 +6691,7 @@ dependencies = [
  "lance-io",
  "lance-linalg",
  "object_store 0.13.2",
+ "object_store 0.14.1",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -6699,6 +6701,7 @@ dependencies = [
  "tokio",
  "uuid",
  "walleye-bitr",
+ "walleye-bitr-server",
  "walleye-cache",
  "walleye-typesafe",
 ]

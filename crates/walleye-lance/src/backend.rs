@@ -382,10 +382,16 @@ impl BitrWalBackend {
         self.state.lock().await.poisoned.is_some()
     }
 
-    /// Returns the first retained one-based position, or one for an empty log.
+    /// Returns the first retained one-based position, or one for an empty log:
+    /// the position after what a durable checkpoint released. Asks the log
+    /// for its extent rather than reading it from the start.
     async fn first_position_inner(&self) -> WalResult<u64> {
-        let entries = self.recover(0).await?;
-        Ok(entries.first().map_or(1, RecoveredEntry::position))
+        let extent = self
+            .writer
+            .extent(self.stream.as_ref())
+            .await
+            .map_err(map_replica_error)?;
+        Ok(extent.first_retained())
     }
 
     /// Validates a caller-provided payload before selecting an LSN.
@@ -962,6 +968,19 @@ impl WalBackend for BitrWalBackend {
         // Keep append/retry cursors and the latest commit certificate intact.
         // A concurrently appended suffix remains available for replay.
         state.committed.retain(|position, _| *position > covered);
+        drop(state);
+        // Lance has published a manifest covering this prefix, so no opener
+        // of this table replays it again and nothing in Walleye reads the
+        // log below it: the log lets it go, and its archived copies with it.
+        // Lance does not wait on that - a release that fails is repeated,
+        // wider, by the next checkpoint.
+        let writer = Arc::clone(&self.writer);
+        let stream = Arc::clone(&self.stream);
+        tokio::spawn(async move {
+            if let Err(error) = writer.release(&stream, covered).await {
+                eprintln!("walleye.storage release stream={stream} outcome=error error={error}");
+            }
+        });
     }
 
     /// Persists one Lance IPC entry through the Bitr quorum writer.
