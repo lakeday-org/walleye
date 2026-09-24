@@ -739,6 +739,12 @@ pub struct Engine {
     /// Why this process cannot yet say every table is served, as of the last
     /// ownership sweep, or `None` once it can. See [`Self::tables_served`].
     tables_pending: std::sync::Mutex<Option<String>>,
+    /// Why this process cannot yet say it reaches every live peer, as of the
+    /// last [`Self::check_served`], or `None` once it can. Kept apart from the
+    /// sweep: a peer that accepts a connection and never answers (a paused
+    /// process) would otherwise hold up every sweep for the probe's timeout,
+    /// and with it the takeover of that peer's tables.
+    peers_pending: std::sync::Mutex<Option<String>>,
     /// Tables this process holds whose writer failed to open. A claim stands
     /// even when the open fails, so the sweep opens them again until they
     /// open; until then the table is not served.
@@ -855,6 +861,7 @@ impl Engine {
                 "table ownership has not been swept yet".into(),
             )),
             open_failed: std::sync::Mutex::new(BTreeSet::new()),
+            peers_pending: std::sync::Mutex::new(Some("peers have not been checked yet".into())),
         };
         // Open writers lazily: the combined Bitr service starts after configuration loads.
         Ok(engine)
@@ -1107,8 +1114,7 @@ impl Engine {
         if let Some(key) = self.owners.surplus(&names) {
             self.hand_back(&key).await;
         }
-        self.reopen_failed().await;
-        let pending = self.tables_pending_after_sweep(&names).await;
+        let pending = self.tables_pending_after_sweep(&names);
         self.set_tables_pending(pending);
         claimed
     }
@@ -1124,10 +1130,53 @@ impl Engine {
     /// nothing about whether a table's owner is settled, open and reachable
     /// from the node a request lands on.
     pub fn tables_served(&self) -> Option<String> {
-        self.tables_pending
+        let tables = self
+            .tables_pending
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+            .clone();
+        tables.or_else(|| {
+            self.peers_pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        })
+    }
+    /// The part of [`Self::tables_served`] that needs the network, run on its
+    /// own loop so the ownership sweep never waits on it: open again every
+    /// held table whose writer failed to open, and check this process can
+    /// connect to every live peer at the address it advertises.
+    pub async fn check_served(&self) {
+        self.reopen_failed().await;
+        let me = self.owners.node();
+        let peers: Vec<crate::ownership::Peer> = self
+            .owners
+            .live_peers()
+            .into_iter()
+            .filter(|peer| peer.node != me)
+            .collect();
+        let unreachable: Vec<String> = futures::stream::iter(peers)
+            .map(|peer| async move { (!self.cluster.reaches(&peer).await).then_some(peer.node) })
+            .buffer_unordered(4)
+            .filter_map(|node| async move { node })
+            .collect()
+            .await;
+        let pending = (!unreachable.is_empty()).then(|| {
+            format!(
+                "cannot yet connect to {} at the address it advertises",
+                unreachable.join(", ")
+            )
+        });
+        let mut current = self
+            .peers_pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *current != pending
+            && let Some(reason) = &pending
+        {
+            eprintln!("walleye.ownership tables_served=false reason={reason}");
+        }
+        *current = pending;
     }
     fn set_tables_pending(&self, pending: Option<String>) {
         let mut current = self
@@ -1172,7 +1221,7 @@ impl Engine {
             self.open_claimed(&name).await;
         }
     }
-    async fn tables_pending_after_sweep(&self, names: &[String]) -> Option<String> {
+    fn tables_pending_after_sweep(&self, names: &[String]) -> Option<String> {
         let unowned = self.owners.unowned(names);
         if !unowned.is_empty() {
             return Some(format!("no live owner yet for {}", unowned.join(", ")));
@@ -1192,25 +1241,6 @@ impl Engine {
             return Some(format!(
                 "opening {} again after a failed open",
                 failed.join(", ")
-            ));
-        }
-        let me = self.owners.node();
-        let peers: Vec<crate::ownership::Peer> = self
-            .owners
-            .live_peers()
-            .into_iter()
-            .filter(|peer| peer.node != me)
-            .collect();
-        let unreachable: Vec<String> = futures::stream::iter(peers)
-            .map(|peer| async move { (!self.cluster.reaches(&peer).await).then_some(peer.node) })
-            .buffer_unordered(4)
-            .filter_map(|node| async move { node })
-            .collect()
-            .await;
-        if !unreachable.is_empty() {
-            return Some(format!(
-                "cannot yet connect to {} at the address it advertises",
-                unreachable.join(", ")
             ));
         }
         None

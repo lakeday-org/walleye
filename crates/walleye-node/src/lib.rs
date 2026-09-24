@@ -419,6 +419,7 @@ impl Service {
         service.clone().spawn_alarms();
         service.clone().spawn_readiness();
         service.clone().spawn_ownership();
+        service.clone().spawn_served();
         Ok(service)
     }
 
@@ -483,6 +484,25 @@ impl Service {
                 tokio::select! {
                     _ = &mut changed => {}
                     _ = tokio::time::sleep(std::time::Duration::from_millis(wait)) => {}
+                }
+            }
+        });
+    }
+
+    /// Keep the network half of "every table is served" current: reopen
+    /// tables whose open failed and check every live peer is reachable. Its
+    /// own loop, so a peer that never answers slows only this, never a sweep.
+    fn spawn_served(self: Arc<Self>) {
+        let Some(engine) = &self.engine else { return };
+        let every = engine.ownership().config().sample();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(every).await;
+                if self.quiescing.load(Ordering::Acquire) {
+                    return;
+                }
+                if let Some(engine) = &self.engine {
+                    engine.check_served().await;
                 }
             }
         });
