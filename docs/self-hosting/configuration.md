@@ -64,7 +64,7 @@ holds back from them.
 | `WALLEYE_MEMBERS` | `id=http://host:8080,id=http://host:8080,…` |
 | `WALLEYE_NODE_ID` | Which member in that list this process is. Required with `WALLEYE_MEMBERS`. |
 | `WALLEYE_BITR_URL` | The local replica gateway. Setting it turns on quorum durability. |
-| `WALLEYE_ADVERTISE_URL` | Without `WALLEYE_MEMBERS`, where other processes reach this one. `http://localhost:<port>` by default. Set it when a replacement may start beside a running node. |
+| `WALLEYE_ADVERTISE_URL` | Where other processes reach this one. With `WALLEYE_MEMBERS` it replaces this node's own entry, so a lease names an address that answers the moment the node listens rather than a hostname peers may resolve only later. Without it, `http://localhost:<port>` by default; set it when a replacement may start beside a running node. |
 
 The member list says where each node answers and where the replicas are. It
 does not decide who owns a table; ownership is recorded in the bucket and

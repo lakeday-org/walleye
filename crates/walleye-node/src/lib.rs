@@ -68,8 +68,9 @@ impl Config {
     /// route; generated and printed when absent), `WALLEYE_DIR`
     /// (`./walleye-cache`), `WALLEYE_RAM_GB` (1), `WALLEYE_NVME_GB` (8), `WALLEYE_BITR_URL` (enables Bitr cluster mode),
     /// `WALLEYE_MEMBERS` (`id=http://host:8080,...`) with `WALLEYE_NODE_ID`
-    /// naming this member, `WALLEYE_ADVERTISE_URL` (where peers reach a node
-    /// started without `WALLEYE_MEMBERS`; `http://localhost:<port>`), and the
+    /// naming this member, `WALLEYE_ADVERTISE_URL` (where peers reach this
+    /// node: it replaces this node's own entry in `WALLEYE_MEMBERS`, and
+    /// without a member list it is `http://localhost:<port>`), and the
     /// lease timings `WALLEYE_LEASE_TTL_MS` (10000), `WALLEYE_LEASE_SKEW_MS`
     /// (2000) and `WALLEYE_OWNERSHIP_SAMPLE_MS` (2000).
     pub fn from_env() -> Result<Self, Box<dyn std::error::Error>> {
@@ -104,6 +105,11 @@ impl Config {
             Some(list) => {
                 let node_id = get("WALLEYE_NODE_ID")
                     .ok_or("WALLEYE_NODE_ID is required with WALLEYE_MEMBERS")?;
+                // Where this node answers, when it says: its own entry in the
+                // member list can name it by a hostname its peers resolve
+                // only some time after it starts, and its lease tells them to
+                // forward to that entry at once.
+                let advertise = get("WALLEYE_ADVERTISE_URL");
                 let members = list
                     .split(',')
                     .map(str::trim)
@@ -112,6 +118,10 @@ impl Config {
                         let (id, endpoint) = entry
                             .split_once('=')
                             .ok_or("WALLEYE_MEMBERS entries are id=http://host:port")?;
+                        let endpoint = match &advertise {
+                            Some(advertise) if id == node_id => advertise.as_str(),
+                            _ => endpoint,
+                        };
                         Ok(Node::new(id, endpoint, 1.0)?)
                     })
                     .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
@@ -301,7 +311,18 @@ async fn quorum_state(client: &reqwest::Client, gateway: &str) -> (bool, serde_j
 }
 
 impl Service {
+    /// [`Self::prepare`] and [`Self::start`] together, for a host that
+    /// accepts connections before it opens the service or never takes any.
     pub async fn open(config: Config) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
+        let service = Self::prepare(config).await?;
+        service.start().await?;
+        Ok(service)
+    }
+
+    /// Everything but joining the cluster: the storage, the engine and the
+    /// cache are open, and nothing of this process is visible to its peers
+    /// yet. [`Self::start`] joins it, once the process accepts connections.
+    pub async fn prepare(config: Config) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
         use_tls();
         let ring = Arc::new(Membership::new(config.members.clone())?);
         if config.token.len() < 16
@@ -411,18 +432,30 @@ impl Service {
                 serde_json::json!({"ready": true})
             }),
         });
-        // Three things run for the life of the node: the disk the Bitr log
-        // takes is reported so the cache's ceiling tracks it, tables nobody
-        // is using are closed so their memory returns to the budget, and
-        // readiness is established and then kept current.
-        service.clone().spawn_disk_sampler();
-        service.clone().spawn_idle_sweeper();
-        service.clone().spawn_view_driver();
-        service.clone().spawn_alarms();
-        service.clone().spawn_readiness();
-        service.clone().spawn_ownership();
-        service.clone().spawn_served();
         Ok(service)
+    }
+
+    /// Join the cluster: publish this process's lease, and start what runs
+    /// for the life of the node. Call it once the process accepts connections
+    /// on the address its lease names - from then on peers forward to it and
+    /// its sweeps claim tables for it, and a peer that cannot connect tells
+    /// its caller the owner is unreachable.
+    pub async fn start(self: &Arc<Self>) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(engine) = &self.engine {
+            engine.start().await.map_err(|error| error.to_string())?;
+        }
+        // For the life of the node: the disk the Bitr log takes is reported
+        // so the cache's ceiling tracks it, tables nobody is using are closed
+        // so their memory returns to the budget, readiness is established and
+        // kept current, and ownership, alarms and views are driven.
+        self.clone().spawn_disk_sampler();
+        self.clone().spawn_idle_sweeper();
+        self.clone().spawn_view_driver();
+        self.clone().spawn_alarms();
+        self.clone().spawn_readiness();
+        self.clone().spawn_ownership();
+        self.clone().spawn_served();
+        Ok(())
     }
 
     /// Fire alarms on the keys this process owns, each when it comes due.
@@ -1423,6 +1456,35 @@ mod config_tests {
         let api = c.api.unwrap();
         assert_eq!(api.root_uri, "s3://walleye/prod");
         assert_eq!(api.bitr_url.as_deref(), Some("http://127.0.0.1:30080"));
+    }
+
+    /// A member list that names this node by a hostname does not decide
+    /// where peers reach it when it advertises an address: that address goes
+    /// in its lease, reachable the moment it listens.
+    #[test]
+    fn an_advertised_address_is_where_a_listed_node_answers() {
+        let c = Config::from_env_with(env(&[
+            ("WALLEYE_BUCKET", "walleye"),
+            ("WALLEYE_NODE_ID", "node-1"),
+            (
+                "WALLEYE_MEMBERS",
+                "node-0=http://a.vm.app.internal:8080,node-1=http://b.vm.app.internal:8080",
+            ),
+            ("WALLEYE_ADVERTISE_URL", "http://[fdaa::3]:8080"),
+        ]))
+        .unwrap();
+        let endpoints: Vec<(&str, &str)> = c
+            .members
+            .iter()
+            .map(|member| (member.id.as_str(), member.endpoint.as_str()))
+            .collect();
+        assert_eq!(
+            endpoints,
+            vec![
+                ("node-0", "http://a.vm.app.internal:8080"),
+                ("node-1", "http://[fdaa::3]:8080")
+            ]
+        );
     }
 
     #[test]

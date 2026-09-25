@@ -763,7 +763,8 @@ pub struct Engine {
     owners: Arc<Ownership>,
     log: Arc<LogName>,
     /// The lease renewer and the bucket sampler, stopped with the engine.
-    background: Vec<tokio::task::AbortHandle>,
+    /// The lease's renewal and sampling, once [`Self::start`] has run.
+    background: std::sync::Mutex<Vec<tokio::task::AbortHandle>>,
     /// The one crossing out of a worker's isolate.
     reach: Arc<dyn walleye_v8::Host>,
     /// Why this process cannot yet say every table is served, as of the last
@@ -832,34 +833,6 @@ impl Engine {
             cluster.endpoint.clone(),
             lease,
         ));
-        // A lease before anything else: nothing may be claimed without one.
-        let mut published = false;
-        for _ in 0..5 {
-            if owners.renew().await {
-                published = true;
-                break;
-            }
-        }
-        if !published {
-            return Err("could not publish this process's lease in the bucket".into());
-        }
-        let background = vec![
-            tokio::spawn({
-                let owners = owners.clone();
-                async move { owners.renew_forever().await }
-            })
-            .abort_handle(),
-            tokio::spawn({
-                let owners = owners.clone();
-                async move { owners.sample_forever().await }
-            })
-            .abort_handle(),
-        ];
-        eprintln!(
-            "walleye.ownership start node={} addr={}",
-            owners.node(),
-            cluster.endpoint
-        );
         let log = Arc::new(LogName::new(config.bitr_url.clone()));
         let engine = Self {
             config,
@@ -882,7 +855,7 @@ impl Engine {
             writer,
             cluster,
             owners,
-            background,
+            background: std::sync::Mutex::new(Vec::new()),
             reach: crate::reach::Reach::new(
                 crate::reach::Allowed::from_env(),
                 tokio::runtime::Handle::current(),
@@ -895,6 +868,45 @@ impl Engine {
         };
         // Open writers lazily: the combined Bitr service starts after configuration loads.
         Ok(engine)
+    }
+    /// Publish this process's lease and keep it and the other leases current.
+    ///
+    /// Until this runs no peer knows the process exists, so nothing is sent
+    /// to it and it can claim nothing. Call it only once the process accepts
+    /// connections on the address its lease names: a lease is peers' licence
+    /// to forward to that address, and a peer that finds nobody there answers
+    /// its caller that the owner is unreachable.
+    pub async fn start(&self) -> Result<(), Error> {
+        let mut published = false;
+        for _ in 0..5 {
+            if self.owners.renew().await {
+                published = true;
+                break;
+            }
+        }
+        if !published {
+            return Err("could not publish this process's lease in the bucket".into());
+        }
+        let renew = tokio::spawn({
+            let owners = self.owners.clone();
+            async move { owners.renew_forever().await }
+        })
+        .abort_handle();
+        let sample = tokio::spawn({
+            let owners = self.owners.clone();
+            async move { owners.sample_forever().await }
+        })
+        .abort_handle();
+        self.background
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend([renew, sample]);
+        eprintln!(
+            "walleye.ownership start node={} addr={}",
+            self.owners.node(),
+            self.cluster.endpoint
+        );
+        Ok(())
     }
     async fn register(&self, definition: StreamDefinition) -> Result<Arc<Stream>, Error> {
         let config = definition.table_config(&self.config.root_uri)?;
@@ -2378,14 +2390,24 @@ impl Engine {
             close_writer(&stream).await;
         }))
         .await;
-        for task in &self.background {
+        for task in self
+            .background
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+        {
             task.abort();
         }
     }
 }
 impl Drop for Engine {
     fn drop(&mut self) {
-        for task in &self.background {
+        for task in self
+            .background
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+        {
             task.abort();
         }
     }
@@ -2687,6 +2709,7 @@ mod tests {
         )
         .await
         .unwrap();
+        engine.start().await.unwrap();
         engine.writer = writer;
         engine
     }
@@ -2903,7 +2926,7 @@ mod tests {
         let mut pending = Box::pin(a.ingest("t", vec![json!({"id":2,"value":2})]));
         assert!(futures::poll!(&mut pending).is_pending());
         // A stops renewing, as a paused or partitioned process does.
-        for task in &a.background {
+        for task in a.background.lock().unwrap().iter() {
             task.abort();
         }
         let started = Instant::now();

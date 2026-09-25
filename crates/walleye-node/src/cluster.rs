@@ -605,8 +605,17 @@ pub async fn route_to_owner(
     // owner, or a local attempt refused before it applied anything - asks the
     // bucket again and goes once more.
     let mut fresh = forwarded;
-    for attempt in 0..2 {
-        let last = attempt == 1;
+    // An answer that says nothing was done because the table was not where
+    // it was looked for - a process that no longer owns it, or nobody owning
+    // it yet - comes from a table moving: handed over, handed back, or being
+    // claimed. Nothing was delivered, so the request is sent again, reading
+    // the bucket afresh each time, for this long before the caller is told.
+    let patient_until = std::time::Instant::now() + MOVED_PATIENCE;
+    let mut attempts = 0_usize;
+    loop {
+        let attempt = attempts;
+        attempts += 1;
+        let last = attempt >= 1;
         let routing = std::time::Instant::now();
         let route = engine.route_request(&table, fresh, forwarded).await;
         slow_step(&table, attempt, forwarded, "route", routing, None);
@@ -622,7 +631,11 @@ pub async fn route_to_owner(
                     serving,
                     Some(&response),
                 );
-                if !last && !forwarded && response.extensions().get::<Refused>().is_some() {
+                let refused = !forwarded && response.extensions().get::<Refused>().is_some();
+                if refused && (!last || std::time::Instant::now() < patient_until) {
+                    if last {
+                        tokio::time::sleep(MOVED_BACKOFF).await;
+                    }
                     fresh = true;
                     continue;
                 }
@@ -667,10 +680,27 @@ pub async fn route_to_owner(
                 // it no longer owns the table, it could not be reached, or it
                 // let the table go and knows nobody to send it to. Ask again;
                 // this process may take the table itself.
-                let moved = response.headers().get(ROUTE_ERROR_HEADER).is_some_and(|v| {
+                let reason = response
+                    .headers()
+                    .get(ROUTE_ERROR_HEADER)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_owned);
+                let moved = reason.as_deref().is_some_and(|v| {
                     v == "stale-owner" || v == "owner-unreachable" || v == "no-owner"
                 });
                 if !last && moved {
+                    fresh = true;
+                    continue;
+                }
+                // Not an owner that refuses connections: the forward already
+                // tried it again at once, and an owner that joins the
+                // cluster only once it accepts connections refuses them only
+                // when it is gone, which its lease will say.
+                if moved
+                    && reason.as_deref() != Some("owner-unreachable")
+                    && std::time::Instant::now() < patient_until
+                {
+                    tokio::time::sleep(MOVED_BACKOFF).await;
                     fresh = true;
                     continue;
                 }
@@ -688,8 +718,14 @@ pub async fn route_to_owner(
             }
         }
     }
-    unreachable!("the second attempt always returns")
 }
+
+/// How long a request that found its table moving keeps asking, re-reading
+/// ownership between tries, before it passes that answer on. Longer than a
+/// node takes to release a table it is handing over, or a peer's sample
+/// takes to see where it went.
+const MOVED_PATIENCE: std::time::Duration = std::time::Duration::from_secs(8);
+const MOVED_BACKOFF: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Say so when one step of routing a request took over a second: which step,
 /// and what it answered. A handover that leaves a write waiting shows here

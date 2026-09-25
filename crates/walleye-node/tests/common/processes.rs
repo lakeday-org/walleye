@@ -41,6 +41,9 @@ pub fn fast() -> LeaseConfig {
     }
 }
 
+/// How long a launch node takes between opening and accepting connections.
+const LAUNCH_OPENING: Duration = Duration::from_millis(1_500);
+
 pub enum Command {
     Pause(Duration),
     Kill,
@@ -65,7 +68,7 @@ impl Proc {
         bitr: Option<&str>,
         lease: LeaseConfig,
     ) -> Self {
-        Self::start_inner(node_id, root, cache, bitr, lease, None).await
+        Self::start_inner(node_id, root, cache, bitr, lease, None, Duration::ZERO).await
     }
 
     /// Start a launch node: the engine and, in the same process, its own
@@ -79,7 +82,16 @@ impl Proc {
         replica: CombinedReplica,
     ) -> Self {
         let gateway = format!("http://{}", replica.gateway_address);
-        Self::start_inner(node_id, root, cache, Some(&gateway), lease, Some(replica)).await
+        Self::start_inner(
+            node_id,
+            root,
+            cache,
+            Some(&gateway),
+            lease,
+            Some(replica),
+            LAUNCH_OPENING,
+        )
+        .await
     }
 
     async fn start_inner(
@@ -89,10 +101,13 @@ impl Proc {
         bitr: Option<&str>,
         lease: LeaseConfig,
         replica: Option<CombinedReplica>,
+        opening: Duration,
     ) -> Self {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let base = format!("http://{}", listener.local_addr().unwrap());
+        // The address is chosen now and bound only once the process is open,
+        // as the binary binds it: whatever a peer sends before then finds
+        // nobody there, which is what a starting Machine offers too.
+        let address = free_address();
+        let base = format!("http://{address}");
         let config = Config {
             node_id: node_id.into(),
             listen: base.clone(),
@@ -134,12 +149,24 @@ impl Proc {
                 }
             };
             let engine = async move {
-                let service = Service::open(config).await.unwrap();
+                let service = Service::prepare(config).await.unwrap();
                 let app = router(service.clone());
+                // A launch Machine takes a moment between opening and
+                // listening: its replica and its warm-up start in between.
+                tokio::time::sleep(opening).await;
                 use axum::serve::ListenerExt;
-                let listener = TcpListener::from_std(listener).unwrap().tap_io(|tcp| {
+                let mut bound = TcpListener::bind(&address).await;
+                for _ in 0..100 {
+                    if bound.is_ok() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    bound = TcpListener::bind(&address).await;
+                }
+                let listener = bound.unwrap().tap_io(|tcp| {
                     let _ = tcp.set_nodelay(true);
                 });
+                service.start().await.unwrap();
                 let (quit, quitting) = tokio::sync::oneshot::channel::<()>();
                 let server = tokio::spawn(async move {
                     let _ = axum::serve(listener, app)
@@ -171,6 +198,10 @@ impl Proc {
                         // over while still answering, then stop serving.
                         Command::Stop => {
                             service.release().await;
+                            service.quiesce();
+                            // As the binary does: go on accepting for as
+                            // long as a proxy may still route here.
+                            tokio::time::sleep(Duration::from_secs(3)).await;
                             let _ = quit.send(());
                             let _ = server.await;
                             service.close().await;
