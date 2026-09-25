@@ -834,6 +834,14 @@ impl Table {
         Ok(LsmStats { sstables })
     }
     /// Flush to Lance SSTables and advance the manifest replay watermark.
+    /// Freeze the memtable for flushing and return what to wait on for it to
+    /// reach a generation. Freezing is quick; the flush that follows is not,
+    /// and it needs no hold on the table: appends go on into a fresh memtable
+    /// while it runs. What [`Self::checkpoint`] does not: take the open-tail
+    /// note back, because rows appended meanwhile may still need it.
+    pub async fn seal(&self) -> lance::Result<Sealed> {
+        Ok(Sealed(self.writer.force_seal_active().await?))
+    }
     pub async fn checkpoint(&mut self) -> lance::Result<()> {
         self.writer.checkpoint().await?;
         self.clear_open_tail().await;
@@ -1204,6 +1212,15 @@ fn shard_snapshot(shard_id: Uuid, manifest: &lance_index::mem_wal::ShardManifest
             .with_current_generation(manifest.current_generation),
         |s, t| s.with_sstable(t.generation, t.path.clone()),
     )
+}
+
+/// A memtable frozen by [`Table::seal`], and everything frozen before it.
+pub struct Sealed(lance::dataset::mem_wal::SealFence);
+impl Sealed {
+    /// Until every one of them is a generation.
+    pub async fn flushed(self) -> lance::Result<()> {
+        self.0.wait().await
+    }
 }
 
 /// Flushed generations to open into a table's caches, captured from its

@@ -1689,10 +1689,20 @@ impl Engine {
         let stream = self.stream(name).await?;
         compact_stream(&stream, 2, self.cache.storage.query_timeout(), false).await
     }
-    /// Flush the memtable into a new generation.
+    /// Flush the memtable into a new generation. Only freezing it holds the
+    /// writer; appends go on while the flush runs. An upgrade asks for this
+    /// on every table before it starts the replacement, and a write waiting
+    /// out each flush was most of what that step cost.
     pub async fn flush(&self, name: &str) -> Result<(), Error> {
         let stream = self.stream(name).await?;
-        stream.table().await?.checkpoint().await?;
+        let started = Instant::now();
+        let sealed = stream.table().await?.seal().await?;
+        let sealed_ms = started.elapsed().as_millis();
+        sealed.flushed().await?;
+        eprintln!(
+            "walleye.storage flush stream={name} sealed_ms={sealed_ms} elapsed_ms={}",
+            started.elapsed().as_millis()
+        );
         Ok(())
     }
     pub async fn lsm_stats(&self, name: &str) -> Result<LsmStats, Error> {
@@ -2122,6 +2132,7 @@ impl Engine {
     /// write that was waiting finds the key released and is sent on to
     /// whoever takes it.
     async fn release_key(&self, name: &str) {
+        let started = Instant::now();
         let stream = self.streams.lock().await.get(name).cloned();
         let guard = match &stream {
             Some(stream) => {
@@ -2144,10 +2155,15 @@ impl Engine {
             Some(stream) => *stream.seq.lock().await,
             None => None,
         };
+        let flushed_ms = started.elapsed().as_millis();
         if let Err(error) = self.owners.release(name, next_seq).await {
             eprintln!("walleye.ownership release table={name} outcome=error error={error}");
         }
         drop(guard);
+        eprintln!(
+            "walleye.ownership released table={name} flush_ms={flushed_ms} elapsed_ms={}",
+            started.elapsed().as_millis()
+        );
     }
 
     /// Give one key back to the process it belongs to, because this one holds
