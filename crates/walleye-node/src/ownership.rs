@@ -119,6 +119,12 @@ pub struct OwnerRecord {
     /// version of this record, and a new owner inherits them with it.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub alarms: BTreeMap<String, Alarm>,
+    /// The arrival number the table's next row takes, left in a released
+    /// record by the owner that released it. Nothing was written after it,
+    /// so whoever claims from that record starts there rather than scanning
+    /// the table for its highest. Only a release carries one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_seq: Option<u64>,
 }
 
 /// What an alarm change came to.
@@ -212,6 +218,9 @@ struct State {
     abandoned: Vec<String>,
     /// Where each known key belongs, as of the last sweep: see [`place`].
     placement: HashMap<String, Peer>,
+    /// Arrival numbers left by the releases this process claimed from, until
+    /// the engine takes them.
+    handed_seq: HashMap<String, u64>,
     /// The most keys one live process should hold as of that sweep.
     fair_share: usize,
     started: Instant,
@@ -330,6 +339,7 @@ impl Ownership {
                 lost: Vec::new(),
                 abandoned: Vec::new(),
                 placement: HashMap::new(),
+                handed_seq: HashMap::new(),
                 fair_share: usize::MAX,
                 started: Instant::now(),
             }),
@@ -845,6 +855,46 @@ impl Ownership {
         self.holds(table) == Some(epoch)
     }
 
+    /// The arrival number the release this process claimed `table` from
+    /// left, once.
+    pub fn take_handed_seq(&self, table: &str) -> Option<u64> {
+        self.state().handed_seq.remove(table)
+    }
+
+    /// Whether a live session of this process's own node is running beside
+    /// it, as the last sample shows: the process this one is replacing.
+    pub fn has_predecessor(&self) -> bool {
+        let me = self.node();
+        self.live_peers()
+            .iter()
+            .any(|peer| peer.node != me && slot(&peer.node) == slot(&me))
+    }
+
+    /// Of `tables`, those the last sample shows held by a live session of
+    /// this process's own node: the process this one is replacing, which
+    /// hands them all over when it stops. Worth loading ahead of that.
+    pub fn held_by_predecessor(&self, tables: &[String]) -> Vec<String> {
+        let me = self.node();
+        let live: HashSet<String> = self
+            .live_peers()
+            .into_iter()
+            .map(|peer| peer.node)
+            .filter(|node| *node != me && slot(node) == slot(&me))
+            .collect();
+        let state = self.state();
+        tables
+            .iter()
+            .filter(|table| {
+                !state.held.contains_key(*table)
+                    && state
+                        .records
+                        .get(*table)
+                        .is_some_and(|(_, record)| live.contains(&record.node))
+            })
+            .cloned()
+            .collect()
+    }
+
     pub fn held_tables(&self) -> Vec<String> {
         self.state().held.keys().cloned().collect()
     }
@@ -922,6 +972,7 @@ impl Ownership {
             node: me.clone(),
             epoch,
             alarms: alarms.clone(),
+            next_seq: None,
         };
         if !self.write_version(table, seq + 1, &claim).await? {
             return Ok(Err(Refusal::NotNow { retry_after: retry }));
@@ -941,6 +992,16 @@ impl Ownership {
                 alarms,
             },
         );
+        // Only from a release: a record its owner still named was written
+        // before rows that may have followed it.
+        match record
+            .as_ref()
+            .filter(|record| record.node.is_empty())
+            .and_then(|record| record.next_seq)
+        {
+            Some(next) => state.handed_seq.insert(table.to_owned(), next),
+            None => state.handed_seq.remove(table),
+        };
         drop(state);
         self.alarms_changed.notify_waiters();
         let prior = record.map(|record| record.node).unwrap_or_default();
@@ -972,6 +1033,7 @@ impl Ownership {
             node: me.clone(),
             epoch,
             alarms: held.alarms.clone(),
+            next_seq: None,
         };
         let written = self.write_version(table, held.seq + 1, &record).await?;
         let mut state = self.state();
@@ -992,7 +1054,9 @@ impl Ownership {
 
     /// Hand `table` back: the record names nobody, at the same epoch, so the
     /// next claimant can take it at once rather than after a lease lapses.
-    pub async fn release(&self, table: &str) -> Result<(), Error> {
+    /// `next_seq` is the arrival number the next row should take, when this
+    /// process knows it; the caller has stopped writing the table.
+    pub async fn release(&self, table: &str, next_seq: Option<u64>) -> Result<(), Error> {
         let _writing = self.writing(table).await;
         let held = self.state().held.remove(table);
         let Some(held) = held else { return Ok(()) };
@@ -1001,6 +1065,7 @@ impl Ownership {
             node: String::new(),
             epoch: held.epoch,
             alarms: held.alarms,
+            next_seq,
         };
         if self.write_version(table, held.seq + 1, &record).await? {
             eprintln!(
@@ -1039,6 +1104,7 @@ impl Ownership {
             node: me.clone(),
             epoch: held.epoch,
             alarms: alarms.clone(),
+            next_seq: None,
         };
         let written = self.write_version(key, held.seq + 1, &record).await?;
         let mut state = self.state();
@@ -1376,7 +1442,7 @@ mod tests {
         assert!(a.claim("mine").await.unwrap().is_ok());
         assert!(b.claim("theirs").await.unwrap().is_ok());
         assert!(b.claim("released").await.unwrap().is_ok());
-        b.release("released").await.unwrap();
+        b.release("released", None).await.unwrap();
         a.sample().await.unwrap();
         let keys: Vec<String> = ["mine", "theirs", "released", "never"]
             .map(String::from)
@@ -1406,7 +1472,7 @@ mod tests {
         assert!(a.set_epoch("t", 4).await.unwrap());
 
         // Released: the next claimant takes it at the same epoch.
-        a.release("t").await.unwrap();
+        a.release("t", None).await.unwrap();
         assert_eq!(b.claim("t").await.unwrap().unwrap(), 4);
 
         // B stops renewing. It stops answering as an owner after ttl on its
@@ -1471,6 +1537,48 @@ mod tests {
             .get(&handed)
             .map(|peer| peer.node.clone());
         assert_eq!(placement, Some(other.node()), "only ever to the other node");
+    }
+
+    /// A process replacing another of its node sees which keys that one
+    /// holds, and a key it claims from a release starts at the arrival
+    /// number the release left, once. A claim from anything but a release
+    /// inherits none, however old a number an earlier release carried.
+    #[tokio::test]
+    async fn a_successor_knows_what_its_predecessor_holds_and_where_it_stopped() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = local_store(dir.path());
+        let keys: Vec<String> = (0..3).map(|i| format!("t{i}")).collect();
+        let original = node(&store, "single").await;
+        for key in &keys[..2] {
+            assert!(original.claim(key).await.unwrap().is_ok());
+        }
+        let successor = node(&store, "single").await;
+        let other = node(&store, "node-1").await;
+        successor.sample().await.unwrap();
+        other.sample().await.unwrap();
+        assert!(successor.has_predecessor());
+        assert_eq!(successor.held_by_predecessor(&keys), keys[..2].to_vec());
+        assert!(
+            !other.has_predecessor(),
+            "another node is not a predecessor"
+        );
+        assert!(other.held_by_predecessor(&keys).is_empty());
+
+        original.release("t0", Some(42)).await.unwrap();
+        assert!(successor.claim("t0").await.unwrap().is_ok());
+        assert_eq!(successor.take_handed_seq("t0"), Some(42));
+        assert_eq!(successor.take_handed_seq("t0"), None, "taken once");
+        successor.sample().await.unwrap();
+        assert_eq!(
+            successor.held_by_predecessor(&keys),
+            vec!["t1".to_owned()],
+            "a key it holds itself is not its predecessor's"
+        );
+
+        // Handed back without a number, over a record that once carried one.
+        successor.release("t0", None).await.unwrap();
+        assert!(original.claim("t0").await.unwrap().is_ok());
+        assert_eq!(original.take_handed_seq("t0"), None);
     }
 
     /// Placement is balanced within one, the same wherever it is worked out,
@@ -1573,6 +1681,7 @@ mod tests {
             node: "ghost".into(),
             epoch: 99,
             alarms: BTreeMap::new(),
+            next_seq: None,
         };
         assert!(
             !a.write_version("t", 2, &ghost).await.unwrap(),

@@ -515,6 +515,23 @@ impl Service {
     fn spawn_ownership(self: Arc<Self>) {
         let Some(engine) = &self.engine else { return };
         let every = engine.ownership().config().sample();
+        // Beside the sweep, not in it: loading a predecessor's tables can
+        // take longer than a sweep interval, and the sweep must keep running
+        // to claim them the moment they are released.
+        tokio::spawn({
+            let service = self.clone();
+            async move {
+                loop {
+                    tokio::time::sleep(every).await;
+                    if service.quiescing.load(Ordering::Acquire) {
+                        return;
+                    }
+                    if let Some(engine) = &service.engine {
+                        engine.prepare_successor().await;
+                    }
+                }
+            }
+        });
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(every).await;

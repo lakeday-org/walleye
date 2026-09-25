@@ -607,9 +607,21 @@ pub async fn route_to_owner(
     let mut fresh = forwarded;
     for attempt in 0..2 {
         let last = attempt == 1;
-        match engine.route_request(&table, fresh, forwarded).await {
+        let routing = std::time::Instant::now();
+        let route = engine.route_request(&table, fresh, forwarded).await;
+        slow_step(&table, attempt, forwarded, "route", routing, None);
+        match route {
             Ok(Route::Local { .. }) => {
+                let serving = std::time::Instant::now();
                 let response = local(parts.clone(), bytes.clone()).await;
+                slow_step(
+                    &table,
+                    attempt,
+                    forwarded,
+                    "local",
+                    serving,
+                    Some(&response),
+                );
                 if !last && !forwarded && response.extensions().get::<Refused>().is_some() {
                     fresh = true;
                     continue;
@@ -630,6 +642,7 @@ pub async fn route_to_owner(
                 ));
             }
             Ok(Route::Remote { peer, verdict_in }) => {
+                let forwarding = std::time::Instant::now();
                 let response = engine
                     .cluster()
                     .forward(
@@ -642,6 +655,14 @@ pub async fn route_to_owner(
                         engine.lease_lapses(peer.node.clone()),
                     )
                     .await;
+                slow_step(
+                    &table,
+                    attempt,
+                    forwarded,
+                    &format!("forward to={}", peer.node),
+                    forwarding,
+                    Some(&response),
+                );
                 // Each says nothing was applied and the owner was not there:
                 // it no longer owns the table, it could not be reached, or it
                 // let the table go and knows nobody to send it to. Ask again;
@@ -668,6 +689,39 @@ pub async fn route_to_owner(
         }
     }
     unreachable!("the second attempt always returns")
+}
+
+/// Say so when one step of routing a request took over a second: which step,
+/// and what it answered. A handover that leaves a write waiting shows here
+/// as the process it waited on and why.
+fn slow_step(
+    table: &str,
+    attempt: usize,
+    forwarded: bool,
+    step: &str,
+    started: std::time::Instant,
+    response: Option<&Response>,
+) {
+    let elapsed = started.elapsed();
+    if elapsed < std::time::Duration::from_secs(1) {
+        return;
+    }
+    let (status, route_error) = response.map_or((0, String::new()), |response| {
+        (
+            response.status().as_u16(),
+            response
+                .headers()
+                .get(ROUTE_ERROR_HEADER)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("-")
+                .to_owned(),
+        )
+    });
+    eprintln!(
+        "walleye.route slow table={table} step={step} attempt={attempt} forwarded={forwarded} \
+         status={status} route_error={route_error} elapsed_ms={}",
+        elapsed.as_millis()
+    );
 }
 
 #[cfg(test)]

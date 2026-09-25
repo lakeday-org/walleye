@@ -333,14 +333,44 @@ impl Table {
         storage: LanceStorageOptions,
         durability: LanceDurability,
     ) -> lance::Result<Self> {
-        let load_started = open_stage_start(&config, "dataset_load");
-        let mut dataset = match storage.open_dataset(&config.uri).await {
-            Ok(d) => {
-                open_stage_finish(&config, "dataset_load", load_started, "ok", None);
-                d
+        Self::open_prepared(config, storage, durability, None).await
+    }
+    /// As [`Self::open`], on a dataset already loaded and warmed by
+    /// [`Prepared`]. The dataset is used as of its last
+    /// [`Prepared::refresh`], so a caller refreshes it before reading the
+    /// epoch it is about to claim. Nothing about the claim changes: the
+    /// writer claims its epoch and fences its predecessor exactly as an open
+    /// from nothing does, it just does not load what it already has.
+    pub async fn open_prepared(
+        config: TableConfig,
+        storage: LanceStorageOptions,
+        durability: LanceDurability,
+        prepared: Option<Prepared>,
+    ) -> lance::Result<Self> {
+        let (loaded, sstables) = match prepared {
+            Some(prepared) => (Ok(prepared.dataset), prepared.sstables),
+            None => {
+                let load_started = open_stage_start(&config, "dataset_load");
+                let loaded = storage.open_dataset(&config.uri).await;
+                match &loaded {
+                    Ok(_) => open_stage_finish(&config, "dataset_load", load_started, "ok", None),
+                    Err(lance::Error::DatasetNotFound { .. }) => {
+                        open_stage_finish(&config, "dataset_load", load_started, "missing", None)
+                    }
+                    Err(error) => open_stage_finish(
+                        &config,
+                        "dataset_load",
+                        load_started,
+                        "error",
+                        Some(error),
+                    ),
+                }
+                (loaded, Arc::new(SsTableCache::new(256)))
             }
+        };
+        let mut dataset = match loaded {
+            Ok(d) => d,
             Err(lance::Error::DatasetNotFound { .. }) => {
-                open_stage_finish(&config, "dataset_load", load_started, "missing", None);
                 let reader = RecordBatchIterator::new(
                     vec![Ok(RecordBatch::new_empty(config.schema.clone()))],
                     config.schema.clone(),
@@ -365,10 +395,7 @@ impl Table {
                     }
                 }
             }
-            Err(error) => {
-                open_stage_finish(&config, "dataset_load", load_started, "error", Some(&error));
-                return Err(error);
-            }
+            Err(error) => return Err(error),
         };
         let schema_started = open_stage_start(&config, "schema_validate");
         let actual_schema: Schema = dataset.schema().into();
@@ -520,7 +547,7 @@ impl Table {
             writer,
             storage,
             durability,
-            sstables: Arc::new(SsTableCache::new(256)),
+            sstables,
             tail_noted: false,
         })
     }
@@ -755,20 +782,25 @@ impl Table {
     /// indexes into the session caches, so the first query pays nothing that
     /// a later one would not. Purely a cache optimization.
     pub async fn warm(&self) -> lance::Result<usize> {
+        match self.warmer().await? {
+            Some(warmer) => warmer.run().await,
+            None => Ok(0),
+        }
+    }
+    /// What [`Self::warm`] does, as something to run without the table: the
+    /// generations to open are read here, and opening them needs neither the
+    /// writer nor whatever lock the caller holds it under. Warming a table
+    /// just taken over can take seconds; a write waiting behind it should
+    /// not.
+    pub async fn warmer(&self) -> lance::Result<Option<Warmer>> {
         let Some(manifest) = self.writer.manifest().await? else {
-            return Ok(0);
+            return Ok(None);
         };
-        let snapshot = manifest.sstables.iter().fold(
-            ShardSnapshot::new(self.writer.shard_id())
-                .with_spec_id(manifest.shard_spec_id)
-                .with_current_generation(manifest.current_generation),
-            |s, t| s.with_sstable(t.generation, t.path.clone()),
-        );
-        let cache: Arc<dyn DatasetCache> = self.sstables.clone();
-        self.dataset
-            .prewarm_mem_wal(&[snapshot], Some(&cache))
-            .await?;
-        Ok(manifest.sstables.len())
+        Ok(Some(Warmer {
+            dataset: self.dataset.clone(),
+            snapshot: shard_snapshot(self.writer.shard_id(), &manifest),
+            sstables: self.sstables.clone(),
+        }))
     }
     /// Generations currently in the manifest, with row counts and index names.
     pub async fn lsm_stats(&self) -> lance::Result<LsmStats> {
@@ -802,6 +834,14 @@ impl Table {
         Ok(LsmStats { sstables })
     }
     /// Flush to Lance SSTables and advance the manifest replay watermark.
+    /// Freeze the memtable for flushing and return what to wait on for it to
+    /// reach a generation. Freezing is quick; the flush that follows is not,
+    /// and it needs no hold on the table: appends go on into a fresh memtable
+    /// while it runs. What [`Self::checkpoint`] does not: take the open-tail
+    /// note back, because rows appended meanwhile may still need it.
+    pub async fn seal(&self) -> lance::Result<Sealed> {
+        Ok(Sealed(self.writer.force_seal_active().await?))
+    }
     pub async fn checkpoint(&mut self) -> lance::Result<()> {
         self.writer.checkpoint().await?;
         self.clear_open_tail().await;
@@ -1033,7 +1073,7 @@ pub async fn prepare_bitr_takeover(
     };
     let object_store = dataset.object_store(None).await?;
     let base_path = dataset.branch_location().path;
-    let store = ShardManifestStore::new(object_store, &base_path, shard_id, 64);
+    let store = ShardManifestStore::new(object_store, &base_path, shard_id, MANIFEST_SCAN_BATCH);
     let Some(manifest) = store.read_latest().await? else {
         return Ok(false);
     };
@@ -1086,6 +1126,13 @@ pub async fn prepare_bitr_takeover(
     Ok(true)
 }
 
+/// How many manifest versions past the version hint one probe checks at
+/// once, as the writer's own manifest reads do. The hint is kept current, so
+/// the newest version is almost always the hint or the one after it: a wider
+/// probe finds nothing more and pays a HEAD per version for it, which under
+/// several opens at once is most of what reading the epoch costs.
+const MANIFEST_SCAN_BATCH: usize = 2;
+
 /// The epoch the next `Table::open` will claim for this shard: one past the
 /// manifest's current writer epoch, or 1 for a shard that has never been
 /// opened. A Bitr backend built with this epoch is fenced exactly like the
@@ -1103,10 +1150,124 @@ pub async fn next_writer_epoch(
     };
     let object_store = dataset.object_store(None).await?;
     let base_path = dataset.branch_location().path;
-    let store = ShardManifestStore::new(object_store, &base_path, shard_id, 64);
+    let store = ShardManifestStore::new(object_store, &base_path, shard_id, MANIFEST_SCAN_BATCH);
     Ok(store
         .read_latest()
         .await?
         .map(|m| m.writer_epoch + 1)
         .unwrap_or(1))
+}
+
+fn shard_snapshot(shard_id: Uuid, manifest: &lance_index::mem_wal::ShardManifest) -> ShardSnapshot {
+    manifest.sstables.iter().fold(
+        ShardSnapshot::new(shard_id)
+            .with_spec_id(manifest.shard_spec_id)
+            .with_current_generation(manifest.current_generation),
+        |s, t| s.with_sstable(t.generation, t.path.clone()),
+    )
+}
+
+/// A memtable frozen by [`Table::seal`], and everything frozen before it.
+pub struct Sealed(lance::dataset::mem_wal::SealFence);
+impl Sealed {
+    /// Until every one of them is a generation.
+    pub async fn flushed(self) -> lance::Result<()> {
+        self.0.wait().await
+    }
+}
+
+/// Flushed generations to open into a table's caches, captured from its
+/// writer by [`Table::warmer`].
+pub struct Warmer {
+    dataset: Arc<Dataset>,
+    snapshot: ShardSnapshot,
+    sstables: Arc<SsTableCache>,
+}
+impl Warmer {
+    /// Open every generation and load its indexes. Returns how many.
+    pub async fn run(self) -> lance::Result<usize> {
+        let generations = self.snapshot.sstables.len();
+        let cache: Arc<dyn DatasetCache> = self.sstables;
+        self.dataset
+            .prewarm_mem_wal(&[self.snapshot], Some(&cache))
+            .await?;
+        Ok(generations)
+    }
+}
+
+/// A table loaded read-only by a process that does not own it yet, so that
+/// taking it over costs the claim and nothing else.
+///
+/// Loading reads the dataset, its indexes and every flushed generation into
+/// this process's caches; it writes nothing and claims nothing, so the owner
+/// is untouched. [`Table::open_prepared`] then opens the writer on it.
+pub struct Prepared {
+    dataset: Dataset,
+    sstables: Arc<SsTableCache>,
+}
+impl Prepared {
+    /// The table's dataset, or `None` when it has never been written.
+    pub async fn load(
+        config: &TableConfig,
+        storage: &LanceStorageOptions,
+    ) -> lance::Result<Option<Self>> {
+        match storage.open_dataset(&config.uri).await {
+            Ok(dataset) => Ok(Some(Self {
+                dataset,
+                sstables: Arc::new(SsTableCache::new(256)),
+            })),
+            Err(lance::Error::DatasetNotFound { .. }) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+    /// Load the dataset's indexes and open every flushed generation the
+    /// shard's manifest names now, into the caches the writer will read
+    /// through. Returns how many generations.
+    pub async fn warm(&self, shard_id: Uuid) -> lance::Result<usize> {
+        // The MemWAL's own index is metadata with no file to load.
+        let mut seen = std::collections::HashSet::new();
+        for index in self.dataset.load_indices().await?.iter() {
+            if !lance_index::is_system_index(index) && seen.insert(index.name.clone()) {
+                self.dataset.prewarm_index(&index.name).await?;
+            }
+        }
+        let Some(manifest) = self.shard_manifests(shard_id).await?.read_latest().await? else {
+            return Ok(0);
+        };
+        Warmer {
+            dataset: Arc::new(self.dataset.clone()),
+            snapshot: shard_snapshot(shard_id, &manifest),
+            sstables: self.sstables.clone(),
+        }
+        .run()
+        .await
+    }
+    /// Move to the dataset's latest version. A compaction may have committed
+    /// since the load.
+    pub async fn refresh(&mut self) -> lance::Result<()> {
+        self.dataset.checkout_latest().await
+    }
+    /// As [`next_writer_epoch`], read through this dataset.
+    pub async fn next_writer_epoch(&self, shard_id: Uuid) -> lance::Result<u64> {
+        Ok(self
+            .shard_manifests(shard_id)
+            .await?
+            .read_latest()
+            .await?
+            .map(|m| m.writer_epoch + 1)
+            .unwrap_or(1))
+    }
+    async fn shard_manifests(
+        &self,
+        shard_id: Uuid,
+    ) -> lance::Result<lance::dataset::mem_wal::ShardManifestStore> {
+        let object_store = self.dataset.object_store(None).await?;
+        let base_path = self.dataset.branch_location().path;
+        Ok(lance::dataset::mem_wal::ShardManifestStore::new(
+            object_store,
+            &base_path,
+            shard_id,
+            MANIFEST_SCAN_BATCH,
+        ))
+    }
 }
