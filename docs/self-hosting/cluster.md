@@ -95,7 +95,14 @@ new owner's epoch.
 
 A node that is stopped hands its tables over instead: it flushes each one,
 releases it, and removes its lease, and a peer takes each table on its next
-request or within one sampling interval, whichever comes first.
+request or within one sampling interval, whichever comes first. It goes on
+answering, and forwarding to the new owners, until then and for a few seconds
+after. A node that starts publishes its lease only once it accepts connections,
+so no peer forwards to it before it can answer. A request that finds its
+table moving - a process that no longer holds it, or nobody holding it yet -
+was not applied anywhere, and is sent again, reading ownership afresh, for up
+to eight seconds before the caller is told. A graceful restart or a rolled
+upgrade refuses nothing.
 
 **A node that comes back catches up.** Its replica holds the log only as far
 as it got before it went down, and a replica counts towards a quorum only for

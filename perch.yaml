@@ -345,3 +345,11 @@
     connect, or the answer came from a process that refused it. Once any
     attempt may have delivered it, the answer is `outcome-unknown`, and a
     request that is not safe to repeat is not sent again.
+
+- name: a-lease-names-an-address-that-answers
+  where: "crates/walleye-node/src/**/*.rs"
+  ensure_absent: >
+    A process publishing its ownership lease, or starting anything that
+    claims tables for it, before it accepts connections on the address the
+    lease names. Peers forward to a live lease's address at once, and one
+    that finds nobody listening tells its caller the owner is unreachable.
