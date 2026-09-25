@@ -38,6 +38,10 @@ type GatheredTable = (String, Arc<Schema>, Vec<RecordBatch>);
 /// A number that differs between two processes racing for the same stream and
 /// between one attempt and the next, without taking a dependency on a random
 /// number generator for a backoff nobody is betting on.
+/// How long a table loaded ahead of a takeover stays as loaded before it is
+/// loaded again. Past this, what the owner has flushed since is worth
+/// warming too.
+const PREPARED_FOR: std::time::Duration = std::time::Duration::from_secs(10);
 fn jitter(stream: &str) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -396,6 +400,10 @@ struct Stream {
     /// Next arrival number to hand out, once the stream's high-water mark is
     /// known. Unset until the first append after opening.
     seq: Mutex<Option<u64>>,
+    /// The table loaded read-only while the process this one replaces still
+    /// owns it, and when, so the claim that follows its release opens only
+    /// the writer.
+    prepared: Mutex<Option<(Instant, walleye_lance::Prepared)>>,
     /// When the writer this stream holds claimed its epoch. A fence can then
     /// tell a claim that was used from one taken away before it was worth
     /// anything.
@@ -551,15 +559,30 @@ impl Stream {
                 self.definition.name
             );
         }
-        let epoch =
-            walleye_lance::next_writer_epoch(&self.storage, &self.config.uri, self.config.shard_id)
-                .await?;
+        let started = Instant::now();
+        // What was loaded ahead is brought up to date, not loaded again: one
+        // read of the latest version rather than the whole dataset.
+        let mut dataset = self.prepared.lock().await.take().map(|(_, loaded)| loaded);
+        let ahead = dataset.is_some();
+        match &mut dataset {
+            Some(loaded) => loaded.refresh().await?,
+            None => {
+                dataset = walleye_lance::Prepared::load(&self.config, &self.storage).await?;
+            }
+        }
+        let load_ms = started.elapsed().as_millis();
+        let epoch = match &dataset {
+            Some(loaded) => loaded.next_writer_epoch(self.config.shard_id).await?,
+            None => 1,
+        };
+        let epoch_ms = started.elapsed().as_millis() - load_ms;
         if !self.owners.set_epoch(&self.definition.name, epoch).await? {
             return Err(Box::new(NotOwner {
                 table: self.definition.name.clone(),
                 owner: None,
             }));
         }
+        let recorded = Instant::now();
         let durability = match &self.bitr {
             Some(writer) => LanceDurability::Bitr(Arc::new(BitrWalBackend::new(
                 writer.clone(),
@@ -570,7 +593,14 @@ impl Stream {
             None => LanceDurability::ObjectStore,
         };
         let config = self.config.clone().with_log(self.log.get().await?);
-        let table = Table::open(config, self.storage.clone(), durability).await?;
+        let record_ms = recorded.duration_since(started).as_millis() - load_ms - epoch_ms;
+        let table = Table::open_prepared(config, self.storage.clone(), durability, dataset).await?;
+        eprintln!(
+            "walleye.storage claim stream={} prepared={ahead} load_ms={load_ms} \
+             epoch_ms={epoch_ms} record_ms={record_ms} open_ms={}",
+            self.definition.name,
+            recorded.elapsed().as_millis()
+        );
         // An open that overlapped another moved the manifest in between. The
         // writer holds the later epoch and has fenced whatever held the
         // earlier one, so the record follows it rather than the writer being
@@ -870,6 +900,7 @@ impl Engine {
                 lease: Mutex::new(None),
                 last_compaction: Mutex::new(None),
                 seq: Mutex::new(None),
+                prepared: Mutex::new(None),
                 claimed_at: Mutex::new(None),
                 contention: std::sync::atomic::AtomicU32::new(0),
                 owners: self.owners.clone(),
@@ -959,14 +990,11 @@ impl Engine {
             eprintln!("walleye.ownership open table={name} outcome=error error={error}");
             return;
         }
+        let opened_ms = started.elapsed().as_millis();
         let mut seq = stream.seq.lock().await;
-        if seq.is_none()
-            && let Ok(high) = self.highest_seq(name).await
-        {
-            *seq = Some(high.max(now_micros()));
-        }
+        let from = self.seed_seq(name, &mut seq).await.unwrap_or("unknown");
         eprintln!(
-            "walleye.ownership open table={name} elapsed_ms={}",
+            "walleye.ownership open table={name} elapsed_ms={} writer_ms={opened_ms} seq={from}",
             started.elapsed().as_millis()
         );
     }
@@ -1086,6 +1114,76 @@ impl Engine {
             self.hand_back(&key).await;
         }
         claimed
+    }
+    /// Load, read-only, every table the process this one is replacing holds,
+    /// so that when it stops and releases them each claim here opens only
+    /// the writer. Nothing is claimed and nothing is written: the owner
+    /// keeps serving them untouched. A table is loaded again once what was
+    /// loaded is [`PREPARED_FOR`] old, so what it warms stays close to what
+    /// the release leaves.
+    pub async fn prepare_successor(&self) {
+        if self.owners.draining() {
+            return;
+        }
+        let known: Vec<String> = self.streams.lock().await.keys().cloned().collect();
+        if self.owners.held_by_predecessor(&known).is_empty() {
+            // The catalog may not be loaded yet, or may have grown.
+            if !self.owners.has_predecessor() || self.refresh_catalog().await.is_err() {
+                return;
+            }
+        }
+        let known: Vec<String> = self.streams.lock().await.keys().cloned().collect();
+        let due: Vec<Arc<Stream>> = {
+            let streams = self.streams.lock().await;
+            let mut due = Vec::new();
+            for name in self.owners.held_by_predecessor(&known) {
+                let Some(stream) = streams.get(&name) else {
+                    continue;
+                };
+                let fresh = stream
+                    .prepared
+                    .try_lock()
+                    .map(|p| {
+                        p.as_ref()
+                            .is_some_and(|(at, _)| at.elapsed() < PREPARED_FOR)
+                    })
+                    .unwrap_or(true);
+                if !fresh {
+                    due.push(stream.clone());
+                }
+            }
+            due
+        };
+        futures::stream::iter(due)
+            .for_each_concurrent(4, |stream| async move {
+                let name = &stream.definition.name;
+                let started = Instant::now();
+                let loaded =
+                    match walleye_lance::Prepared::load(&stream.config, &stream.storage).await {
+                        Ok(Some(loaded)) => loaded,
+                        Ok(None) => return,
+                        Err(error) => {
+                            eprintln!(
+                                "walleye.ownership prepare table={name} outcome=error error={error}"
+                            );
+                            return;
+                        }
+                    };
+                match loaded.warm(stream.config.shard_id).await {
+                    Ok(generations) => {
+                        *stream.prepared.lock().await = Some((Instant::now(), loaded));
+                        eprintln!(
+                            "walleye.ownership prepare table={name} generations={generations} \
+                             elapsed_ms={}",
+                            started.elapsed().as_millis()
+                        );
+                    }
+                    Err(error) => eprintln!(
+                        "walleye.ownership prepare table={name} outcome=error error={error}"
+                    ),
+                }
+            })
+            .await;
     }
     /// The registered definition, loading it from the catalog if needed.
     /// Does not open a writer and does not check ownership.
@@ -1418,12 +1516,25 @@ impl Engine {
     /// would hide those rows from it for good.
     async fn reserve_seq(&self, name: &str, stream: &Arc<Stream>, rows: u64) -> Result<u64, Error> {
         let mut seq = stream.seq.lock().await;
-        let next = match *seq {
-            Some(next) => next,
-            None => self.highest_seq(name).await?.max(now_micros()),
-        };
+        self.seed_seq(name, &mut seq).await?;
+        let next = seq.expect("seeded");
         *seq = Some(next.saturating_add(rows.max(1)));
         Ok(next)
+    }
+    /// Make sure `seq` holds the stream's next arrival number. A key claimed
+    /// from a release starts where its last owner stopped, which that owner
+    /// wrote into the release; anything else scans the table for its
+    /// highest, once per process. Returns which it was.
+    async fn seed_seq(&self, name: &str, seq: &mut Option<u64>) -> Result<&'static str, Error> {
+        if let Some(next) = self.owners.take_handed_seq(name) {
+            *seq = Some(seq.unwrap_or(0).max(next).max(now_micros()));
+            return Ok("handed");
+        }
+        if seq.is_none() {
+            *seq = Some(self.highest_seq(name).await?.max(now_micros()));
+            return Ok("scanned");
+        }
+        Ok("known")
     }
     /// The largest arrival number the stream already holds, or zero when it
     /// holds none. Paid once per stream per process.
@@ -1578,10 +1689,20 @@ impl Engine {
         let stream = self.stream(name).await?;
         compact_stream(&stream, 2, self.cache.storage.query_timeout(), false).await
     }
-    /// Flush the memtable into a new generation.
+    /// Flush the memtable into a new generation. Only freezing it holds the
+    /// writer; appends go on while the flush runs. An upgrade asks for this
+    /// on every table before it starts the replacement, and a write waiting
+    /// out each flush was most of what that step cost.
     pub async fn flush(&self, name: &str) -> Result<(), Error> {
         let stream = self.stream(name).await?;
-        stream.table().await?.checkpoint().await?;
+        let started = Instant::now();
+        let sealed = stream.table().await?.seal().await?;
+        let sealed_ms = started.elapsed().as_millis();
+        sealed.flushed().await?;
+        eprintln!(
+            "walleye.storage flush stream={name} sealed_ms={sealed_ms} elapsed_ms={}",
+            started.elapsed().as_millis()
+        );
         Ok(())
     }
     pub async fn lsm_stats(&self, name: &str) -> Result<LsmStats, Error> {
@@ -1635,7 +1756,13 @@ impl Engine {
                 let started = Instant::now();
                 let outcome = async {
                     let stream = self.stream(&name).await?;
-                    let generations = stream.table().await?.warm().await?;
+                    // Read what to open under the writer, open it without:
+                    // a write that arrives meanwhile does not wait for it.
+                    let warmer = stream.table().await?.warmer().await?;
+                    let generations = match warmer {
+                        Some(warmer) => warmer.run().await?,
+                        None => 0,
+                    };
                     Ok::<usize, Error>(generations)
                 }
                 .await;
@@ -1729,7 +1856,7 @@ impl Engine {
         }
         let dropped = self.drop_objects(name).await;
         // The name is free for anyone to create again.
-        if let Err(error) = self.owners.release(name).await {
+        if let Err(error) = self.owners.release(name, None).await {
             eprintln!("walleye.ownership release table={name} outcome=error error={error}");
         }
         self.dropping.lock().await.remove(name);
@@ -2005,7 +2132,17 @@ impl Engine {
     /// write that was waiting finds the key released and is sent on to
     /// whoever takes it.
     async fn release_key(&self, name: &str) {
+        let started = Instant::now();
         let stream = self.streams.lock().await.get(name).cloned();
+        // The arrival counter before the writer slot, the order every write
+        // takes them in: `reserve_seq` holds the counter while its first
+        // seeding reads the table through the writer. Taken the other way
+        // round, a first write racing a release waits for the writer while the
+        // release waits for the counter, until the writer's client gives up.
+        let seq = match &stream {
+            Some(stream) => Some(stream.seq.lock().await),
+            None => None,
+        };
         let guard = match &stream {
             Some(stream) => {
                 let mut guard = stream.table.lock().await;
@@ -2022,10 +2159,19 @@ impl Engine {
             }
             None => None,
         };
-        if let Err(error) = self.owners.release(name).await {
+        // Read with the counter and the writer slot held, so no row takes a
+        // number after it.
+        let next_seq = seq.as_deref().copied().flatten();
+        let flushed_ms = started.elapsed().as_millis();
+        if let Err(error) = self.owners.release(name, next_seq).await {
             eprintln!("walleye.ownership release table={name} outcome=error error={error}");
         }
         drop(guard);
+        drop(seq);
+        eprintln!(
+            "walleye.ownership released table={name} flush_ms={flushed_ms} elapsed_ms={}",
+            started.elapsed().as_millis()
+        );
     }
 
     /// Give one key back to the process it belongs to, because this one holds
