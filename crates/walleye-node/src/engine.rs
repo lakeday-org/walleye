@@ -2134,6 +2134,15 @@ impl Engine {
     async fn release_key(&self, name: &str) {
         let started = Instant::now();
         let stream = self.streams.lock().await.get(name).cloned();
+        // The arrival counter before the writer slot, the order every write
+        // takes them in: `reserve_seq` holds the counter while its first
+        // seeding reads the table through the writer. Taken the other way
+        // round, a first write racing a release waits for the writer while the
+        // release waits for the counter, until the writer's client gives up.
+        let seq = match &stream {
+            Some(stream) => Some(stream.seq.lock().await),
+            None => None,
+        };
         let guard = match &stream {
             Some(stream) => {
                 let mut guard = stream.table.lock().await;
@@ -2150,16 +2159,15 @@ impl Engine {
             }
             None => None,
         };
-        // Read with the writer slot held, so no row takes a number after it.
-        let next_seq = match &stream {
-            Some(stream) => *stream.seq.lock().await,
-            None => None,
-        };
+        // Read with the counter and the writer slot held, so no row takes a
+        // number after it.
+        let next_seq = seq.as_deref().copied().flatten();
         let flushed_ms = started.elapsed().as_millis();
         if let Err(error) = self.owners.release(name, next_seq).await {
             eprintln!("walleye.ownership release table={name} outcome=error error={error}");
         }
         drop(guard);
+        drop(seq);
         eprintln!(
             "walleye.ownership released table={name} flush_ms={flushed_ms} elapsed_ms={}",
             started.elapsed().as_millis()
