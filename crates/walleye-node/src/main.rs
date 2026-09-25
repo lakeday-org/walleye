@@ -35,7 +35,10 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         walleye_node::Config::from_env()?
     };
-    let service = walleye_node::Service::open(config).await?;
+    // Open everything, bind the listener, and only then join the cluster: a
+    // lease published before the listener is bound sends peers' forwards to
+    // an address that refuses them.
+    let service = walleye_node::Service::prepare(config).await?;
     let listener = match tokio::net::TcpListener::bind(&service.config.listen).await {
         Ok(listener) => listener,
         // A host without IPv6 cannot bind the dual-stack default; fall back to
@@ -66,6 +69,9 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
             let _ = stopped.await;
         })
         .into_future();
+    // The listener is bound, so a peer that connects now is queued until the
+    // server below accepts it rather than refused.
+    service.start().await?;
     let bitr = async {
         if service.config.bitr {
             walleye_bitr_server::daemon::run_until(Vec::new(), async {

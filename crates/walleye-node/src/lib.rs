@@ -301,7 +301,18 @@ async fn quorum_state(client: &reqwest::Client, gateway: &str) -> (bool, serde_j
 }
 
 impl Service {
+    /// [`Self::prepare`] and [`Self::start`] together, for a host that
+    /// accepts connections before it opens the service or never takes any.
     pub async fn open(config: Config) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
+        let service = Self::prepare(config).await?;
+        service.start().await?;
+        Ok(service)
+    }
+
+    /// Everything but joining the cluster: the storage, the engine and the
+    /// cache are open, and nothing of this process is visible to its peers
+    /// yet. [`Self::start`] joins it, once the process accepts connections.
+    pub async fn prepare(config: Config) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
         use_tls();
         let ring = Arc::new(Membership::new(config.members.clone())?);
         if config.token.len() < 16
@@ -411,18 +422,30 @@ impl Service {
                 serde_json::json!({"ready": true})
             }),
         });
-        // Three things run for the life of the node: the disk the Bitr log
-        // takes is reported so the cache's ceiling tracks it, tables nobody
-        // is using are closed so their memory returns to the budget, and
-        // readiness is established and then kept current.
-        service.clone().spawn_disk_sampler();
-        service.clone().spawn_idle_sweeper();
-        service.clone().spawn_view_driver();
-        service.clone().spawn_alarms();
-        service.clone().spawn_readiness();
-        service.clone().spawn_ownership();
-        service.clone().spawn_served();
         Ok(service)
+    }
+
+    /// Join the cluster: publish this process's lease, and start what runs
+    /// for the life of the node. Call it once the process accepts connections
+    /// on the address its lease names - from then on peers forward to it and
+    /// its sweeps claim tables for it, and a peer that cannot connect tells
+    /// its caller the owner is unreachable.
+    pub async fn start(self: &Arc<Self>) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(engine) = &self.engine {
+            engine.start().await.map_err(|error| error.to_string())?;
+        }
+        // For the life of the node: the disk the Bitr log takes is reported
+        // so the cache's ceiling tracks it, tables nobody is using are closed
+        // so their memory returns to the budget, readiness is established and
+        // kept current, and ownership, alarms and views are driven.
+        self.clone().spawn_disk_sampler();
+        self.clone().spawn_idle_sweeper();
+        self.clone().spawn_view_driver();
+        self.clone().spawn_alarms();
+        self.clone().spawn_readiness();
+        self.clone().spawn_ownership();
+        self.clone().spawn_served();
+        Ok(())
     }
 
     /// Fire alarms on the keys this process owns, each when it comes due.
