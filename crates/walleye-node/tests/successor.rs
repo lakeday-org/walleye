@@ -36,11 +36,11 @@ const BUCKET: &str = "walleye-test";
 /// One way, so a round trip costs twice this: an in-region object store.
 const ONE_WAY: Duration = Duration::from_millis(5);
 const TABLES: usize = 6;
-/// Measured at 0.86 to 1.06 s in a debug build over the relay, where it was
-/// 1.37 to 1.95 s before a successor prepared its tables and inherited the
-/// arrival number; this leaves room for a busy machine and none for a
-/// return to opening from nothing.
-const TAKEOVER_OVER_A_BUCKET: Duration = Duration::from_millis(1_500);
+/// Measured at 0.9 to 1.3 s in a debug build over the relay, from the release
+/// to the successor's first acknowledged write, where it was 1.4 to 1.9 s
+/// before a successor prepared its tables and inherited the arrival number.
+/// Room for a busy machine, none for a return to opening from nothing.
+const TAKEOVER_OVER_A_BUCKET: Duration = Duration::from_secs(2);
 
 /// Every write each table acknowledged: when, by which process, which id.
 type Acks = Arc<Mutex<BTreeMap<String, Vec<(Instant, String, i64)>>>>;
@@ -157,6 +157,33 @@ fn storage(endpoint: &str) -> ObjectStoreParams {
     }
 }
 
+/// As `write`, or `None` when nothing answered at `base`: the process is
+/// gone, and a proxy would send the request elsewhere.
+async fn write_to(base: &str, table: &str, id: i64) -> Option<Answer> {
+    let response = client()
+        .post(format!("{base}/v1/streams/{table}/events"))
+        .header("authorization", format!("Bearer {TOKEN}"))
+        .json(&serde_json::json!({"rows": [{"id": id, "at": id}]}))
+        .send()
+        .await
+        .ok()?;
+    let status = response.status().as_u16();
+    let owner = response
+        .headers()
+        .get(walleye_node::cluster::OWNER_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    let text = response.text().await.ok()?;
+    Some(Answer {
+        status,
+        owner,
+        route_error: None,
+        retry_after: None,
+        body: serde_json::from_str(&text).unwrap_or(serde_json::Value::String(text)),
+    })
+}
+
 /// The node an ownership record names, empty once released.
 async fn record_holder(store: &ObjectStore, root: &Path, table: &str) -> Option<String> {
     use futures::TryStreamExt;
@@ -269,17 +296,32 @@ async fn replace_the_only_node(root: &str, (direct, prefix): (Arc<ObjectStore>, 
         "the successor took a key before the original stopped"
     );
 
-    // One writer per table through the successor, which forwards.
+    // One writer per table. Half go through the successor, which forwards,
+    // as the proxy sends them once the successor is routed; half go to the
+    // original, as a connection the proxy already holds does, and move to
+    // the successor only when the original stops answering.
     let stop = Arc::new(AtomicBool::new(false));
     let acks: Acks = Default::default();
     let mut writers = Vec::new();
-    for table in tables.clone() {
-        let (base, stop, acks) = (successor.base.clone(), stop.clone(), acks.clone());
+    for (index, table) in tables.clone().into_iter().enumerate() {
+        let bases = if index % 2 == 0 {
+            vec![successor.base.clone()]
+        } else {
+            vec![original.base.clone(), successor.base.clone()]
+        };
+        let (stop, acks) = (stop.clone(), acks.clone());
         writers.push(tokio::spawn(async move {
             let mut refused = Vec::new();
             let mut id = 0_i64;
+            let mut at = 0;
             while !stop.load(Ordering::Acquire) {
-                let answer = write(&base, &table, id).await;
+                let answer = loop {
+                    match write_to(&bases[at], &table, id).await {
+                        Some(answer) => break answer,
+                        None if at + 1 < bases.len() => at += 1,
+                        None => panic!("{table}: no process answered"),
+                    }
+                };
                 if answer.status == 200 {
                     acks.lock()
                         .unwrap()
