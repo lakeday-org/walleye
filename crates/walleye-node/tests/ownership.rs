@@ -232,9 +232,10 @@ async fn two_processes_racing_for_a_table_leave_one_owner() {
 }
 
 /// The ramp upgrade: a replacement starts beside the original under the same
-/// configured id. It serves only what it owns - its share, handed back by the
-/// original one key at a time - and sends everything else to the original,
-/// and once the original releases it takes everything.
+/// configured id. The original hands it nothing while both run - they are one
+/// node, not two, and the replacement is not taking traffic yet - so the
+/// replacement sends every request to the original, and once the original
+/// releases it takes everything.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_replacement_takes_over_when_the_original_leaves() {
     let store = tempfile::tempdir().unwrap();
@@ -256,28 +257,26 @@ async fn a_replacement_takes_over_when_the_original_leaves() {
     let replacement = Proc::start("single", &root, cache.path(), None, lease.clone()).await;
     let replacement_session = session(&replacement.base).await;
     assert_ne!(original_session, replacement_session);
-    // The two share the tables once the original has handed back its
-    // surplus, and a write through either lands where the table is held.
+    // Once both have swept, the original still holds every table: a
+    // successor on its own node is never handed a key.
     let spread = settled_spread(
         &[&original.base, &replacement.base],
         &tables,
         Duration::from_secs(30),
     )
     .await;
-    assert_eq!(spread.iter().sum::<usize>(), tables.len());
-    assert!(spread.iter().all(|n| (2..=3).contains(n)), "{spread:?}");
-    let on_replacement = held(&replacement.base).await;
+    assert_eq!(
+        spread,
+        vec![tables.len(), 0],
+        "nothing moved to the successor"
+    );
+    // A write through the replacement lands on the original, which holds it.
     for table in &tables {
         let answer = write(&replacement.base, table, 10).await;
         assert_eq!(answer.status, 200, "{}", answer.body);
-        let expected = if on_replacement.contains_key(table) {
-            &replacement_session
-        } else {
-            &original_session
-        };
         assert_eq!(
-            &answer.owner, expected,
-            "{table} is served where it is held"
+            answer.owner, original_session,
+            "{table} is served by the original until it leaves"
         );
         acked.get_mut(table).unwrap().push(10);
     }
