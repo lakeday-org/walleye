@@ -68,8 +68,9 @@ impl Config {
     /// route; generated and printed when absent), `WALLEYE_DIR`
     /// (`./walleye-cache`), `WALLEYE_RAM_GB` (1), `WALLEYE_NVME_GB` (8), `WALLEYE_BITR_URL` (enables Bitr cluster mode),
     /// `WALLEYE_MEMBERS` (`id=http://host:8080,...`) with `WALLEYE_NODE_ID`
-    /// naming this member, `WALLEYE_ADVERTISE_URL` (where peers reach a node
-    /// started without `WALLEYE_MEMBERS`; `http://localhost:<port>`), and the
+    /// naming this member, `WALLEYE_ADVERTISE_URL` (where peers reach this
+    /// node: it replaces this node's own entry in `WALLEYE_MEMBERS`, and
+    /// without a member list it is `http://localhost:<port>`), and the
     /// lease timings `WALLEYE_LEASE_TTL_MS` (10000), `WALLEYE_LEASE_SKEW_MS`
     /// (2000) and `WALLEYE_OWNERSHIP_SAMPLE_MS` (2000).
     pub fn from_env() -> Result<Self, Box<dyn std::error::Error>> {
@@ -104,6 +105,11 @@ impl Config {
             Some(list) => {
                 let node_id = get("WALLEYE_NODE_ID")
                     .ok_or("WALLEYE_NODE_ID is required with WALLEYE_MEMBERS")?;
+                // Where this node answers, when it says: its own entry in the
+                // member list can name it by a hostname its peers resolve
+                // only some time after it starts, and its lease tells them to
+                // forward to that entry at once.
+                let advertise = get("WALLEYE_ADVERTISE_URL");
                 let members = list
                     .split(',')
                     .map(str::trim)
@@ -112,6 +118,10 @@ impl Config {
                         let (id, endpoint) = entry
                             .split_once('=')
                             .ok_or("WALLEYE_MEMBERS entries are id=http://host:port")?;
+                        let endpoint = match &advertise {
+                            Some(advertise) if id == node_id => advertise.as_str(),
+                            _ => endpoint,
+                        };
                         Ok(Node::new(id, endpoint, 1.0)?)
                     })
                     .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
@@ -1446,6 +1456,35 @@ mod config_tests {
         let api = c.api.unwrap();
         assert_eq!(api.root_uri, "s3://walleye/prod");
         assert_eq!(api.bitr_url.as_deref(), Some("http://127.0.0.1:30080"));
+    }
+
+    /// A member list that names this node by a hostname does not decide
+    /// where peers reach it when it advertises an address: that address goes
+    /// in its lease, reachable the moment it listens.
+    #[test]
+    fn an_advertised_address_is_where_a_listed_node_answers() {
+        let c = Config::from_env_with(env(&[
+            ("WALLEYE_BUCKET", "walleye"),
+            ("WALLEYE_NODE_ID", "node-1"),
+            (
+                "WALLEYE_MEMBERS",
+                "node-0=http://a.vm.app.internal:8080,node-1=http://b.vm.app.internal:8080",
+            ),
+            ("WALLEYE_ADVERTISE_URL", "http://[fdaa::3]:8080"),
+        ]))
+        .unwrap();
+        let endpoints: Vec<(&str, &str)> = c
+            .members
+            .iter()
+            .map(|member| (member.id.as_str(), member.endpoint.as_str()))
+            .collect();
+        assert_eq!(
+            endpoints,
+            vec![
+                ("node-0", "http://a.vm.app.internal:8080"),
+                ("node-1", "http://[fdaa::3]:8080")
+            ]
+        );
     }
 
     #[test]
