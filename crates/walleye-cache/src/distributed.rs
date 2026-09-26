@@ -19,6 +19,8 @@ use walleye_ring::Membership;
 pub struct PeerConfig {
     pub token: String,
     pub ring: Arc<Membership>,
+    /// Sent with every request to a peer, beside the token.
+    pub headers: reqwest::header::HeaderMap,
 }
 impl std::fmt::Debug for PeerConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -60,11 +62,12 @@ impl DistributedCache {
     ) -> std::result::Result<Self, reqwest::Error> {
         Ok(Self {
             local,
-            config,
             client: reqwest::Client::builder()
+                .default_headers(config.headers.clone())
                 .connect_timeout(Duration::from_millis(100))
                 .timeout(Duration::from_secs(2))
                 .build()?,
+            config,
             stats: Arc::default(),
         })
     }

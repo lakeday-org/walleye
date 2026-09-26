@@ -262,6 +262,10 @@ table clicks already exists with a different definition
   decoded at once, so it is reserved at twice its own size before decoding: on
   the default 1 GiB budget an insert over roughly 360 MiB is a 413 whatever the
   route allows. Send it in batches
+- on the managed service every request crosses the service's edge first, and
+  the edge refuses a body over 100 MB with its own 413 before the node sees
+  it. There a single insert is at most 100 MB whatever the node would take;
+  send larger loads in batches
 - SQL statements up to 64 KiB, sixty seconds to run, and an 8 MiB response
 - a write while the quorum is unreachable is a 503. The LanceDB routes carry
   `Retry-After`; the native write routes return a bare 503 with the reason in
