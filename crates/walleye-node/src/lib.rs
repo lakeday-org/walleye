@@ -895,6 +895,20 @@ pub fn use_tls() {
     });
 }
 
+/// The digest of the source tree this binary was compiled from, or `unset`
+/// for a build that did not ask for it (see `build.rs`).
+pub const SOURCE_SHA256: &str = env!("WALLEYE_SOURCE_SHA256");
+
+/// Which binary is answering: its version and the digest of the source tree it
+/// was compiled from, so a run can check the running binary rather than the
+/// image's label.
+async fn version() -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "source_sha256": SOURCE_SHA256,
+    }))
+}
+
 /// Every route the node serves, each with what it asks of its caller.
 pub(crate) fn routes() -> access::Routes<Arc<Service>> {
     use access::{Required::*, Scope::*};
@@ -908,6 +922,7 @@ pub(crate) fn routes() -> access::Routes<Arc<Service>> {
         .route(Method::POST, "/internal/cache/flush", System, flush)
         .route(Method::GET, "/internal/ownership", System, ownership)
         .route(Method::GET, "/internal/alarms", System, alarms)
+        .route(Method::GET, "/internal/version", System, version)
         .route(Method::POST, "/v1/streams", Data(Manage), define)
         .route(
             Method::POST,
