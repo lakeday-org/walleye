@@ -25,6 +25,13 @@ and `AWS_REGION`.
 | `WALLEYE_PORT` | `8080` | Port to listen on. |
 | `WALLEYE_BIND` | `[::]` | Address to bind. The default is dual-stack. |
 | `WALLEYE_TOKEN` | generated | The deployment token, at least 16 characters. It may call every route. |
+| `WALLEYE_EDGE_KEY` | unset | When set, every request except `/healthz` must carry it in `x-walleye-edge-key`, or it is refused with 403 before its token is read. |
+
+`WALLEYE_EDGE_KEY` is for a node that is reachable at an address you do not
+want used, with a proxy in front that you do: the proxy adds the header, and
+the address without it serves nothing but health checks. Members of a cluster
+send it to each other, so every member needs the same value. Unset, the node
+checks nothing.
 
 The bind default reaches IPv6-only private networks and maps IPv4 clients in.
 On a host with no IPv6 at all the node falls back to the same port on
