@@ -40,6 +40,9 @@ lance-index = "=11.0.0"
 datafusion-execution = "=54.1.0"
 tokio.workspace = true
 tempfile.workspace = true
+axum.workspace = true
+walleye-bitr-server = { path = "../walleye-bitr-server" }
+object_store_bitr = { package = "object_store", version = "0.14.0" }
 
 [lints]
 workspace = true

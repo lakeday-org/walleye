@@ -50,6 +50,11 @@ pub enum ArchiveError {
     /// Concurrent publishers prevented bounded head advancement.
     #[error("replica archive head remained contended")]
     Contended,
+    /// A read asked for records a durable checkpoint already released.
+    #[error(
+        "replica archive released through LSN {released_lsn}; a read after {after_lsn} was asked"
+    )]
+    Released { after_lsn: u64, released_lsn: u64 },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -73,6 +78,10 @@ struct ArchiveHead {
     stream: String,
     archived_lsn: u64,
     writer_epoch: u64,
+    /// Everything through here was covered by the table's durable checkpoint
+    /// and its segments deleted. No read may start below it.
+    #[serde(default)]
+    released_lsn: u64,
     /// The newest index page: the references to every segment before
     /// `segments`, folded out of the head so it stays small.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -370,6 +379,12 @@ impl OpaqueArchive {
             return Ok(None);
         }
         self.validate_head_chain(stream, &head)?;
+        // A released prefix is proven by the checkpoint that released it,
+        // not by segments, which are gone: verify from there.
+        let after_lsn = after_lsn.max(head.released_lsn);
+        if after_lsn == head.archived_lsn {
+            return Ok(Some((head.archived_lsn, head.writer_epoch)));
+        }
         let references = self.references_after(stream, &head, after_lsn).await?;
         let wanted: Vec<&SegmentRef> = references.iter().collect();
         let mut verified_epoch = 0_u64;
@@ -454,10 +469,31 @@ impl OpaqueArchive {
         head: &ArchiveHead,
         after_lsn: u64,
     ) -> Result<Vec<SegmentRef>, ArchiveError> {
+        if after_lsn < head.released_lsn {
+            return Err(ArchiveError::Released {
+                after_lsn,
+                released_lsn: head.released_lsn,
+            });
+        }
+        let (mut references, _) = self.walk(stream, head, after_lsn).await?;
+        references.retain(|reference| reference.last_lsn > after_lsn);
+        Ok(references)
+    }
+
+    /// The segment references from the one holding `after_lsn + 1` to the
+    /// archived tail, checked contiguous, and the index pages read to reach
+    /// them.
+    async fn walk(
+        &self,
+        stream: &str,
+        head: &ArchiveHead,
+        after_lsn: u64,
+    ) -> Result<(Vec<SegmentRef>, Vec<PageRef>), ArchiveError> {
         if after_lsn >= head.archived_lsn {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), Vec::new()));
         }
         let mut references = head.segments.clone();
+        let mut pages = Vec::new();
         let mut next_page = head.page.clone();
         while references
             .first()
@@ -479,6 +515,7 @@ impl OpaqueArchive {
                 )));
             }
             next_page = page.previous;
+            pages.push(reference);
             let mut older = page.segments;
             older.append(&mut references);
             references = older;
@@ -505,8 +542,85 @@ impl OpaqueArchive {
                 expected.saturating_sub(1)
             )));
         }
-        references.retain(|reference| reference.last_lsn > after_lsn);
-        Ok(references)
+        Ok((references, pages))
+    }
+
+    /// Where the stream's archive begins and ends: `(released_lsn,
+    /// archived_lsn)`.
+    pub async fn extent(&self, stream: &str) -> Result<(u64, u64), ArchiveError> {
+        let head = self.load_head(stream).await?.head;
+        self.validate_head_chain(stream, &head)?;
+        Ok((head.released_lsn, head.archived_lsn))
+    }
+
+    /// Lets go of the stream's archive through `through_lsn`, as far as it is
+    /// archived: the head records the release first, so no read that loads
+    /// it afterwards asks for what follows, and then every segment wholly
+    /// inside the released prefix is deleted, with every index page that
+    /// names only such segments. A read that loaded the head before the
+    /// release and wanted part of that prefix fails and is retried; nothing
+    /// that reads from the table's checkpoint onwards ever wanted it.
+    /// Returns the released watermark.
+    pub async fn release(&self, stream: &str, through_lsn: u64) -> Result<u64, ArchiveError> {
+        let mut contention_attempts = 0_usize;
+        loop {
+            let loaded = self.load_head(stream).await?;
+            let head = loaded.head;
+            self.validate_head_chain(stream, &head)?;
+            let target = through_lsn.min(head.archived_lsn);
+            if target <= head.released_lsn {
+                return Ok(head.released_lsn);
+            }
+            let (references, pages) = self.walk(stream, &head, head.released_lsn).await?;
+            // The head names nothing released: those references, and the
+            // newest page once all it names is released, go with the objects.
+            let mut next = head.clone();
+            next.released_lsn = target;
+            next.segments
+                .retain(|reference| reference.last_lsn > target);
+            if next
+                .page
+                .as_ref()
+                .is_some_and(|page| page.last_lsn <= target)
+            {
+                next.page = None;
+            }
+            match self.put_head(&next, loaded.update).await {
+                Ok(()) => {}
+                Err(ArchiveError::ObjectStore(
+                    object_store::Error::AlreadyExists { .. }
+                    | object_store::Error::Precondition { .. },
+                )) => {
+                    contention_attempts = contention_attempts.saturating_add(1);
+                    if contention_attempts >= HEAD_UPDATE_ATTEMPTS {
+                        return Err(ArchiveError::Contended);
+                    }
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
+            let doomed = references
+                .iter()
+                .filter(|reference| reference.last_lsn <= target)
+                .map(|reference| reference.key.clone())
+                .chain(
+                    pages
+                        .iter()
+                        .filter(|page| page.last_lsn <= target)
+                        .map(|page| page.key.clone()),
+                );
+            for key in doomed {
+                match self.store.delete(&Path::from(key.as_str())).await {
+                    Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
+                    Err(error) => {
+                        eprintln!(
+                            "lakeday.replica archive release could not delete {key}: {error}"
+                        );
+                    }
+                }
+            }
+            return Ok(target);
+        }
     }
 
     /// Moves all but the newest references out of `head` into a new index
@@ -561,7 +675,6 @@ impl OpaqueArchive {
                 .previous
                 .as_ref()
                 .is_some_and(|previous| previous.last_lsn.saturating_add(1) != reference.first_lsn)
-            || (page.previous.is_none() && reference.first_lsn != 1)
         {
             return Err(ArchiveError::Contiguity(format!(
                 "index page {} does not match the reference to it",
@@ -672,6 +785,7 @@ impl OpaqueArchive {
                     stream: stream.to_owned(),
                     archived_lsn: 0,
                     writer_epoch: 0,
+                    released_lsn: 0,
                     page: None,
                     segments: Vec::new(),
                 },
@@ -765,6 +879,22 @@ impl OpaqueArchive {
             expected = page.last_lsn.checked_add(1).ok_or_else(|| {
                 ArchiveError::Contiguity("archive LSN range exhausted".to_owned())
             })?;
+        } else if head.released_lsn > 0 {
+            // Everything before the released prefix is gone from the head:
+            // the references start inside it, or right after it, or there
+            // are none and the archive ends where the release did.
+            expected = match head.segments.first() {
+                Some(first) if first.first_lsn <= head.released_lsn.saturating_add(1) => {
+                    first.first_lsn
+                }
+                Some(first) => {
+                    return Err(ArchiveError::Contiguity(format!(
+                        "released through {}, references start at {}",
+                        head.released_lsn, first.first_lsn
+                    )));
+                }
+                None => head.released_lsn.saturating_add(1),
+            };
         }
         for reference in &head.segments {
             if reference.first_lsn != expected || reference.last_lsn < reference.first_lsn {
@@ -791,6 +921,12 @@ impl OpaqueArchive {
             return Err(ArchiveError::Contiguity(format!(
                 "head watermark {} does not match segment tail {archived_lsn}",
                 head.archived_lsn
+            )));
+        }
+        if head.released_lsn > head.archived_lsn {
+            return Err(ArchiveError::Contiguity(format!(
+                "head released {} past its archived tail {}",
+                head.released_lsn, head.archived_lsn
             )));
         }
         if head.archived_lsn == 0 && head.writer_epoch != 0 {
@@ -858,6 +994,7 @@ mod tests {
             stream: stream.to_owned(),
             archived_lsn: 9,
             writer_epoch: 7,
+            released_lsn: 0,
             page: None,
             segments: Vec::new(),
         };
@@ -892,6 +1029,7 @@ mod tests {
             stream: stream.to_owned(),
             archived_lsn: 3,
             writer_epoch: 7,
+            released_lsn: 0,
             page: None,
             segments: vec![SegmentRef {
                 first_lsn: 1,

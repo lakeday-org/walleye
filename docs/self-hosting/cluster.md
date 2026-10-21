@@ -140,6 +140,16 @@ one after another. The coordinator writing a stream keeps its newest
 acknowledged records in memory to bring a member level quickly, and forgets
 the rest once the archive holds them.
 
+When a table flushes, the log below its checkpoint is never read again: the
+next owner replays only what comes after it. The writer tells the replicas,
+and the archive lets that prefix go - the head records the release first,
+then the segments and index pages wholly inside it are deleted - so a bucket
+holds a table's unflushed history, not its lifetime. A member that was away
+past a released prefix is brought over it by its own archive pass, then
+caught up as usual. Claiming a table asks the log for its extent - where it
+begins and ends - rather than reading it from the start, so a claim costs the
+same for a table written for a year as for one written for a minute.
+
 Restoring a node that lost its disk is the seeding path above: it reads the
 archive, catches up from its peers, and rejoins owning nothing; the others
 then hand it its share, one key per sweep.

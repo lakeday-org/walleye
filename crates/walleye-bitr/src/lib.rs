@@ -514,6 +514,11 @@ pub enum ReplicaError {
     #[error("replica gateway protocol error: {0}")]
     Protocol(String),
     /// The gateway returned a tail with a gap in the committed LSN sequence.
+    /// A recovery asked for records a durable checkpoint already released.
+    #[error(
+        "replica log was released through LSN {released_lsn}; recovery after {after_lsn} was asked"
+    )]
+    Released { after_lsn: u64, released_lsn: u64 },
     #[error("replica recovery expected LSN {expected_lsn}, received {received_lsn}")]
     RecoveryGap {
         expected_lsn: u64,
@@ -627,6 +632,30 @@ pub trait Replica: Send + Sync {
     async fn records(&self, stream: &str) -> Vec<EncryptedRecord>;
 }
 
+/// How much of a stream's log exists: everything through `released_lsn` was
+/// covered by a durable checkpoint and let go, and `committed_lsn` is the
+/// committed tail. A stream never written has both at zero. The records a
+/// recovery can still return are those after `released_lsn`.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct StreamExtent {
+    pub released_lsn: u64,
+    pub committed_lsn: u64,
+}
+
+impl StreamExtent {
+    /// Whether the log has ever held a committed record of the stream.
+    #[must_use]
+    pub fn ever_written(&self) -> bool {
+        self.committed_lsn > 0
+    }
+
+    /// The first position a recovery can return.
+    #[must_use]
+    pub fn first_retained(&self) -> u64 {
+        self.released_lsn.saturating_add(1)
+    }
+}
+
 /// One load-balanced cloud endpoint that owns quorum fan-out and recovery.
 #[async_trait]
 pub trait ReplicaGateway: Send + Sync {
@@ -663,6 +692,14 @@ pub trait ReplicaGateway: Send + Sync {
         committed_lsn: u64,
         certificate: &str,
     ) -> Result<Vec<EncryptedRecord>, ReplicaError>;
+
+    /// Where the stream's log begins and ends, without reading its records.
+    async fn extent(&self, stream: &str) -> Result<StreamExtent, ReplicaError>;
+
+    /// Lets go of the stream's log through `through_lsn`: its writer has
+    /// published a durable checkpoint covering it, so no recovery will ask
+    /// for it again. Never moves backwards, and never past what is committed.
+    async fn release(&self, stream: &str, through_lsn: u64) -> Result<(), ReplicaError>;
 }
 
 /// Shared handle for a single cloud quorum gateway.
@@ -806,6 +843,16 @@ impl QuorumWriter {
     ) -> Result<Vec<AppendRecord>, ReplicaError> {
         let records = self.gateway.recover(stream, after_lsn).await?;
         self.decrypt_recovery(stream, after_lsn, None, records)
+    }
+
+    /// Where the stream's log begins and ends, without reading its records.
+    pub async fn extent(&self, stream: &str) -> Result<StreamExtent, ReplicaError> {
+        self.gateway.extent(stream).await
+    }
+
+    /// Lets go of the stream's log through a durable checkpoint.
+    pub async fn release(&self, stream: &str, through_lsn: u64) -> Result<(), ReplicaError> {
+        self.gateway.release(stream, through_lsn).await
     }
 
     /// Recovers one gateway tail using an authenticated committed watermark.
@@ -962,6 +1009,7 @@ impl QuorumWriter {
 struct MemoryState {
     highest_epoch: BTreeMap<String, u64>,
     records: BTreeMap<(String, u64), EncryptedRecord>,
+    released: BTreeMap<String, u64>,
 }
 
 /// In-memory gateway fixture with node-like fencing and idempotency rules.
@@ -1073,6 +1121,25 @@ impl MemoryReplica {
     }
 
     /// Returns all records currently held by the in-memory cloud fixture.
+    /// Refuses a recovery that starts inside the released prefix.
+    fn ensure_retained(&self, stream: &str, after_lsn: u64) -> Result<(), ReplicaError> {
+        let released_lsn = self
+            .state
+            .lock()
+            .map_err(|_| ReplicaError::NodeUnavailable)?
+            .released
+            .get(stream)
+            .copied()
+            .unwrap_or(0);
+        if after_lsn < released_lsn {
+            return Err(ReplicaError::Released {
+                after_lsn,
+                released_lsn,
+            });
+        }
+        Ok(())
+    }
+
     async fn records_snapshot(&self, stream: &str) -> Vec<EncryptedRecord> {
         self.state
             .lock()
@@ -1127,12 +1194,49 @@ impl ReplicaGateway for MemoryReplica {
         stream: &str,
         after_lsn: u64,
     ) -> Result<Vec<EncryptedRecord>, ReplicaError> {
+        self.ensure_retained(stream, after_lsn)?;
         Ok(self
             .records_snapshot(stream)
             .await
             .into_iter()
             .filter(|record| record.lsn > after_lsn)
             .collect())
+    }
+
+    async fn extent(&self, stream: &str) -> Result<StreamExtent, ReplicaError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| ReplicaError::NodeUnavailable)?;
+        let released_lsn = state.released.get(stream).copied().unwrap_or(0);
+        let committed_lsn = state
+            .records
+            .range((stream.to_owned(), 0)..=(stream.to_owned(), u64::MAX))
+            .next_back()
+            .map_or(released_lsn, |(_, record)| record.lsn.max(released_lsn));
+        Ok(StreamExtent {
+            released_lsn,
+            committed_lsn,
+        })
+    }
+
+    async fn release(&self, stream: &str, through_lsn: u64) -> Result<(), ReplicaError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| ReplicaError::NodeUnavailable)?;
+        let committed = state
+            .records
+            .range((stream.to_owned(), 0)..=(stream.to_owned(), u64::MAX))
+            .next_back()
+            .map_or(0, |(_, record)| record.lsn);
+        let released = state.released.entry(stream.to_owned()).or_default();
+        *released = (*released).max(through_lsn.min(committed));
+        let released = *released;
+        state
+            .records
+            .retain(|(candidate, lsn), _| candidate != stream || *lsn > released);
+        Ok(())
     }
 
     /// Returns the in-memory gateway's records within the authenticated bound.
@@ -1146,6 +1250,7 @@ impl ReplicaGateway for MemoryReplica {
         if certificate.is_empty() {
             return Err(ReplicaError::CommitCertificateMissing);
         }
+        self.ensure_retained(stream, after_lsn)?;
         Ok(self
             .records_snapshot(stream)
             .await
@@ -1483,4 +1588,49 @@ impl ReplicaGateway for HttpReplica {
         self.fetch_records(stream, after_lsn, Some(committed_lsn), Some(certificate))
             .await
     }
+
+    async fn extent(&self, stream: &str) -> Result<StreamExtent, ReplicaError> {
+        self.activate().await?;
+        let response = self
+            .client
+            .get(format!("{}/v1/extent", self.base_url))
+            .bearer_auth(&self.bearer)
+            .query(&[("stream", stream)])
+            .send()
+            .await
+            .map_err(|_| ReplicaError::GatewayUnavailable)?;
+        if !response.status().is_success() {
+            return Err(Self::gateway_error(response).await);
+        }
+        response
+            .json::<StreamExtent>()
+            .await
+            .map_err(|error| ReplicaError::Protocol(format!("invalid extent response: {error}")))
+    }
+
+    async fn release(&self, stream: &str, through_lsn: u64) -> Result<(), ReplicaError> {
+        self.activate().await?;
+        let response = self
+            .client
+            .post(format!("{}/v1/release", self.base_url))
+            .bearer_auth(&self.bearer)
+            .json(&ReleaseRequest {
+                stream: stream.to_owned(),
+                through_lsn,
+            })
+            .send()
+            .await
+            .map_err(|_| ReplicaError::GatewayUnavailable)?;
+        if !response.status().is_success() {
+            return Err(Self::gateway_error(response).await);
+        }
+        Ok(())
+    }
+}
+
+/// The body of a release request.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ReleaseRequest {
+    pub stream: String,
+    pub through_lsn: u64,
 }

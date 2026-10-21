@@ -16,7 +16,7 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 use walleye_bitr::{
     AppendRecord, CommitKnowledge, EncryptedRecord, MemoryReplica, QuorumWriter, ReplicaError,
-    ReplicaGateway,
+    ReplicaGateway, StreamExtent,
 };
 use walleye_lance::{
     BitrWalBackend, NamespaceConfig, WalBackendError, decode_ipc_entry, encode_fence_sentinel,
@@ -344,6 +344,13 @@ impl ReplicaGateway for StaleProbeGateway {
             .recover_with_watermark(stream, after_lsn, committed_lsn, certificate)
             .await
     }
+    async fn extent(&self, stream: &str) -> Result<StreamExtent, ReplicaError> {
+        self.inner.extent(stream).await
+    }
+
+    async fn release(&self, stream: &str, through_lsn: u64) -> Result<(), ReplicaError> {
+        self.inner.release(stream, through_lsn).await
+    }
 }
 
 /// Seeds an occupied position after the new backend has cached an empty tail.
@@ -557,5 +564,12 @@ impl ReplicaGateway for DropFirstAckGateway {
         self.inner
             .recover_with_watermark(stream, after_lsn, committed_lsn, certificate)
             .await
+    }
+    async fn extent(&self, stream: &str) -> Result<StreamExtent, ReplicaError> {
+        self.inner.extent(stream).await
+    }
+
+    async fn release(&self, stream: &str, through_lsn: u64) -> Result<(), ReplicaError> {
+        self.inner.release(stream, through_lsn).await
     }
 }
