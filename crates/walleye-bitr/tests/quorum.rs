@@ -688,4 +688,17 @@ impl ReplicaGateway for StaticGateway {
     ) -> Result<Vec<EncryptedRecord>, ReplicaError> {
         Ok(self.records.clone())
     }
+
+    /// Reports the fixture tail as the whole log.
+    async fn extent(&self, _stream: &str) -> Result<walleye_bitr::StreamExtent, ReplicaError> {
+        Ok(walleye_bitr::StreamExtent {
+            released_lsn: 0,
+            committed_lsn: self.records.last().map_or(0, EncryptedRecord::lsn),
+        })
+    }
+
+    /// Recovery tests never release.
+    async fn release(&self, _stream: &str, _through_lsn: u64) -> Result<(), ReplicaError> {
+        Ok(())
+    }
 }

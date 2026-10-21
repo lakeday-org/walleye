@@ -61,7 +61,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use walleye_bitr::{
     CAPACITY_EXCEEDED_CODE, ENCRYPTED_RECORD_CONTENT_TYPE, EncryptedRecord,
-    MAX_ENCRYPTED_RECORD_BATCH_BYTES, Replica, ReplicaError, validate_append_batch,
+    MAX_ENCRYPTED_RECORD_BATCH_BYTES, Replica, ReplicaError, StreamExtent, validate_append_batch,
 };
 
 type HmacSha256 = Hmac<Sha256>;
@@ -5882,6 +5882,21 @@ fn cohort_for_stream_excluding(
         .ok_or(ReplicaError::QuorumUnavailable)
 }
 
+/// A read of the released prefix is the caller asking for what a checkpoint
+/// let go of, and says so; any other archive failure is storage.
+fn archive_error(error: ArchiveError) -> ReplicaError {
+    match error {
+        ArchiveError::Released {
+            after_lsn,
+            released_lsn,
+        } => ReplicaError::Released {
+            after_lsn,
+            released_lsn,
+        },
+        error => ReplicaError::NodeStorage(error.to_string()),
+    }
+}
+
 /// Derives the host placement token from the immutable route identity. This
 /// token is intentionally independent from `EncryptedRecord.writer_epoch`:
 /// the latter is authenticated client data and must never be rewritten by a
@@ -6495,6 +6510,13 @@ pub struct GatewayStatus {
 /// Records appended to a catching-up member per request.
 const CATCH_UP_BATCH: usize = 256;
 
+/// Streams one archive pass works on at once.
+const ARCHIVE_STREAMS_IN_FLIGHT: usize = 16;
+
+/// Acknowledged records a writer keeps per stream once the archive holds
+/// them, so a member a moment behind is brought level from memory.
+const WRITER_RECORDS_KEPT: u64 = 128;
+
 /// How many times bringing a member level looks again after the member moved
 /// under it, before giving up until the next refusal.
 const LEVEL_ATTEMPTS: usize = 8;
@@ -6602,41 +6624,139 @@ impl ReplicaGateway {
             .into_iter()
             .map(|prefix| (prefix.stream, prefix.archived_lsn))
             .collect::<BTreeMap<_, _>>();
+        // A stream this member holds only a trimmed prefix of is visited too:
+        // a member that was away can have trimmed everything it held, and it
+        // is its own pass that brings it past a prefix a checkpoint released,
+        // which no peer can copy to it any more.
         let streams = snapshot
             .records
             .into_iter()
             .chain(snapshot.committed)
             .map(|record| record.stream().to_owned())
+            .chain(trimmed.keys().cloned())
             .collect::<BTreeSet<_>>();
+        // Streams are archived side by side: on an object store every step
+        // is a round trip, and one pass visiting a node's streams one after
+        // another takes as long as all of their round trips added together.
+        let streams: Vec<String> = streams.into_iter().collect();
         let mut archived_records = 0_usize;
         let mut compacted_prefixes = Vec::new();
-        for stream in streams {
-            let archived_lsn = self
-                .archive
-                .archived_lsn(&stream)
-                .await
-                .map_err(|error| ReplicaError::NodeStorage(error.to_string()))?;
-            let (records, _) = self
-                .recover_hot_tail(&stream, archived_lsn, None, None)
-                .await?;
-            if !records.is_empty() {
-                archived_records = archived_records.saturating_add(records.len());
-                self.archive
-                    .archive_committed(&records)
-                    .await
-                    .map_err(|error| ReplicaError::NodeStorage(error.to_string()))?;
-            }
-            if let Some((published_lsn, writer_epoch)) = self
-                .archive
-                .archived_tail(&stream, trimmed.get(&stream).copied().unwrap_or(0))
-                .await
-                .map_err(|error| ReplicaError::NodeStorage(error.to_string()))?
-            {
-                compacted_prefixes.push((stream, published_lsn, writer_epoch));
+        let mut failure = None;
+        for chunk in streams.chunks(ARCHIVE_STREAMS_IN_FLIGHT) {
+            let passes: Vec<_> = chunk
+                .iter()
+                .map(|stream| {
+                    self.archive_stream(stream, trimmed.get(stream).copied().unwrap_or(0))
+                })
+                .collect();
+            for (stream, result) in chunk.iter().zip(join_all(passes).await) {
+                match result {
+                    Ok((records, compacted)) => {
+                        archived_records = archived_records.saturating_add(records);
+                        if let Some((published_lsn, writer_epoch)) = compacted {
+                            compacted_prefixes.push((stream.clone(), published_lsn, writer_epoch));
+                        }
+                    }
+                    Err(error) => {
+                        failure.get_or_insert(error);
+                    }
+                }
             }
         }
         node.compact_archived_batch(&compacted_prefixes)?;
-        Ok(archived_records)
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(archived_records),
+        }
+    }
+
+    /// Archives one stream's newly committed records, lets this coordinator
+    /// forget the acknowledged records the archive now holds, and says how
+    /// far the local member may trim: how many records were archived, and
+    /// the archive's tail when it is past `trimmed_lsn`.
+    async fn archive_stream(
+        &self,
+        stream: &str,
+        trimmed_lsn: u64,
+    ) -> Result<(usize, Option<(u64, u64)>), ReplicaError> {
+        let archived_lsn = self
+            .archive
+            .archived_lsn(stream)
+            .await
+            .map_err(|error| ReplicaError::NodeStorage(error.to_string()))?;
+        let (records, _) = self
+            .recover_hot_tail(stream, archived_lsn, None, None)
+            .await?;
+        let archived_lsn = if records.is_empty() {
+            archived_lsn
+        } else {
+            self.archive
+                .archive_committed(&records)
+                .await
+                .map_err(|error| ReplicaError::NodeStorage(error.to_string()))?
+        };
+        self.forget_archived(stream, archived_lsn).await;
+        let compacted = self
+            .archive
+            .archived_tail(stream, trimmed_lsn)
+            .await
+            .map_err(|error| ReplicaError::NodeStorage(error.to_string()))?;
+        Ok((records.len(), compacted))
+    }
+
+    /// Drops the acknowledged records this coordinator holds for `stream`
+    /// that the archive holds through `archived_lsn`, keeping the newest
+    /// [`WRITER_RECORDS_KEPT`]. The map is what lets the writer bring a member
+    /// level with its tail and certify what it just acknowledged; anything
+    /// older a member lacks comes from the archive through catch-up, and a
+    /// resend of an archived record is proved against the archive. Without
+    /// this the map holds every record the stream was ever written.
+    async fn forget_archived(&self, stream: &str, archived_lsn: u64) {
+        let mut state = self.writer_state.lock().await;
+        if let Some(writer) = state.streams.get_mut(stream) {
+            let below = archived_lsn
+                .min(writer.committed_lsn.saturating_sub(WRITER_RECORDS_KEPT))
+                .saturating_add(1);
+            writer.records = writer.records.split_off(&below);
+        }
+    }
+
+    /// Where the stream's log begins and ends: the prefix a checkpoint
+    /// released, from the archive head, and the committed tail, from the
+    /// archive head and the hot tail after it. Reads no archived records, so
+    /// it costs the same however long the stream has lived.
+    pub async fn extent(&self, stream: &str) -> Result<StreamExtent, ReplicaError> {
+        let (released_lsn, archived_lsn) =
+            self.archive.extent(stream).await.map_err(archive_error)?;
+        let hot = self
+            .recover_with_watermark_certificate(stream, archived_lsn, None, None)
+            .await?;
+        Ok(StreamExtent {
+            released_lsn,
+            committed_lsn: hot.last().map_or(archived_lsn, EncryptedRecord::lsn),
+        })
+    }
+
+    /// Lets go of the stream's archive through a checkpoint the table
+    /// published durably. See [`OpaqueArchive::release`].
+    pub async fn release(&self, stream: &str, through_lsn: u64) -> Result<(), ReplicaError> {
+        self.archive
+            .release(stream, through_lsn)
+            .await
+            .map(|_| ())
+            .map_err(archive_error)
+    }
+
+    /// How many acknowledged records this coordinator holds, over every
+    /// stream it writes.
+    pub async fn acknowledged_records(&self) -> usize {
+        self.writer_state
+            .lock()
+            .await
+            .streams
+            .values()
+            .map(|stream| stream.records.len())
+            .sum()
     }
 
     /// Creates a gateway from an immutable explicit membership snapshot.
@@ -10052,22 +10172,27 @@ impl ReplicaGateway {
         let hot_state = hot.streams.get(stream);
         let mut committed = hot_state.map_or(0, |state| state.committed_lsn);
         let mut writer_epoch = hot_state.map_or(0, |state| state.writer_epoch);
+        // The prefix a checkpoint released is certified by it; the walk
+        // starts after it rather than at LSN 1.
+        let (released, _) = self.archive.extent(stream).await.map_err(archive_error)?;
         let mut records = self
             .archive
-            .recover(stream, 0)
+            .recover(stream, released)
             .await
-            .map_err(|error| ReplicaError::NodeStorage(error.to_string()))?;
+            .map_err(archive_error)?;
         records.extend(
             candidates
                 .iter()
-                .filter(|((candidate_stream, _), _)| candidate_stream == stream)
+                .filter(|((candidate_stream, lsn), _)| {
+                    candidate_stream == stream && *lsn > released
+                })
                 .map(|(_, record)| record.clone()),
         );
         records.sort_by_key(EncryptedRecord::lsn);
         records.dedup_by_key(|record| record.lsn());
-        let mut expected_lsn = 1_u64;
+        let mut expected_lsn = released.saturating_add(1);
         let mut prefix_epoch = 0_u64;
-        let mut merged = 0_u64;
+        let mut merged = released;
         for record in records {
             if record.lsn() != expected_lsn
                 || record.committed_lsn() != expected_lsn.saturating_sub(1)
@@ -12039,11 +12164,15 @@ impl ReplicaGateway {
                     .next()
                     .map_or(state.committed_lsn, |first| first.saturating_sub(1))
             });
+            // A prefix the table's checkpoint released is certified by that
+            // checkpoint; the merge starts after it.
+            let (released, _) = self.archive.extent(stream).await.map_err(archive_error)?;
+            let floor = floor.max(released);
             let archived = self
                 .archive
                 .recover(stream, floor)
                 .await
-                .map_err(|error| ReplicaError::NodeStorage(error.to_string()))?;
+                .map_err(archive_error)?;
             if !archived.is_empty() {
                 let mut records = archived;
                 records.extend(
@@ -13055,9 +13184,13 @@ impl ReplicaGateway {
                 match state.streams.get(stream) {
                     Some(writer) => (
                         writer.committed_lsn,
+                        // A member trimmed past what this writer knows is
+                        // committed wants nothing from it: an empty range,
+                        // never an inverted one.
                         writer
                             .records
-                            .range(floor.saturating_add(1)..=writer.committed_lsn.max(floor))
+                            .range(floor.saturating_add(1)..)
+                            .take_while(|(lsn, _)| **lsn <= writer.committed_lsn)
                             .map(|(lsn, record)| (*lsn, record.clone()))
                             .collect::<BTreeMap<_, _>>(),
                     ),
@@ -13329,7 +13462,7 @@ impl ReplicaGateway {
             .archive
             .recover(stream, after_lsn)
             .await
-            .map_err(|error| ReplicaError::NodeStorage(error.to_string()))?;
+            .map_err(archive_error)?;
         if let Some(limit) = committed_lsn {
             archived.retain(|record| record.lsn() <= limit);
         }
@@ -13352,7 +13485,7 @@ impl ReplicaGateway {
                 .archive
                 .recover(stream, hot_after)
                 .await
-                .map_err(|error| ReplicaError::NodeStorage(error.to_string()))?;
+                .map_err(archive_error)?;
             if let Some(limit) = committed_lsn {
                 late.retain(|record| record.lsn() <= limit);
             }
@@ -14401,11 +14534,15 @@ impl ReplicaGateway {
         // What the peers have already archived and trimmed comes back from
         // the archive, which holds exactly the committed prefix.
         if peers_trimmed > floor {
+            // Below the released prefix there is nothing to read: the member
+            // is brought past it by its own archive pass, which trims it to
+            // the archive's tail.
+            let (released, _) = self.archive.extent(stream).await.map_err(archive_error)?;
             for record in self
                 .archive
-                .recover(stream, floor)
+                .recover(stream, floor.max(released))
                 .await
-                .map_err(|error| ReplicaError::NodeStorage(error.to_string()))?
+                .map_err(archive_error)?
             {
                 if record.lsn() > peers_trimmed {
                     break;
@@ -14820,6 +14957,14 @@ impl walleye_bitr::ReplicaGateway for ReplicaGateway {
         )
         .await
     }
+
+    async fn extent(&self, stream: &str) -> Result<StreamExtent, ReplicaError> {
+        ReplicaGateway::extent(self, stream).await
+    }
+
+    async fn release(&self, stream: &str, through_lsn: u64) -> Result<(), ReplicaError> {
+        ReplicaGateway::release(self, stream, through_lsn).await
+    }
 }
 
 /// Builds the gateway router around a shared gateway state.
@@ -14831,6 +14976,8 @@ pub fn gateway_router(gateway: Arc<ReplicaGateway>) -> Router {
         .route("/v1/append", post(gateway_append))
         .route("/v1/append-many", post(gateway_append_many))
         .route("/v1/records", get(gateway_records))
+        .route("/v1/extent", get(gateway_extent))
+        .route("/v1/release", post(gateway_release))
         .route("/v1/admin/repair", post(gateway_repair))
         .route("/v1/admin/status", get(admin_status))
         .route("/v1/admin/rebalance", post(admin_rebalance))
@@ -15208,6 +15355,59 @@ async fn gateway_records(
     {
         Ok(records) => Json(records).into_response(),
         Err(error) => gateway_recovery_error(error, &query, "recovery"),
+    }
+}
+
+#[derive(Deserialize)]
+struct ExtentQuery {
+    stream: String,
+}
+
+async fn gateway_extent(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+    Query(query): Query<ExtentQuery>,
+) -> Response {
+    if !state.gateway.auth.permits(&headers, &query.stream) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let _admission = match state.gateway.admit_read().await {
+        Ok(admission) => admission,
+        Err(error) => return (recovery_status(error), "extent unavailable").into_response(),
+    };
+    match state.gateway.extent(&query.stream).await {
+        Ok(extent) => Json(extent).into_response(),
+        Err(error) => {
+            eprintln!(
+                "{}",
+                serde_json::json!({"event":"replica_extent_failed","stream":query.stream,"error":error.to_string()})
+            );
+            (recovery_status(error), "extent unavailable").into_response()
+        }
+    }
+}
+
+async fn gateway_release(
+    State(state): State<GatewayState>,
+    headers: HeaderMap,
+    Json(request): Json<walleye_bitr::ReleaseRequest>,
+) -> Response {
+    if !state.gateway.auth.permits(&headers, &request.stream) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    match state
+        .gateway
+        .release(&request.stream, request.through_lsn)
+        .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => {
+            eprintln!(
+                "{}",
+                serde_json::json!({"event":"replica_release_failed","stream":request.stream,"error":error.to_string()})
+            );
+            StatusCode::SERVICE_UNAVAILABLE.into_response()
+        }
     }
 }
 

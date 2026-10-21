@@ -93,7 +93,10 @@ async fn open_after(
         schema,
         vec!["id".into()],
     )
-    .unwrap();
+    .unwrap()
+    // The engine names the bucket's own write-ahead log this way; a writer
+    // replays another's tail only in the log both name.
+    .with_log("object-store");
     let started = std::time::Instant::now();
     let opened = Table::open(
         successor,
