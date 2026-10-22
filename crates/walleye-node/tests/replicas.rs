@@ -323,3 +323,70 @@ async fn successive_failovers_do_not_get_slower() {
         p.stop().await;
     }
 }
+
+/// Successive failovers over what a real launch cluster runs on: an archive
+/// with an object store's latency, replicas a network apart, and a history
+/// that has built up before the first failure. Neither the failover nor the
+/// catch-up after each restart may grow from one round to the next.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn successive_failovers_at_scale_do_not_get_slower() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let launch = Launch::under(
+        dir.path(),
+        Conditions {
+            archive: Duration::from_millis(60),
+            peer: Duration::from_millis(2),
+        },
+    );
+    let mut procs = launch_cluster(&launch, cache.path()).await;
+    let writers = Writers::start(bases(&procs));
+    tokio::time::sleep(Duration::from_secs(20)).await;
+    let mut failovers = Vec::new();
+    let mut catch_ups = Vec::new();
+    for victim in [0, 1, 0, 2] {
+        holding_tables(&procs[victim].as_ref().unwrap().base).await;
+        writers.set(victim, None);
+        procs[victim].take().unwrap().kill().await;
+        let killed = Instant::now();
+        failovers.push(
+            writers
+                .all_writing_after(killed, Duration::from_secs(60))
+                .await,
+        );
+        // A Machine takes a few seconds to come back.
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        procs[victim] = Some(launch.start(victim, cache.path(), fast()).await);
+        writers.set(victim, Some(procs[victim].as_ref().unwrap().base.clone()));
+        let others: Vec<usize> = (0..3).filter(|i| *i != victim).collect();
+        catch_ups.push(complete(&launch, victim, &others, Duration::from_secs(60)).await);
+        eprintln!(
+            "  round: node-{victim} failover {} ms, caught up {} ms",
+            failovers.last().unwrap().as_millis(),
+            catch_ups.last().unwrap().as_millis()
+        );
+    }
+    let acked = writers.finish().await;
+    println!(
+        "  at scale: failovers {:?} ms; catch-ups {:?} ms",
+        failovers.iter().map(|f| f.as_millis()).collect::<Vec<_>>(),
+        catch_ups.iter().map(|f| f.as_millis()).collect::<Vec<_>>()
+    );
+    check_exactly_once(&procs[1].as_ref().unwrap().base, &acked).await;
+    let (first_failover, first_catch_up) = (failovers[0], catch_ups[0]);
+    assert!(
+        failovers
+            .iter()
+            .all(|f| *f < first_failover * 2 + Duration::from_secs(2)),
+        "failovers grew: {failovers:?}"
+    );
+    assert!(
+        catch_ups
+            .iter()
+            .all(|c| *c < first_catch_up * 2 + Duration::from_secs(2)),
+        "catch-ups grew: {catch_ups:?}"
+    );
+    for p in procs.into_iter().flatten() {
+        p.stop().await;
+    }
+}

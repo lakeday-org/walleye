@@ -271,3 +271,16 @@
     withdraws a member's own record only when a newer writer's committed
     record replaced it. Counting a member for a position it lacks, or copying
     an uncommitted record, lets a second failure lose an acknowledged write.
+
+- name: a-writer-levels-a-member-only-with-what-it-acknowledged
+  where: mentions bring_level
+  each: method
+  min: 75
+  ensure: >
+    Bringing a member level from a writer's own records sends only records
+    that writer acknowledged with a quorum, in LSN order, and counts a record
+    the member already holds as held only where it equals the acknowledged
+    record or the member's peers vouched for it. Anything else - a record the
+    writer lacks, or one that differs - goes through catch-up from the peers.
+    Sending past an unchecked record can chain committed records onto an
+    orphan the member kept from a dead writer.

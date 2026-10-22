@@ -568,8 +568,81 @@ pub struct Launch {
     pub root: String,
     pub archive: Arc<OpaqueArchive>,
     pub members: Vec<ReplicaNode>,
+    /// Where each replica's storage listener binds: its member address
+    /// itself, or behind a proxy that adds the peer latency.
+    storage: Vec<String>,
     gateways: Vec<String>,
     data: std::path::PathBuf,
+}
+
+/// What a launch cluster runs over, beyond the defaults of one machine: the
+/// latency of each archive request, as an object store across a network
+/// adds, and the one-way latency between replicas.
+#[derive(Clone, Copy, Default)]
+pub struct Conditions {
+    pub archive: Duration,
+    pub peer: Duration,
+}
+
+/// Forwards connections to `listen` on to `upstream`, delivering every byte
+/// `delay` after it was sent, in each direction. A connection to a replica
+/// that is down is closed, as it would be.
+fn delayed_proxy(listen: &str, upstream: String, delay: Duration) {
+    let listener = std::net::TcpListener::bind(listen).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    tokio::spawn(async move {
+        let listener = TcpListener::from_std(listener).unwrap();
+        loop {
+            let Ok((inbound, _)) = listener.accept().await else {
+                continue;
+            };
+            let upstream = upstream.clone();
+            tokio::spawn(async move {
+                let Ok(outbound) = tokio::net::TcpStream::connect(&upstream).await else {
+                    return;
+                };
+                let _ = inbound.set_nodelay(true);
+                let _ = outbound.set_nodelay(true);
+                let (in_read, in_write) = inbound.into_split();
+                let (out_read, out_write) = outbound.into_split();
+                tokio::join!(
+                    delayed_copy(in_read, out_write, delay),
+                    delayed_copy(out_read, in_write, delay)
+                );
+            });
+        }
+    });
+}
+
+async fn delayed_copy(
+    mut from: tokio::net::tcp::OwnedReadHalf,
+    mut to: tokio::net::tcp::OwnedWriteHalf,
+    delay: Duration,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<(Instant, Vec<u8>)>();
+    let reader = async move {
+        let mut buffer = vec![0_u8; 64 * 1024];
+        while let Ok(read) = from.read(&mut buffer).await {
+            if read == 0
+                || sender
+                    .send((Instant::now() + delay, buffer[..read].to_vec()))
+                    .is_err()
+            {
+                break;
+            }
+        }
+    };
+    let writer = async move {
+        while let Some((due, bytes)) = receiver.recv().await {
+            tokio::time::sleep_until(due.into()).await;
+            if to.write_all(&bytes).await.is_err() {
+                break;
+            }
+        }
+        let _ = to.shutdown().await;
+    };
+    tokio::join!(reader, writer);
 }
 
 fn free_address() -> String {
@@ -579,17 +652,54 @@ fn free_address() -> String {
 
 impl Launch {
     pub fn new(dir: &std::path::Path) -> Self {
+        Self::under(dir, Conditions::default())
+    }
+
+    /// A launch cluster over `conditions`. Call it inside the test's runtime:
+    /// the peer proxies run there, and outlive every node.
+    pub fn under(dir: &std::path::Path, conditions: Conditions) -> Self {
         keys();
-        let store: Arc<dyn object_store_bitr::ObjectStore> =
+        let memory: Arc<dyn object_store_bitr::ObjectStore> =
             Arc::new(object_store_bitr::memory::InMemory::new());
+        let store: Arc<dyn object_store_bitr::ObjectStore> = if conditions.archive.is_zero() {
+            memory
+        } else {
+            let wait = conditions.archive;
+            Arc::new(object_store_bitr::throttle::ThrottledStore::new(
+                memory,
+                object_store_bitr::throttle::ThrottleConfig {
+                    wait_get_per_call: wait,
+                    wait_put_per_call: wait,
+                    wait_list_per_call: wait,
+                    wait_delete_per_call: wait,
+                    ..Default::default()
+                },
+            ))
+        };
         let archive = Arc::new(OpaqueArchive::new(store, "bitr", 16).expect("archive"));
-        let members = (0..3)
-            .map(|i| ReplicaNode::new(format!("node-{i}"), format!("http://{}", free_address())))
+        let addresses: Vec<String> = (0..3).map(|_| free_address()).collect();
+        let storage: Vec<String> = if conditions.peer.is_zero() {
+            addresses.clone()
+        } else {
+            addresses
+                .iter()
+                .map(|address| {
+                    let behind = free_address();
+                    delayed_proxy(address, behind.clone(), conditions.peer);
+                    behind
+                })
+                .collect()
+        };
+        let members = addresses
+            .iter()
+            .enumerate()
+            .map(|(i, address)| ReplicaNode::new(format!("node-{i}"), format!("http://{address}")))
             .collect();
         Self {
             root: format!("file://{}/store", dir.display()),
             archive,
             members,
+            storage,
             gateways: (0..3).map(|_| free_address()).collect(),
             data: dir.join("replicas"),
         }
@@ -612,10 +722,7 @@ impl Launch {
             admin_token: String::new(),
             quorum: 2,
             archive: Arc::clone(&self.archive),
-            storage_address: self.members[index]
-                .url
-                .trim_start_matches("http://")
-                .to_owned(),
+            storage_address: self.storage[index].clone(),
             gateway_address: self.gateways[index].clone(),
         }
     }
