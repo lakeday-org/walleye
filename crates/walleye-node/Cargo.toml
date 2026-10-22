@@ -53,3 +53,7 @@ arrow-ipc.workspace = true
 
 [lints]
 workspace = true
+
+[build-dependencies]
+sha2.workspace = true
+hex.workspace = true

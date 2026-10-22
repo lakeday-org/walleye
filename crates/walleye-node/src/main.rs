@@ -2,6 +2,16 @@
 use std::{future::IntoFuture, sync::Arc};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // What an image build checks against its label before it pushes: the
+    // digest of the source tree this binary was compiled from.
+    if std::env::args().nth(1).as_deref() == Some("--version") {
+        println!(
+            "walleye-node {} source-sha256 {}",
+            env!("CARGO_PKG_VERSION"),
+            walleye_node::SOURCE_SHA256
+        );
+        return Ok(());
+    }
     // V8 sets up process-global memory protection keys, and a thread created
     // before that setup cannot later enter an isolate. Workers run on the
     // blocking pool, so the platform has to start before the runtime builds
